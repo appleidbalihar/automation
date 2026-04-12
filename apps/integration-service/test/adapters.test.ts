@@ -28,8 +28,7 @@ test("dangerous script command is blocked", async () => {
   assert.match(String(result.error), /dangerous command policy/i);
 });
 
-test("env refs are resolved and sensitive values are masked in output", async () => {
-  process.env.SMOKE_SECRET_TOKEN = "super-secret-value";
+test("env refs are blocked by strict vault-only policy", async () => {
   const result = await executeIntegration({
     executionType: "SCRIPT",
     commandRef: "cat",
@@ -37,10 +36,8 @@ test("env refs are resolved and sensitive values are masked in output", async ()
       token: "env:SMOKE_SECRET_TOKEN"
     }
   });
-  assert.equal(result.status, "SUCCESS");
-  const stdout = String((result.output as { stdout?: string })?.stdout ?? "");
-  assert.match(stdout, /\*\*\*/);
-  assert.ok(!stdout.includes("super-secret-value"));
+  assert.equal(result.status, "FAILED");
+  assert.match(String(result.error), /ENV_SECRET_REF_BLOCKED/i);
 });
 
 test("script command is blocked by default production allowlist", async () => {
@@ -80,9 +77,7 @@ test("plain string with colon is not treated as secret reference", async () => {
 
 test("vault ref fails clearly when vault is not configured", async () => {
   const prevAddr = process.env.VAULT_ADDR;
-  const prevToken = process.env.VAULT_TOKEN;
   delete process.env.VAULT_ADDR;
-  delete process.env.VAULT_TOKEN;
 
   const result = await executeIntegration({
     executionType: "SCRIPT",
@@ -97,6 +92,4 @@ test("vault ref fails clearly when vault is not configured", async () => {
 
   if (prevAddr === undefined) delete process.env.VAULT_ADDR;
   else process.env.VAULT_ADDR = prevAddr;
-  if (prevToken === undefined) delete process.env.VAULT_TOKEN;
-  else process.env.VAULT_TOKEN = prevToken;
 });

@@ -34,6 +34,16 @@ const eventPublisher = new EventPublisher(config.rabbitmqUrl, "platform.events",
 const WORKFLOW_PUBLISH_AUDIT_QUEUE = "workflow-service.publish-audit.v1";
 const EXECUTION_TYPES: ExecutionType[] = ["REST", "SSH", "NETCONF", "SCRIPT"];
 const AUTH_TYPES: IntegrationAuthType[] = ["NO_AUTH", "OAUTH2", "BASIC", "MTLS", "API_KEY", "OIDC", "JWT"];
+const SENSITIVE_KEY_PATTERN = /(password|token|secret|api[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|passphrase)/i;
+const VAULT_REF_PATTERN = /^vault:[^#\s]+#[^#\s]+$/i;
+const VAULT_KV_MOUNT = String(process.env.VAULT_KV_MOUNT ?? "secret").trim() || "secret";
+const STRICT_VAULT_ONLY = String(process.env.VAULT_STRICT_SECRETS ?? "true").trim().toLowerCase() !== "false";
+
+type SensitiveIssue = {
+  path: string;
+  code: "PLAINTEXT_SECRET_BLOCKED" | "ENV_SECRET_REF_BLOCKED" | "VAULT_SECRET_NOT_FOUND";
+  message: string;
+};
 
 function tryParseJson(text: string): unknown {
   try {
@@ -62,6 +72,218 @@ function isAdmin(headers: Record<string, unknown>): boolean {
 function toJsonObject(value: unknown): any {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return JSON.parse(JSON.stringify(value));
+}
+
+function isVaultRef(value: unknown): boolean {
+  return typeof value === "string" && VAULT_REF_PATTERN.test(value.trim());
+}
+
+function validateSecretFields(
+  value: unknown,
+  options: {
+    pathPrefix: string;
+    allowSensitiveKeys: boolean;
+    requireVaultRefForSensitive: boolean;
+  },
+  path: string[] = []
+): SensitiveIssue[] {
+  const issues: SensitiveIssue[] = [];
+  if (Array.isArray(value)) {
+    for (const [index, entry] of value.entries()) {
+      issues.push(...validateSecretFields(entry, options, [...path, String(index)]));
+    }
+    return issues;
+  }
+  if (!value || typeof value !== "object") {
+    return issues;
+  }
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const currentPath = [...path, key];
+    const pointer = `${options.pathPrefix}.${currentPath.join(".")}`;
+    if (typeof entry === "string" && entry.startsWith("env:")) {
+      issues.push({
+        path: pointer,
+        code: "ENV_SECRET_REF_BLOCKED",
+        message: `env secret reference is blocked at ${pointer}`
+      });
+    }
+    if (SENSITIVE_KEY_PATTERN.test(key)) {
+      if (!options.allowSensitiveKeys) {
+        issues.push({
+          path: pointer,
+          code: "PLAINTEXT_SECRET_BLOCKED",
+          message: `sensitive key is not allowed in ${options.pathPrefix}`
+        });
+      } else if (options.requireVaultRefForSensitive && !isVaultRef(entry)) {
+        issues.push({
+          path: pointer,
+          code: "PLAINTEXT_SECRET_BLOCKED",
+          message: `sensitive key must use vault: reference at ${pointer}`
+        });
+      }
+    }
+    if (entry && typeof entry === "object") {
+      issues.push(...validateSecretFields(entry, options, currentPath));
+    }
+  }
+  return issues;
+}
+
+function collectAllVaultRefs(value: unknown, refs: Set<string> = new Set<string>()): Set<string> {
+  if (Array.isArray(value)) {
+    for (const item of value) collectAllVaultRefs(item, refs);
+    return refs;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      collectAllVaultRefs(item, refs);
+    }
+    return refs;
+  }
+  if (typeof value === "string" && value.startsWith("vault:")) {
+    refs.add(value.trim());
+  }
+  return refs;
+}
+
+function requireAdmin(headers: Record<string, unknown>): { allowed: boolean; error?: { error: string } } {
+  if (!isAdmin(headers)) {
+    return { allowed: false, error: { error: "FORBIDDEN_ADMIN_ONLY" } };
+  }
+  return { allowed: true };
+}
+
+function secretLogicalPath(input: { scope: string; username?: string; group?: string }): string {
+  const group = String(input.group ?? "default").trim().replace(/[^a-zA-Z0-9/_-]/g, "_");
+  if (input.scope === "global") {
+    return `platform/global/${group}`;
+  }
+  const username = String(input.username ?? "").trim();
+  if (!username) {
+    throw new Error("USERNAME_REQUIRED_FOR_USER_SCOPE");
+  }
+  return `platform/users/${username}/${group}`;
+}
+
+function secretDataPath(logicalPath: string): string {
+  return `${VAULT_KV_MOUNT}/data/${logicalPath}`;
+}
+
+function secretMetadataPath(logicalPath: string): string {
+  return `${VAULT_KV_MOUNT}/metadata/${logicalPath}`;
+}
+
+async function vaultCall(method: string, path: string, body?: Record<string, unknown>): Promise<Response> {
+  const response = await fetch(new URL(`/v1/${path}`, process.env.VAULT_ADDR ?? "http://vault:8200"), {
+    method,
+    headers: {
+      "content-type": "application/json",
+      ...(process.env.VAULT_NAMESPACE ? { "X-Vault-Namespace": process.env.VAULT_NAMESPACE } : {})
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  return response;
+}
+
+async function readVaultKv(logicalPath: string): Promise<Record<string, unknown>> {
+  const response = await vaultCall("GET", secretDataPath(logicalPath));
+  if (response.status === 404) return {};
+  if (!response.ok) {
+    throw new Error(`VAULT_SECRET_NOT_FOUND:${logicalPath}`);
+  }
+  const payload = (await response.json()) as { data?: { data?: Record<string, unknown> } };
+  return payload.data?.data ?? {};
+}
+
+async function writeVaultKv(logicalPath: string, data: Record<string, unknown>): Promise<void> {
+  const response = await vaultCall("POST", secretDataPath(logicalPath), { data });
+  if (!response.ok) {
+    throw new Error(`VAULT_WRITE_FAILED:${logicalPath}`);
+  }
+}
+
+function sanitizeLogicalPath(path: string): string {
+  const normalized = String(path ?? "").trim().replace(/^\/+/, "").replace(/\/+$/, "");
+  if (!normalized.startsWith("platform/")) {
+    throw new Error("SECRET_PATH_MUST_START_WITH_PLATFORM");
+  }
+  return normalized;
+}
+
+async function readVaultKvMetadata(logicalPath: string): Promise<{ version: number; updatedAt: string | null }> {
+  const response = await vaultCall("GET", secretMetadataPath(logicalPath));
+  if (!response.ok) return { version: 0, updatedAt: null };
+  const payload = (await response.json()) as { data?: { current_version?: number; updated_time?: string } };
+  return {
+    version: payload.data?.current_version ?? 0,
+    updatedAt: payload.data?.updated_time ?? null
+  };
+}
+
+async function listVaultChildren(prefix: string): Promise<string[]> {
+  const response = await vaultCall("GET", `${VAULT_KV_MOUNT}/metadata/${prefix}?list=true`);
+  if (response.status === 404) return [];
+  if (!response.ok) {
+    throw new Error(`VAULT_LIST_FAILED:${prefix}`);
+  }
+  const payload = (await response.json()) as { data?: { keys?: string[] } };
+  return payload.data?.keys ?? [];
+}
+
+async function listVaultLeafPaths(prefix: string): Promise<string[]> {
+  const children = await listVaultChildren(prefix);
+  const output: string[] = [];
+  for (const key of children) {
+    const next = `${prefix}/${key}`.replace(/\/+/g, "/");
+    if (key.endsWith("/")) {
+      const nested = await listVaultLeafPaths(next.replace(/\/+$/, ""));
+      output.push(...nested);
+    } else {
+      output.push(next);
+    }
+  }
+  return output;
+}
+
+async function vaultRefExists(ref: string): Promise<boolean> {
+  if (!isVaultRef(ref)) return false;
+  const raw = ref.slice("vault:".length);
+  const [path, field] = raw.split("#");
+  if (!path || !field) return false;
+  const response = await vaultCall("GET", path);
+  if (!response.ok) return false;
+  const payload = (await response.json()) as { data?: { data?: Record<string, unknown> } & Record<string, unknown> };
+  const kv2 = payload.data?.data?.[field];
+  const kv1 = (payload.data as Record<string, unknown> | undefined)?.[field];
+  return kv2 !== undefined || kv1 !== undefined;
+}
+
+async function enforceStrictSecretPolicy(): Promise<void> {
+  if (!STRICT_VAULT_ONLY) return;
+  const [integrations, environments] = await Promise.all([
+    prisma.integrationProfile.findMany({ select: { id: true, credentialJson: true } }),
+    prisma.userEnvironment.findMany({ select: { id: true, variablesJson: true } })
+  ]);
+  const violations: string[] = [];
+  for (const integration of integrations) {
+    const issues = validateSecretFields(integration.credentialJson, {
+      pathPrefix: `integration:${integration.id}.credentials`,
+      allowSensitiveKeys: true,
+      requireVaultRefForSensitive: true
+    });
+    violations.push(...issues.map((entry) => `${entry.code}:${entry.path}`));
+  }
+  for (const environment of environments) {
+    const issues = validateSecretFields(environment.variablesJson, {
+      pathPrefix: `environment:${environment.id}.variables`,
+      allowSensitiveKeys: false,
+      requireVaultRefForSensitive: false
+    });
+    violations.push(...issues.map((entry) => `${entry.code}:${entry.path}`));
+  }
+  if (violations.length > 0) {
+    throw new Error(`STRICT_VAULT_ONLY_POLICY_VIOLATIONS:${violations.slice(0, 20).join(",")}`);
+  }
 }
 
 function normalizeExecutionType(value: unknown): ExecutionType | undefined {
@@ -376,6 +598,486 @@ app.get("/workflows/:id/publish-audits", async (request) => {
   });
 });
 
+app.get("/admin/secrets", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const query = request.query as { scope?: string; username?: string; group?: string };
+  try {
+    const logicalPath = secretLogicalPath({
+      scope: String(query.scope ?? "global").trim().toLowerCase(),
+      username: query.username,
+      group: query.group
+    });
+    const [dataResponse, metadataResponse] = await Promise.all([
+      vaultCall("GET", secretDataPath(logicalPath)),
+      vaultCall("GET", secretMetadataPath(logicalPath))
+    ]);
+    const dataPayload = dataResponse.ok ? (((await dataResponse.json()) as { data?: { data?: Record<string, unknown> } }).data?.data ?? {}) : {};
+    const metadataPayload = metadataResponse.ok
+      ? ((await metadataResponse.json()) as { data?: { current_version?: number; updated_time?: string } })
+      : {};
+    const updatedAt = metadataPayload.data?.updated_time;
+    const version = metadataPayload.data?.current_version ?? 0;
+    return {
+      scope: String(query.scope ?? "global").trim().toLowerCase(),
+      username: query.username ?? null,
+      group: query.group ?? "default",
+      path: logicalPath,
+      secrets: Object.keys(dataPayload).map((key) => ({
+        key,
+        value: "***",
+        version,
+        updatedAt: updatedAt ?? null
+      }))
+    };
+  } catch (error) {
+    return reply.code(400).send({ error: "VAULT_SECRET_NOT_FOUND", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/admin/secrets/catalog", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const query = request.query as { limit?: string };
+  const limit = Math.min(Math.max(Number(query.limit ?? "1000") || 1000, 1), 5000);
+  try {
+    const [globalPaths, userPaths] = await Promise.all([listVaultLeafPaths("platform/global"), listVaultLeafPaths("platform/users")]);
+    const paths = [...new Set([...globalPaths, ...userPaths])].sort().slice(0, limit);
+    const integrationMap = new Map(
+      (
+        await prisma.integrationProfile.findMany({
+          select: { id: true, name: true, ownerId: true }
+        })
+      ).map((entry) => [entry.id, entry])
+    );
+    const environmentMap = new Map(
+      (
+        await prisma.userEnvironment.findMany({
+          select: { id: true, name: true, ownerId: true }
+        })
+      ).map((entry) => [entry.id, entry])
+    );
+
+    function enrichPathMeta(path: string): {
+      purpose: string;
+      ownerId: string | null;
+      resourceType: string;
+      resourceId: string | null;
+      resourceName: string | null;
+      workflowCount: number | null;
+    } {
+      const integrationMatch = path.match(/^platform\/users\/([^/]+)\/integration\/([^/]+)$/);
+      if (integrationMatch) {
+        const [, ownerId, integrationId] = integrationMatch;
+        const integration = integrationMap.get(integrationId);
+        return {
+          purpose: "Integration Credential",
+          ownerId,
+          resourceType: "integration",
+          resourceId: integrationId,
+          resourceName: integration?.name ?? null,
+          workflowCount: null
+        };
+      }
+      const environmentMatch = path.match(/^platform\/users\/([^/]+)\/environment\/([^/]+)$/);
+      if (environmentMatch) {
+        const [, ownerId, environmentId] = environmentMatch;
+        const environment = environmentMap.get(environmentId);
+        return {
+          purpose: "Environment Secret Backup",
+          ownerId,
+          resourceType: "environment",
+          resourceId: environmentId,
+          resourceName: environment?.name ?? null,
+          workflowCount: null
+        };
+      }
+      if (path.startsWith("platform/global/")) {
+        return {
+          purpose: "Global Shared Secret",
+          ownerId: null,
+          resourceType: "global",
+          resourceId: null,
+          resourceName: null,
+          workflowCount: null
+        };
+      }
+      return {
+        purpose: "Platform Secret",
+        ownerId: null,
+        resourceType: "other",
+        resourceId: null,
+        resourceName: null,
+        workflowCount: null
+      };
+    }
+
+    const items: Array<{
+      path: string;
+      key: string;
+      value: string;
+      version: number;
+      updatedAt: string | null;
+      purpose: string;
+      ownerId: string | null;
+      resourceType: string;
+      resourceId: string | null;
+      resourceName: string | null;
+      workflowCount: number | null;
+    }> = [];
+    for (const path of paths) {
+      const [data, metadata] = await Promise.all([readVaultKv(path), readVaultKvMetadata(path)]);
+      const meta = enrichPathMeta(path);
+      let workflowCount = meta.workflowCount;
+      if (meta.resourceType === "integration" && meta.resourceId) {
+        workflowCount = (await findIntegrationWorkflowUsage(meta.resourceId)).length;
+      } else if (meta.resourceType === "environment" && meta.resourceId) {
+        workflowCount = (await findEnvironmentWorkflowUsage(meta.resourceId)).length;
+      }
+      for (const key of Object.keys(data).sort()) {
+        items.push({
+          path,
+          key,
+          value: "***",
+          version: metadata.version,
+          updatedAt: metadata.updatedAt,
+          purpose: meta.purpose,
+          ownerId: meta.ownerId,
+          resourceType: meta.resourceType,
+          resourceId: meta.resourceId,
+          resourceName: meta.resourceName,
+          workflowCount
+        });
+      }
+    }
+    return {
+      totalPaths: paths.length,
+      totalSecrets: items.length,
+      items
+    };
+  } catch (error) {
+    return reply.code(400).send({ error: "VAULT_LIST_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/admin/secrets/by-path", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const body = (request.body ?? {}) as { path?: string; key?: string; value?: unknown };
+  const path = sanitizeLogicalPath(String(body.path ?? ""));
+  const key = String(body.key ?? "").trim();
+  const value = String(body.value ?? "");
+  if (!key) return reply.code(400).send({ error: "SECRET_KEY_REQUIRED" });
+  try {
+    const data = await readVaultKv(path);
+    data[key] = value;
+    await writeVaultKv(path, data);
+    return reply.code(201).send({ path, key, value: "***", updatedAt: new Date().toISOString() });
+  } catch (error) {
+    return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.patch("/admin/secrets/by-path", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const body = (request.body ?? {}) as { path?: string; key?: string; value?: unknown };
+  const path = sanitizeLogicalPath(String(body.path ?? ""));
+  const key = String(body.key ?? "").trim();
+  const value = String(body.value ?? "");
+  if (!key) return reply.code(400).send({ error: "SECRET_KEY_REQUIRED" });
+  try {
+    const data = await readVaultKv(path);
+    if (!(key in data)) {
+      return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
+    }
+    data[key] = value;
+    await writeVaultKv(path, data);
+    return { path, key, value: "***", updatedAt: new Date().toISOString() };
+  } catch (error) {
+    return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete("/admin/secrets/by-path", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const body = (request.body ?? {}) as { path?: string; key?: string };
+  const path = sanitizeLogicalPath(String(body.path ?? ""));
+  const key = String(body.key ?? "").trim();
+  try {
+    if (!key) {
+      const response = await vaultCall("DELETE", secretMetadataPath(path));
+      if (!response.ok && response.status !== 404) {
+        return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: path });
+      }
+      return { deleted: true, path };
+    }
+    const data = await readVaultKv(path);
+    if (!(key in data)) {
+      return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
+    }
+    delete data[key];
+    await writeVaultKv(path, data);
+    return { deleted: true, path, key };
+  } catch (error) {
+    return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/admin/secrets", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const body = (request.body ?? {}) as { scope?: string; username?: string; group?: string; key?: string; value?: unknown };
+  const key = String(body.key ?? "").trim();
+  if (!key) return reply.code(400).send({ error: "SECRET_KEY_REQUIRED" });
+  const value = String(body.value ?? "");
+  try {
+    const logicalPath = secretLogicalPath({
+      scope: String(body.scope ?? "global").trim().toLowerCase(),
+      username: body.username,
+      group: body.group
+    });
+    const existing = await readVaultKv(logicalPath);
+    existing[key] = value;
+    await writeVaultKv(logicalPath, existing);
+    return reply.code(201).send({
+      scope: String(body.scope ?? "global").trim().toLowerCase(),
+      username: body.username ?? null,
+      group: body.group ?? "default",
+      path: logicalPath,
+      key,
+      value: "***",
+      updatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.patch("/admin/secrets", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const body = (request.body ?? {}) as { scope?: string; username?: string; group?: string; key?: string; value?: unknown };
+  const key = String(body.key ?? "").trim();
+  if (!key) return reply.code(400).send({ error: "SECRET_KEY_REQUIRED" });
+  const value = String(body.value ?? "");
+  try {
+    const logicalPath = secretLogicalPath({
+      scope: String(body.scope ?? "global").trim().toLowerCase(),
+      username: body.username,
+      group: body.group
+    });
+    const existing = await readVaultKv(logicalPath);
+    if (!(key in existing)) {
+      return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
+    }
+    existing[key] = value;
+    await writeVaultKv(logicalPath, existing);
+    return {
+      scope: String(body.scope ?? "global").trim().toLowerCase(),
+      username: body.username ?? null,
+      group: body.group ?? "default",
+      path: logicalPath,
+      key,
+      value: "***",
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete("/admin/secrets", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const body = (request.body ?? {}) as { scope?: string; username?: string; group?: string; key?: string };
+  try {
+    const logicalPath = secretLogicalPath({
+      scope: String(body.scope ?? "global").trim().toLowerCase(),
+      username: body.username,
+      group: body.group
+    });
+    const key = String(body.key ?? "").trim();
+    if (!key) {
+      const response = await vaultCall("DELETE", secretMetadataPath(logicalPath));
+      if (!response.ok && response.status !== 404) {
+        return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: logicalPath });
+      }
+      return { deleted: true, path: logicalPath };
+    }
+    const existing = await readVaultKv(logicalPath);
+    if (!(key in existing)) return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
+    delete existing[key];
+    await writeVaultKv(logicalPath, existing);
+    return { deleted: true, path: logicalPath, key };
+  } catch (error) {
+    return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/admin/secrets/usage", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const query = request.query as { ref?: string };
+  const ref = String(query.ref ?? "").trim();
+  if (!ref) return reply.code(400).send({ error: "SECRET_REF_REQUIRED" });
+  const [integrations, environments, versions] = await Promise.all([
+    prisma.integrationProfile.findMany({ select: { id: true, name: true, ownerId: true, credentialJson: true } }),
+    prisma.userEnvironment.findMany({ select: { id: true, name: true, ownerId: true, variablesJson: true } }),
+    prisma.workflowVersion.findMany({ select: { id: true, workflowId: true, version: true, nodesJson: true } })
+  ]);
+  const inIntegrations = integrations.filter((entry) => JSON.stringify(entry.credentialJson ?? {}).includes(ref));
+  const inEnvironments = environments.filter((entry) => JSON.stringify(entry.variablesJson ?? {}).includes(ref));
+  const inWorkflows = versions.filter((entry) => JSON.stringify(entry.nodesJson ?? {}).includes(ref));
+  return {
+    ref,
+    usage: {
+      integrations: inIntegrations.map((entry) => ({ id: entry.id, name: entry.name, ownerId: entry.ownerId })),
+      environments: inEnvironments.map((entry) => ({ id: entry.id, name: entry.name, ownerId: entry.ownerId })),
+      workflows: inWorkflows.map((entry) => ({ id: entry.id, workflowId: entry.workflowId, version: entry.version }))
+    }
+  };
+});
+
+app.post("/admin/secrets/migrate", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const migrationId = `mig_${Date.now()}`;
+  const report: {
+    migrationId: string;
+    converted: number;
+    skipped: number;
+    failed: number;
+    rollbackMap: Array<{ entityType: string; entityId: string; path: string; vaultRef: string; backupRef: string }>;
+    errors: Array<{ entityType: string; entityId: string; path: string; error: string }>;
+  } = { migrationId, converted: 0, skipped: 0, failed: 0, rollbackMap: [], errors: [] };
+
+  function pathKey(path: string[]): string {
+    return path.join("_").replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
+  }
+
+  async function migrateObjectSecrets(input: {
+    entityType: "integration" | "environment";
+    entityId: string;
+    ownerId: string;
+    object: Record<string, unknown>;
+    disallowSensitive: boolean;
+  }): Promise<Record<string, unknown>> {
+    const clone = JSON.parse(JSON.stringify(input.object)) as Record<string, unknown>;
+    async function visit(node: unknown, path: string[]): Promise<void> {
+      if (!node || typeof node !== "object") return;
+      for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+        const nextPath = [...path, key];
+        if (value && typeof value === "object") {
+          await visit(value, nextPath);
+          continue;
+        }
+        if (!SENSITIVE_KEY_PATTERN.test(key)) continue;
+        if (typeof value !== "string" || value.length === 0) {
+          report.skipped += 1;
+          continue;
+        }
+        if (value.startsWith("vault:")) {
+          report.skipped += 1;
+          continue;
+        }
+        if (value.startsWith("env:")) {
+          report.failed += 1;
+          report.errors.push({
+            entityType: input.entityType,
+            entityId: input.entityId,
+            path: nextPath.join("."),
+            error: "ENV_SECRET_REF_BLOCKED"
+          });
+          continue;
+        }
+        if (input.disallowSensitive) {
+          report.failed += 1;
+          report.errors.push({
+            entityType: input.entityType,
+            entityId: input.entityId,
+            path: nextPath.join("."),
+            error: "PLAINTEXT_SECRET_BLOCKED"
+          });
+          continue;
+        }
+        const targetLogicalPath = `platform/users/${input.ownerId}/${input.entityType}/${input.entityId}`;
+        const backupLogicalPath = `platform/global/migration-backup/${migrationId}/${input.entityType}/${input.entityId}`;
+        const keyName = pathKey(nextPath);
+        const target = await readVaultKv(targetLogicalPath);
+        target[keyName] = value;
+        await writeVaultKv(targetLogicalPath, target);
+        const backup = await readVaultKv(backupLogicalPath);
+        backup[keyName] = value;
+        await writeVaultKv(backupLogicalPath, backup);
+        (node as Record<string, unknown>)[key] = `vault:${secretDataPath(targetLogicalPath)}#${keyName}`;
+        report.converted += 1;
+        report.rollbackMap.push({
+          entityType: input.entityType,
+          entityId: input.entityId,
+          path: nextPath.join("."),
+          vaultRef: `vault:${secretDataPath(targetLogicalPath)}#${keyName}`,
+          backupRef: `vault:${secretDataPath(backupLogicalPath)}#${keyName}`
+        });
+      }
+    }
+    await visit(clone, []);
+    return clone;
+  }
+
+  const [integrations, environments] = await Promise.all([
+    prisma.integrationProfile.findMany({ select: { id: true, ownerId: true, credentialJson: true } }),
+    prisma.userEnvironment.findMany({ select: { id: true, ownerId: true, variablesJson: true } })
+  ]);
+
+  for (const integration of integrations) {
+    try {
+      const next = await migrateObjectSecrets({
+        entityType: "integration",
+        entityId: integration.id,
+        ownerId: integration.ownerId,
+        object: toJsonObject(integration.credentialJson),
+        disallowSensitive: false
+      });
+      await prisma.integrationProfile.update({
+        where: { id: integration.id },
+        data: { credentialJson: next as any }
+      });
+    } catch (error) {
+      report.failed += 1;
+      report.errors.push({
+        entityType: "integration",
+        entityId: integration.id,
+        path: "credentialJson",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  for (const environment of environments) {
+    try {
+      await migrateObjectSecrets({
+        entityType: "environment",
+        entityId: environment.id,
+        ownerId: environment.ownerId,
+        object: toJsonObject(environment.variablesJson),
+        disallowSensitive: true
+      });
+    } catch (error) {
+      report.failed += 1;
+      report.errors.push({
+        entityType: "environment",
+        entityId: environment.id,
+        path: "variablesJson",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  return report;
+});
+
 app.post("/integrations", async (request, reply) => {
   const body = (request.body ?? {}) as {
     name?: string;
@@ -399,6 +1101,22 @@ app.post("/integrations", async (request, reply) => {
   if (!authType) {
     return reply.code(400).send({ error: "INTEGRATION_AUTH_TYPE_INVALID" });
   }
+  const credentialObject = toJsonObject(body.credentials);
+  const credentialIssues = validateSecretFields(credentialObject, {
+    pathPrefix: "integration.credentials",
+    allowSensitiveKeys: true,
+    requireVaultRefForSensitive: true
+  });
+  if (credentialIssues.length > 0) {
+    return reply.code(400).send({ error: credentialIssues[0].code, details: credentialIssues[0].message, issues: credentialIssues });
+  }
+  const refs = [...collectAllVaultRefs(credentialObject)];
+  for (const ref of refs) {
+    const exists = await vaultRefExists(ref);
+    if (!exists) {
+      return reply.code(400).send({ error: "VAULT_SECRET_NOT_FOUND", details: ref });
+    }
+  }
 
   const requester = requesterUserId(request.headers as Record<string, unknown>);
   const ownerId = String(body.ownerId ?? requester).trim() || requester;
@@ -415,7 +1133,7 @@ app.post("/integrations", async (request, reply) => {
       lifecycleState: "ACTIVE",
       isActive: true,
       baseConfigJson: toJsonObject(body.baseConfig),
-      credentialJson: toJsonObject(body.credentials)
+      credentialJson: credentialObject
     },
     include: { shares: true }
   });
@@ -526,7 +1244,25 @@ app.patch("/integrations/:id", async (request, reply) => {
     data.authType = authType;
   }
   if (body.baseConfig !== undefined) data.baseConfigJson = toJsonObject(body.baseConfig);
-  if (body.credentials !== undefined) data.credentialJson = toJsonObject(body.credentials);
+  if (body.credentials !== undefined) {
+    const credentialObject = toJsonObject(body.credentials);
+    const credentialIssues = validateSecretFields(credentialObject, {
+      pathPrefix: "integration.credentials",
+      allowSensitiveKeys: true,
+      requireVaultRefForSensitive: true
+    });
+    if (credentialIssues.length > 0) {
+      return reply.code(400).send({ error: credentialIssues[0].code, details: credentialIssues[0].message, issues: credentialIssues });
+    }
+    const refs = [...collectAllVaultRefs(credentialObject)];
+    for (const ref of refs) {
+      const exists = await vaultRefExists(ref);
+      if (!exists) {
+        return reply.code(400).send({ error: "VAULT_SECRET_NOT_FOUND", details: ref });
+      }
+    }
+    data.credentialJson = credentialObject;
+  }
 
   const updated = await prisma.integrationProfile.update({
     where: { id },
@@ -792,12 +1528,21 @@ app.post("/environments", async (request, reply) => {
       data: { isDefault: false }
     });
   }
+  const variablesObject = toJsonObject(body.variables);
+  const variableIssues = validateSecretFields(variablesObject, {
+    pathPrefix: "environment.variables",
+    allowSensitiveKeys: false,
+    requireVaultRefForSensitive: false
+  });
+  if (variableIssues.length > 0) {
+    return reply.code(400).send({ error: variableIssues[0].code, details: variableIssues[0].message, issues: variableIssues });
+  }
 
   const environment = await prisma.userEnvironment.create({
     data: {
       name,
       ownerId,
-      variablesJson: toJsonObject(body.variables),
+      variablesJson: variablesObject,
       isDefault: Boolean(body.isDefault)
     },
     include: { shares: true }
@@ -899,7 +1644,18 @@ app.patch("/environments/:id", async (request, reply) => {
     if (!name) return reply.code(400).send({ error: "ENVIRONMENT_NAME_REQUIRED" });
     data.name = name;
   }
-  if (body.variables !== undefined) data.variablesJson = toJsonObject(body.variables);
+  if (body.variables !== undefined) {
+    const variablesObject = toJsonObject(body.variables);
+    const variableIssues = validateSecretFields(variablesObject, {
+      pathPrefix: "environment.variables",
+      allowSensitiveKeys: false,
+      requireVaultRefForSensitive: false
+    });
+    if (variableIssues.length > 0) {
+      return reply.code(400).send({ error: variableIssues[0].code, details: variableIssues[0].message, issues: variableIssues });
+    }
+    data.variablesJson = variablesObject;
+  }
   if (body.isDefault !== undefined) data.isDefault = Boolean(body.isDefault);
 
   const updated = await prisma.userEnvironment.update({
@@ -1024,6 +1780,7 @@ app.addHook("onClose", async () => {
 });
 
 async function start(): Promise<void> {
+  await enforceStrictSecretPolicy();
   await app.listen({ port: config.port, host: "0.0.0.0" });
   tlsRuntime.onReload((error) => {
     if (error) return;

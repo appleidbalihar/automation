@@ -21,8 +21,9 @@ x-shared-env: &shared-env
   INTEGRATION_SSH_ALLOWLIST: ${INTEGRATION_SSH_ALLOWLIST:-.*}
   INTEGRATION_NETCONF_ALLOWLIST: ${INTEGRATION_NETCONF_ALLOWLIST:-.*}
   VAULT_ADDR: http://vault:8200
-  VAULT_TOKEN: ${VAULT_TOKEN:-}
   VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
+  VAULT_STRICT_SECRETS: ${VAULT_STRICT_SECRETS:-true}
+  VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
   MTLS_REQUIRED: "true"
   TLS_CERT_PATH: /tls/cert.pem
   TLS_KEY_PATH: /tls/key.pem
@@ -290,6 +291,7 @@ services:
       <<: *shared-env
       PORT: 4001
       SERVICE_NAME: workflow-service
+      VAULT_ADDR: http://workflow-service-vault-agent:8200
     volumes:
       - tls_workflow_service:/tls:ro
     depends_on:
@@ -375,6 +377,7 @@ services:
       <<: *shared-env
       PORT: 4004
       SERVICE_NAME: integration-service
+      VAULT_ADDR: http://integration-service-vault-agent:8200
     volumes:
       - tls_integration_service:/tls:ro
     depends_on:

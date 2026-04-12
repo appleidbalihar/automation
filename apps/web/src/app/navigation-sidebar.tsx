@@ -29,6 +29,7 @@ export function NavigationSidebar(): ReactElement {
   const navItems = [...baseNavItems, { href: "/profile", label: "Profile" }];
   if (roles.includes("admin")) {
     navItems.push({ href: "/users", label: "Users" });
+    navItems.push({ href: "/secrets", label: "Secrets" });
     navItems.push({ href: "/security", label: "Security Health" });
   }
 

@@ -227,6 +227,39 @@ a {
   font-size: 13px;
 }
 
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.ops-grid label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.ops-grid input,
+.ops-grid select,
+.ops-grid textarea,
+.ops-grid button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 9px;
+  background: var(--surface);
+}
+
+.ops-grid button {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.ops-grid button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .ops-table-wrap {
   width: 100%;
   overflow-x: auto;

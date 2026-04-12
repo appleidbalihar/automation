@@ -56,3 +56,7 @@
 - Move to strict secure-only mode: gateway ingress over HTTPS, web internal gateway proxy over HTTPS, and secure URL defaults (`https/amqps/rediss`) across runtime config.
 - Require private CA trust import for client browsers/operators as the default deployment model for internal IP-based access.
 - Enable TLS listeners for core infra containers in compose baseline (PostgreSQL, RabbitMQ, Redis, Keycloak, MinIO) and remove plaintext defaults from shared environment contracts.
+- Cut over to strict Vault-only secrets for sensitive data: `env:` secret refs are blocked and sensitive plaintext values are rejected.
+- Keep non-secret environment variables for operational values only; credentials move to Vault refs (`vault:path#field`).
+- Remove shared static `VAULT_TOKEN` from app runtime env and standardize Vault Agent sidecar access for app services.
+- Add admin-controlled Vault secret lifecycle APIs/UI with masked responses, usage tracing, and one-time plaintext-to-Vault migration path.

@@ -9,6 +9,7 @@ COMMON_NAME="${CERT_COMMON_NAME:-${SERVICE_NAME}}"
 ALT_NAMES="${CERT_ALT_NAMES:-${SERVICE_NAME},localhost}"
 IP_SANS="${CERT_IP_SANS:-}"
 TTL="${CERT_TTL:-8760h}"
+AGENT_LISTEN_ADDR="${VAULT_AGENT_LISTEN_ADDR:-0.0.0.0:8200}"
 
 mkdir -p "${TLS_OUTPUT_DIR}"
 
@@ -30,6 +31,15 @@ auto_auth {
       path = "/tmp/vault-agent-token"
     }
   }
+}
+
+listener "tcp" {
+  address = "${AGENT_LISTEN_ADDR}"
+  tls_disable = true
+}
+
+cache {
+  use_auto_auth_token = true
 }
 
 template {

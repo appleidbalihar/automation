@@ -63,6 +63,8 @@ export VAULT_TOKEN="${ROOT_TOKEN}"
 
 vault auth enable approle >/dev/null 2>&1 || true
 
+vault secrets enable -path=secret kv-v2 >/dev/null 2>&1 || true
+
 vault secrets enable pki >/dev/null 2>&1 || true
 vault secrets tune -max-lease-ttl="${PKI_ROOT_TTL}" pki >/dev/null
 
@@ -109,6 +111,28 @@ path "pki_int/cert/ca" {
   capabilities = ["read"]
 }
 EOF
+
+  if [ "${service}" = "workflow-service" ]; then
+    cat >>/tmp/"${service}".hcl <<EOF
+path "secret/data/platform/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "secret/metadata/platform/*" {
+  capabilities = ["read", "update", "delete", "list"]
+}
+EOF
+  fi
+
+  if [ "${service}" = "integration-service" ]; then
+    cat >>/tmp/"${service}".hcl <<EOF
+path "secret/data/platform/*" {
+  capabilities = ["read", "list"]
+}
+path "secret/metadata/platform/*" {
+  capabilities = ["read", "list"]
+}
+EOF
+  fi
 
   vault policy write "${service}-pki" /tmp/"${service}".hcl >/dev/null
   vault write auth/approle/role/"${service}-role" token_policies="${service}-pki" token_ttl="1h" token_max_ttl="24h" >/dev/null

@@ -764,6 +764,46 @@ app.post(
   }
 );
 
+app.get("/admin/secrets", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/admin/secrets");
+});
+
+app.post("/admin/secrets", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/secrets");
+});
+
+app.patch("/admin/secrets", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, "/admin/secrets");
+});
+
+app.delete("/admin/secrets", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, "/admin/secrets");
+});
+
+app.get("/admin/secrets/usage", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/admin/secrets/usage");
+});
+
+app.post("/admin/secrets/migrate", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/secrets/migrate");
+});
+
+app.get("/admin/secrets/catalog", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/admin/secrets/catalog");
+});
+
+app.post("/admin/secrets/by-path", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/secrets/by-path");
+});
+
+app.patch("/admin/secrets/by-path", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, "/admin/secrets/by-path");
+});
+
+app.delete("/admin/secrets/by-path", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, "/admin/secrets/by-path");
+});
+
 app.post("/workflows", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
   await proxy(request, reply, "POST", config.workflowServiceUrl, "/workflows");
 });

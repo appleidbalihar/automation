@@ -36,33 +36,6 @@ interface SecretResolver {
   resolve(ref: string, path: string[]): Promise<string>;
 }
 
-class EnvSecretResolver implements SecretResolver {
-  constructor(private readonly scopedEnv: Record<string, unknown>) {}
-
-  async resolve(ref: string, path: string[]): Promise<string> {
-    const [provider, ...rest] = ref.split(":");
-    if (provider !== "env") {
-      throw new Error(`Unsupported secret provider: ${provider} at ${path.join(".") || "root"}`);
-    }
-    const envName = rest.join(":");
-    if (!envName) {
-      throw new Error(`Invalid secret reference format at ${path.join(".") || "root"}`);
-    }
-    const scopedValue = this.scopedEnv[envName];
-    if (typeof scopedValue === "string") {
-      return scopedValue;
-    }
-    if (typeof scopedValue === "number" || typeof scopedValue === "boolean") {
-      return String(scopedValue);
-    }
-    const processEnvValue = process.env[envName];
-    if (processEnvValue === undefined) {
-      throw new Error(`Missing environment reference: ${envName} at ${path.join(".") || "root"}`);
-    }
-    return processEnvValue;
-  }
-}
-
 class VaultSecretResolver implements SecretResolver {
   async resolve(ref: string, path: string[]): Promise<string> {
     const raw = ref.slice("vault:".length);
@@ -71,14 +44,11 @@ class VaultSecretResolver implements SecretResolver {
       throw new Error(`Invalid vault reference format at ${path.join(".") || "root"}. Expected vault:path#field`);
     }
     const addr = process.env.VAULT_ADDR;
-    const token = process.env.VAULT_TOKEN;
-    if (!addr || !token) {
-      throw new Error("Vault is not configured. Set VAULT_ADDR and VAULT_TOKEN");
+    if (!addr) {
+      throw new Error("Vault is not configured. Set VAULT_ADDR");
     }
     const endpoint = new URL(`/v1/${vaultPath}`, addr);
-    const headers: Record<string, string> = {
-      "X-Vault-Token": token
-    };
+    const headers: Record<string, string> = {};
     if (process.env.VAULT_NAMESPACE) {
       headers["X-Vault-Namespace"] = process.env.VAULT_NAMESPACE;
     }
@@ -103,11 +73,9 @@ class VaultSecretResolver implements SecretResolver {
   }
 }
 
-function createSecretResolver(provider: "env" | "vault", scopedEnv: Record<string, unknown>): SecretResolver {
-  if (provider === "vault") {
-    return new VaultSecretResolver();
-  }
-  return new EnvSecretResolver(scopedEnv);
+function createSecretResolver(provider: "vault"): SecretResolver {
+  if (provider === "vault") return new VaultSecretResolver();
+  throw new Error(`Unsupported secret provider: ${provider}`);
 }
 
 function timeoutOf(input: IntegrationRequest): number {
@@ -170,8 +138,11 @@ async function resolveRefs(
   }
 
   if (typeof value === "string" && (value.startsWith("env:") || value.startsWith("vault:"))) {
-    const provider = value.startsWith("vault:") ? "vault" : "env";
-    const resolver = createSecretResolver(provider, scopedEnv);
+    if (value.startsWith("env:")) {
+      throw new Error(`ENV_SECRET_REF_BLOCKED at ${path.join(".") || "root"}`);
+    }
+    const provider = "vault";
+    const resolver = createSecretResolver(provider);
     const resolved = await resolver.resolve(value, path);
     const secrets = new Set<string>();
     if (SENSITIVE_PATTERN.test(value) || provider === "vault") {
