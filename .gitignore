@@ -1,0 +1,15 @@
+node_modules
+.turbo
+.next
+dist
+coverage
+.env
+.env.local
+pnpm-lock.yaml
+*.log
+.DS_Store
+apps/**/.next
+apps/**/dist
+packages/**/dist
+packages/db/prisma/dev.db
+

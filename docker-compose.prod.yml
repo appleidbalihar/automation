@@ -1,0 +1,622 @@
+x-shared-env: &shared-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform}@postgres:5432/${POSTGRES_DB:-automation}?schema=public&sslmode=verify-full&sslrootcert=/tls/ca.pem
+  REDIS_URL: rediss://:platformredis@redis:6379
+  RABBITMQ_URL: amqps://guest:guest@rabbitmq:5671
+  OPENSEARCH_URL: https://admin:DevAdmin123!@opensearch:9200
+  KEYCLOAK_URL: https://keycloak:8443
+  KEYCLOAK_PUBLIC_URL: ${KEYCLOAK_PUBLIC_URL:-https://localhost:8443}
+  KEYCLOAK_REALM: ${KEYCLOAK_REALM:-automation-platform}
+  KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-automation-web}
+  KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-replace-me}
+  AUTH_ALLOW_LEGACY_BEARER: ${AUTH_ALLOW_LEGACY_BEARER:-false}
+  WORKFLOW_SERVICE_URL: https://workflow-service:4001
+  ORDER_SERVICE_URL: https://order-service:4002
+  EXECUTION_ENGINE_SERVICE_URL: https://execution-engine:4003
+  INTEGRATION_SERVICE_URL: https://integration-service:4004
+  LOGGING_SERVICE_URL: https://logging-service:4005
+  RAG_SERVICE_URL: https://rag-service:4006
+  CHAT_SERVICE_URL: https://chat-service:4007
+  INTEGRATION_REST_URL_ALLOWLIST: ${INTEGRATION_REST_URL_ALLOWLIST:-^https?://|^http://localhost:}
+  INTEGRATION_SCRIPT_ALLOWLIST: ${INTEGRATION_SCRIPT_ALLOWLIST:-.*}
+  INTEGRATION_SSH_ALLOWLIST: ${INTEGRATION_SSH_ALLOWLIST:-.*}
+  INTEGRATION_NETCONF_ALLOWLIST: ${INTEGRATION_NETCONF_ALLOWLIST:-.*}
+  VAULT_ADDR: http://vault:8200
+  VAULT_TOKEN: ${VAULT_TOKEN:-}
+  VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
+  MTLS_REQUIRED: "true"
+  TLS_CERT_PATH: /tls/cert.pem
+  TLS_KEY_PATH: /tls/key.pem
+  TLS_CA_PATH: /tls/ca.pem
+  TLS_VERIFY_PEER: ${TLS_VERIFY_PEER:-true}
+  TLS_RELOAD_DEBOUNCE_MS: ${TLS_RELOAD_DEBOUNCE_MS:-1000}
+  SECURITY_DIAGNOSTICS_TOKEN: ${SECURITY_DIAGNOSTICS_TOKEN:-}
+  NODE_EXTRA_CA_CERTS: /tls/ca.pem
+
+x-images:
+  app-service: &app-service-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/platform-service:${APP_IMAGE_TAG:-latest}"
+  app-web: &app-web-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/platform-web:${APP_IMAGE_TAG:-latest}"
+  app-migrate: &app-migrate-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/platform-db-migrate:${APP_IMAGE_TAG:-latest}"
+  infra-vault: &infra-vault-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-vault:${INFRA_IMAGE_TAG:-latest}"
+  infra-pgvector: &infra-pgvector-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-pgvector:${INFRA_IMAGE_TAG:-latest}"
+  infra-redis: &infra-redis-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-redis:${INFRA_IMAGE_TAG:-latest}"
+  infra-rabbitmq: &infra-rabbitmq-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-rabbitmq:${INFRA_IMAGE_TAG:-latest}"
+  infra-opensearch: &infra-opensearch-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-opensearch:${INFRA_IMAGE_TAG:-latest}"
+  infra-minio: &infra-minio-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-minio:${INFRA_IMAGE_TAG:-latest}"
+  infra-keycloak: &infra-keycloak-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-keycloak:${INFRA_IMAGE_TAG:-latest}"
+  infra-nginx: &infra-nginx-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-nginx:${INFRA_IMAGE_TAG:-latest}"
+  infra-docker-cli: &infra-docker-cli-image "${REGISTRY_IMAGE_PREFIX:-registry.gitlab.com/appleid.balihar-group/automation}/infra-docker-cli:${INFRA_IMAGE_TAG:-latest}"
+
+x-vault-agent: &vault-agent
+  image: *infra-vault-image
+  command: ["sh", "/vault/scripts/agent-entrypoint.sh"]
+  environment:
+    VAULT_ADDR: http://vault:8200
+    CERT_TTL: ${TLS_CERT_TTL:-8760h}
+  volumes:
+    - ./infra/vault:/vault/scripts:ro
+    - vault_data:/vault/file:ro
+  depends_on:
+    vault-bootstrap:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: *infra-pgvector-image
+    command:
+      [
+        "bash",
+        "-lc",
+        "cp /tls/cert.pem /var/lib/postgresql/server.crt && cp /tls/key.pem /var/lib/postgresql/server.key && cp /tls/ca.pem /var/lib/postgresql/root.crt && chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key /var/lib/postgresql/root.crt && chmod 600 /var/lib/postgresql/server.key && chmod 644 /var/lib/postgresql/server.crt /var/lib/postgresql/root.crt && export PATH=/usr/lib/postgresql/15/bin:$PATH && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key -c ssl_ca_file=/var/lib/postgresql/root.crt -c hba_file=/etc/postgresql/pg_hba.conf"
+      ]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-platform}
+      POSTGRES_DB: ${POSTGRES_DB:-automation}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - tls_postgres:/tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-platform} -d ${POSTGRES_DB:-automation}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    depends_on:
+      postgres-vault-agent:
+        condition: service_started
+
+  postgres-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: postgres
+      CERT_COMMON_NAME: postgres
+      CERT_ALT_NAMES: postgres,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_postgres:/tls
+
+  redis:
+    image: *infra-redis-image
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - tls_redis:/tls:ro
+    depends_on:
+      redis-vault-agent:
+        condition: service_started
+
+  redis-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: redis
+      CERT_COMMON_NAME: redis
+      CERT_ALT_NAMES: redis,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_redis:/tls
+
+  rabbitmq:
+    image: *infra-rabbitmq-image
+    environment:
+      RABBITMQ_CONFIG_FILE: /etc/rabbitmq/rabbitmq
+    ports:
+      - "5671:5671"
+      - "15671:15671"
+    volumes:
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - tls_rabbitmq:/tls:ro
+    depends_on:
+      rabbitmq-vault-agent:
+        condition: service_started
+
+  rabbitmq-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: rabbitmq
+      CERT_COMMON_NAME: rabbitmq
+      CERT_ALT_NAMES: rabbitmq,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_rabbitmq:/tls
+
+  opensearch:
+    image: *infra-opensearch-image
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "DevAdmin123!"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+
+  minio:
+    image: *infra-minio-image
+    command:
+      [
+        "sh",
+        "-lc",
+        "mkdir -p /root/.minio/certs/CAs && cp /tls/cert.pem /root/.minio/certs/public.crt && cp /tls/key.pem /root/.minio/certs/private.key && cp /tls/ca.pem /root/.minio/certs/CAs/ca.crt && exec minio server /data --console-address :9001"
+      ]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+      - tls_minio:/tls:ro
+    depends_on:
+      minio-vault-agent:
+        condition: service_started
+
+  minio-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: minio
+      CERT_COMMON_NAME: minio
+      CERT_ALT_NAMES: minio,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_minio:/tls
+
+  keycloak:
+    image: *infra-keycloak-image
+    command:
+      [
+        "start",
+        "--import-realm",
+        "--http-enabled=false",
+        "--https-port=8443",
+        "--https-certificate-file=/tls/cert.pem",
+        "--https-certificate-key-file=/tls/key.pem",
+        "--hostname-strict=false"
+      ]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+      - tls_keycloak:/tls:ro
+    depends_on:
+      keycloak-vault-agent:
+        condition: service_started
+
+  keycloak-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: keycloak
+      CERT_COMMON_NAME: keycloak
+      CERT_ALT_NAMES: keycloak,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_keycloak:/tls
+
+  vault:
+    image: *infra-vault-image
+    cap_add:
+      - IPC_LOCK
+    command: ["vault", "server", "-config=/vault/config/vault.hcl"]
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./infra/vault/vault.hcl:/vault/config/vault.hcl:ro
+      - vault_data:/vault/file
+    restart: unless-stopped
+
+  vault-bootstrap:
+    image: *infra-vault-image
+    command: ["sh", "/vault/scripts/bootstrap-pki.sh"]
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_INIT_FILE: /vault/file/vault-init.json
+      APPROLE_DIR: /vault/file/approle
+      PKI_LEAF_TTL: ${PKI_LEAF_TTL:-8760h}
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file
+    depends_on:
+      vault:
+        condition: service_started
+    restart: "no"
+
+  db-migrate:
+    image: *app-migrate-image
+    environment:
+      <<: *shared-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-vault-agent:
+        condition: service_started
+    volumes:
+      - tls_postgres:/tls:ro
+    restart: "no"
+
+  workflow-service-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: workflow-service
+      CERT_COMMON_NAME: workflow-service
+      CERT_ALT_NAMES: workflow-service,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_workflow_service:/tls
+
+  workflow-service:
+    image: *app-service-image
+    environment:
+      <<: *shared-env
+      PORT: 4001
+      SERVICE_NAME: workflow-service
+    volumes:
+      - tls_workflow_service:/tls:ro
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_started
+      workflow-service-vault-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  order-service-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: order-service
+      CERT_COMMON_NAME: order-service
+      CERT_ALT_NAMES: order-service,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_order_service:/tls
+
+  order-service:
+    image: *app-service-image
+    environment:
+      <<: *shared-env
+      PORT: 4002
+      SERVICE_NAME: order-service
+    volumes:
+      - tls_order_service:/tls:ro
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_started
+      order-service-vault-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  execution-engine-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: execution-engine
+      CERT_COMMON_NAME: execution-engine
+      CERT_ALT_NAMES: execution-engine,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_execution_engine:/tls
+
+  execution-engine:
+    image: *app-service-image
+    environment:
+      <<: *shared-env
+      PORT: 4003
+      SERVICE_NAME: execution-engine
+    volumes:
+      - tls_execution_engine:/tls:ro
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      execution-engine-vault-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  integration-service-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: integration-service
+      CERT_COMMON_NAME: integration-service
+      CERT_ALT_NAMES: integration-service,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_integration_service:/tls
+
+  integration-service:
+    image: *app-service-image
+    environment:
+      <<: *shared-env
+      PORT: 4004
+      SERVICE_NAME: integration-service
+    volumes:
+      - tls_integration_service:/tls:ro
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      vault:
+        condition: service_started
+      integration-service-vault-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  logging-service-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: logging-service
+      CERT_COMMON_NAME: logging-service
+      CERT_ALT_NAMES: logging-service,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_logging_service:/tls
+
+  logging-service:
+    image: *app-service-image
+    environment:
+      <<: *shared-env
+      PORT: 4005
+      SERVICE_NAME: logging-service
+    volumes:
+      - tls_logging_service:/tls:ro
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_started
+      logging-service-vault-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  rag-service-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: rag-service
+      CERT_COMMON_NAME: rag-service
+      CERT_ALT_NAMES: rag-service,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_rag_service:/tls
+
+  rag-service:
+    image: *app-service-image
+    environment:
+      <<: *shared-env
+      PORT: 4006
+      SERVICE_NAME: rag-service
+    volumes:
+      - tls_rag_service:/tls:ro
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_started
+      rag-service-vault-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  chat-service-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: chat-service
+      CERT_COMMON_NAME: chat-service
+      CERT_ALT_NAMES: chat-service,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_chat_service:/tls
+
+  chat-service:
+    image: *app-service-image
+    environment:
+      <<: *shared-env
+      PORT: 4007
+      SERVICE_NAME: chat-service
+    volumes:
+      - tls_chat_service:/tls:ro
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      chat-service-vault-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  api-gateway-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: api-gateway
+      CERT_COMMON_NAME: api-gateway
+      CERT_ALT_NAMES: api-gateway,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_api_gateway:/tls
+
+  api-gateway:
+    image: *app-service-image
+    environment:
+      <<: *shared-env
+      PORT: 4000
+      SERVICE_NAME: api-gateway
+    volumes:
+      - tls_api_gateway:/tls:ro
+      - rotation_control:/rotation-control
+    depends_on:
+      workflow-service:
+        condition: service_started
+      order-service:
+        condition: service_started
+      logging-service:
+        condition: service_started
+      rag-service:
+        condition: service_started
+      chat-service:
+        condition: service_started
+      api-gateway-vault-agent:
+        condition: service_started
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+
+  web:
+    image: *app-web-image
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${WEB_NEXT_PUBLIC_API_BASE_URL:-}
+      WEB_INTERNAL_API_BASE_URL: ${WEB_INTERNAL_API_BASE_URL:-https://api-gateway:4000}
+      PORT: 3000
+      KEYCLOAK_URL: ${WEB_KEYCLOAK_URL:-https://keycloak:8443}
+      KEYCLOAK_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KEYCLOAK_REGISTER_DEFAULT_ROLE: ${KEYCLOAK_REGISTER_DEFAULT_ROLE:-useradmin}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-automation-platform}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-automation-web}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
+      NODE_EXTRA_CA_CERTS: /tls/ca.pem
+    volumes:
+      - tls_web:/tls:ro
+    depends_on:
+      api-gateway:
+        condition: service_started
+      web-vault-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  web-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: web
+      CERT_COMMON_NAME: web
+      CERT_ALT_NAMES: web,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_web:/tls
+
+  web-ingress:
+    image: *infra-nginx-image
+    command: ["nginx", "-g", "daemon off;"]
+    volumes:
+      - ./infra/nginx/web-https.conf:/etc/nginx/nginx.conf:ro
+      - tls_web_ingress:/tls:ro
+    depends_on:
+      web:
+        condition: service_started
+      web-ingress-vault-agent:
+        condition: service_started
+    ports:
+      - "3443:443"
+    restart: unless-stopped
+
+  web-ingress-vault-agent:
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: web
+      CERT_COMMON_NAME: web
+      CERT_ALT_NAMES: web,localhost
+      CERT_IP_SANS: ${WEB_CERT_IP_SANS:-}
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_web_ingress:/tls
+
+  cert-rotation-controller:
+    image: *infra-docker-cli-image
+    command: ["sh", "/vault/scripts/rotation-controller.sh"]
+    environment:
+      ROTATION_INTERVAL_SECONDS: ${ROTATION_INTERVAL_SECONDS:-20}
+      TLS_ROOT: /tls
+      ROTATION_REQUESTS_FILE: /rotation-control/requests.jsonl
+      ROTATION_ENABLE_FALLBACK: ${ROTATION_ENABLE_FALLBACK:-false}
+      TARGET_CONTAINERS: ${ROTATION_TARGET_CONTAINERS:-postgres rabbitmq redis keycloak minio opensearch}
+      RESTART_WINDOW_SECONDS: ${RESTART_WINDOW_SECONDS:-1800}
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - tls_api_gateway:/tls/api-gateway:ro
+      - tls_workflow_service:/tls/workflow-service:ro
+      - tls_order_service:/tls/order-service:ro
+      - tls_execution_engine:/tls/execution-engine:ro
+      - tls_integration_service:/tls/integration-service:ro
+      - tls_logging_service:/tls/logging-service:ro
+      - tls_rag_service:/tls/rag-service:ro
+      - tls_chat_service:/tls/chat-service:ro
+      - rotation_control:/rotation-control
+    depends_on:
+      vault-bootstrap:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  opensearch_data:
+  minio_data:
+  vault_data:
+  tls_api_gateway:
+  tls_workflow_service:
+  tls_order_service:
+  tls_execution_engine:
+  tls_integration_service:
+  tls_logging_service:
+  tls_rag_service:
+  tls_chat_service:
+  rotation_control:
+  tls_postgres:
+  tls_rabbitmq:
+  tls_redis:
+  tls_keycloak:
+  tls_minio:
+  tls_web:
+  tls_web_ingress:

@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "baseUrl": ".",
+    "paths": {
+      "@platform/contracts": ["packages/contracts/src"],
+      "@platform/config": ["packages/config/src"],
+      "@platform/auth": ["packages/auth/src"],
+      "@platform/observability": ["packages/observability/src"],
+      "@platform/db": ["packages/db/src"],
+      "@platform/engine-core": ["packages/engine-core/src"],
+      "@platform/tls-runtime": ["packages/tls-runtime/src"],
+      "@platform/ui-kit": ["packages/ui-kit/src"]
+    }
+  }
+}

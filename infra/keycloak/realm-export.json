@@ -1,0 +1,36 @@
+{
+  "realm": "automation-platform",
+  "enabled": true,
+  "clients": [
+    {
+      "clientId": "automation-web",
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["http://localhost:3000/*"],
+      "webOrigins": ["http://localhost:3000"]
+    }
+  ],
+  "roles": {
+    "realm": [
+      { "name": "admin" },
+      { "name": "useradmin" },
+      { "name": "operator" },
+      { "name": "approver" },
+      { "name": "viewer" }
+    ]
+  },
+  "users": [
+    {
+      "username": "platform-admin",
+      "firstName": "Platform",
+      "lastName": "Admin",
+      "email": "platform-admin@example.com",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        { "type": "password", "value": "admin123", "temporary": false }
+      ],
+      "realmRoles": ["admin"]
+    }
+  ]
+}

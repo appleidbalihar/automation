@@ -1,0 +1,20 @@
+# Service Status
+
+| Service | Status | Scope in this milestone |
+| --- | --- | --- |
+| web | Implemented (v1 core) | Enterprise shell, role-aware navigation, route-level auth gate with Keycloak-backed sign-in (`/api/auth/token`), self-registration defaulting to `useradmin`, dedicated external integration management page (`/integrations`) with integration/environment tabs and sharing controls, Postman-style integration auth forms (`No Auth`, `Basic`, `API Key`, `OAuth2`) with simple Base URL/method inputs, authenticated profile/password page (`/profile`), platform-admin user lifecycle page (`/users`) backed by Keycloak admin APIs, admin security health page (`/security`) with manual rotation action, interactive workflow builder UI, tracked-order execution/approval/log UX, and live workflow publish + RAG job visibility |
+| api-gateway | Implemented (v1 core) | Public API endpoints with role enforcement (`admin` + `useradmin` with legacy `operator` compatibility), hardened Keycloak JWT validation (internal/public issuer compatibility + client binding checks), live downstream proxying, dependency health checks, certificate monitor/alert publisher, webhook dispatch, TLS-aware readiness checks, and admin cert-control APIs (`/admin/security/certificates`, `/admin/security/certificates/events`, `/admin/security/certificates/:service/renew`) wired to existing rotation workflow |
+| workflow-service | Implemented (v1 core) | Workflow create/list/get/publish endpoints, version persistence, integration/environment LCM + username sharing + duplicate + usage safety checks + integration auth test endpoints, owner/shared scope enforcement for non-admin list queries, `workflow.published` event publishing, and publish-audit worker persistence |
+| order-service | Implemented (v1 core) | Order execute/get/list/approvals/retry/rollback plus approval actions (request/approve/reject), persisted checkpoint/audit histories, immediate retry execution from checkpoint, rollback-action execution, RabbitMQ domain-event publishing, and owner-scoped access enforcement for non-admin reads/mutations |
+| execution-engine | Implemented (v1 core) | Engine capabilities plus workflow validation and checkpoint-aware run execution that delegates step execution to integration-service and returns timestamped audit payloads |
+| integration-service | Implemented (v1 core) | Live REST/SSH/NETCONF/SCRIPT adapters with policy controls, env/vault secret refs, `{{envVar}}` template interpolation in URL/auth inputs, OAuth2 token retrieval/cache support, masking, and audit emission |
+| logging-service | Implemented (v1 core) | Ingest/query/timeline endpoints with recursive masking, correlation-aware filtering, and RabbitMQ event consumption |
+| rag-service | Implemented (v1 core) | Operational retrieval/index request endpoints with `rag.index.requested` event publishing, index worker job tracking, and persisted indexed document search |
+| chat-service | Implemented (v1 core) | Operational-only policy with stricter guardrails, context-aware order/workflow responses, and query history persistence |
+
+## Deployment mode
+- All services run in Docker Compose with a containerized app tier (`web`, `api-gateway`, `workflow-service`, `order-service`, `execution-engine`, `integration-service`, `logging-service`, `rag-service`, `chat-service`) plus containerized infra dependencies.
+- Automated certificate/key lifecycle is wired through Vault PKI bootstrap + per-service Vault Agent rendering into `/tls/*`, and backend services expose TLS runtime diagnostics via `/security/tls`.
+- Rotation controller remains the renewal/recycle orchestrator; gateway alerts/manual controls enqueue requests via shared control queue (`/rotation-control/requests.jsonl`) instead of introducing a separate renewal engine.
+- Secure-only deployment defaults are enabled: HTTPS service URLs and TLS-enabled infra listener configs are part of the compose baseline.
+- Offline production deployment path is available via GitLab Container Registry images and `docker-compose.prod.yml` (no `build:` steps, no internet pulls from public registries).

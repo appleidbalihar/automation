@@ -1,0 +1,51 @@
+stages:
+  - verify
+  - build
+  - mirror
+
+default:
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      command: ["--mtu=1460"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILDKIT: "1"
+    COMPOSE_DOCKER_CLI_BUILD: "1"
+  before_script:
+    - docker login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
+
+verify:prod-compose:
+  stage: verify
+  script:
+    - export REGISTRY_IMAGE_PREFIX="${CI_REGISTRY_IMAGE}"
+    - export APP_IMAGE_TAG="${CI_COMMIT_SHA}"
+    - export INFRA_IMAGE_TAG="${CI_COMMIT_SHA}"
+    - docker compose -f docker-compose.prod.yml config >/tmp/compose-prod.resolved.yml
+    - test -s /tmp/compose-prod.resolved.yml
+
+build:app-images:
+  stage: build
+  script:
+    - export APP_TAG="${CI_COMMIT_SHA}"
+    - docker build -f infra/docker/Dockerfile.service -t "${CI_REGISTRY_IMAGE}/platform-service:${APP_TAG}" -t "${CI_REGISTRY_IMAGE}/platform-service:latest" .
+    - docker build -f infra/docker/Dockerfile.web -t "${CI_REGISTRY_IMAGE}/platform-web:${APP_TAG}" -t "${CI_REGISTRY_IMAGE}/platform-web:latest" .
+    - docker build -f infra/docker/Dockerfile.migrate -t "${CI_REGISTRY_IMAGE}/platform-db-migrate:${APP_TAG}" -t "${CI_REGISTRY_IMAGE}/platform-db-migrate:latest" .
+    - docker push "${CI_REGISTRY_IMAGE}/platform-service:${APP_TAG}"
+    - docker push "${CI_REGISTRY_IMAGE}/platform-service:latest"
+    - docker push "${CI_REGISTRY_IMAGE}/platform-web:${APP_TAG}"
+    - docker push "${CI_REGISTRY_IMAGE}/platform-web:latest"
+    - docker push "${CI_REGISTRY_IMAGE}/platform-db-migrate:${APP_TAG}"
+    - docker push "${CI_REGISTRY_IMAGE}/platform-db-migrate:latest"
+
+mirror:infra-images:
+  stage: mirror
+  script:
+    - ./ci/mirror-images.sh "${CI_REGISTRY_IMAGE}" "${CI_COMMIT_SHA}"

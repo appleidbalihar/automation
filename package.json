@@ -1,0 +1,28 @@
+{
+  "name": "enterprise-automation-platform",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "turbo run dev --parallel",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "compose:up": "docker compose up -d",
+    "compose:down": "docker compose down -v",
+    "seed:auth": "node infra/keycloak/seed-info.js",
+    "seed:vault": "bash infra/vault/seed-smoke-secret.sh",
+    "seed:vault-pki": "docker compose run --rm vault-bootstrap",
+    "smoke:vault": "bash tests/smoke/vault-integration-smoke.sh",
+    "smoke:rag": "bash tests/smoke/rag-gateway-worker-smoke.sh",
+    "smoke:recovery": "bash tests/smoke/order-recovery-timeline-smoke.sh",
+    "smoke:rbac": "bash tests/smoke/rbac-resume-e2e-smoke.sh",
+    "smoke:engine": "bash tests/smoke/execution-engine-smoke.sh",
+    "smoke:all": "bash tests/smoke/all-smoke.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "turbo": "^2.4.4",
+    "typescript": "^5.8.2"
+  }
+}
