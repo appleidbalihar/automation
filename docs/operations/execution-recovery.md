@@ -21,5 +21,3 @@
 
 ## Security and visibility
 - Logs are stored with masking for sensitive fields (`password`, `token`, `secret`).
-- Assistant answers are restricted to operational guidance and do not expose backend implementation details.
-

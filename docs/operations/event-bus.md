@@ -11,7 +11,6 @@ The event bus provides asynchronous execution tracking so order activity can sti
 ## Current producers
 - `order-service`: order/step/retry/rollback lifecycle events
 - `workflow-service`: workflow publish events (`workflow.published`)
-- `rag-service`: indexing requests (`rag.index.requested`)
 
 ## What to monitor
 - RabbitMQ queue depth for `logging-service.events.v1`

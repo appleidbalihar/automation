@@ -29,7 +29,7 @@ const app: any = Fastify({
   https: tlsRuntime.getServerOptions()
 });
 
-type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
+type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 type CertSeverity = "OK" | "WARNING" | "CRITICAL";
 
 const CERT_CONTROL_ORDER_ID = "cert-control-global";
@@ -57,8 +57,6 @@ const certTargets: CertTarget[] = [
   { service: "execution-engine", url: config.executionEngineServiceUrl, mode: "security-endpoint", rotationTargets: ["execution-engine-vault-agent"] },
   { service: "integration-service", url: config.integrationServiceUrl, mode: "security-endpoint", rotationTargets: ["integration-service-vault-agent"] },
   { service: "logging-service", url: config.loggingServiceUrl, mode: "security-endpoint", rotationTargets: ["logging-service-vault-agent"] },
-  { service: "rag-service", url: config.ragServiceUrl, mode: "security-endpoint", rotationTargets: ["rag-service-vault-agent"] },
-  { service: "chat-service", url: config.chatServiceUrl, mode: "security-endpoint", rotationTargets: ["chat-service-vault-agent"] },
   { service: "keycloak", url: config.keycloakUrl, mode: "tls-handshake", rotationTargets: ["keycloak-vault-agent", "keycloak"] }
 ];
 
@@ -624,9 +622,7 @@ app.get("/health/dependencies", async (request, reply) => {
   const checks = await Promise.all([
     dependencyHealth("workflow-service", config.workflowServiceUrl),
     dependencyHealth("order-service", config.orderServiceUrl),
-    dependencyHealth("logging-service", config.loggingServiceUrl),
-    dependencyHealth("rag-service", config.ragServiceUrl),
-    dependencyHealth("chat-service", config.chatServiceUrl)
+    dependencyHealth("logging-service", config.loggingServiceUrl)
   ]);
   const ok = checks.every((item) => item.ok);
   reply.code(ok ? 200 : 503).send({
@@ -640,9 +636,7 @@ app.get("/health/readiness", async (request, reply) => {
   const dependencies = await Promise.all([
     dependencyHealth("workflow-service", config.workflowServiceUrl),
     dependencyHealth("order-service", config.orderServiceUrl),
-    dependencyHealth("logging-service", config.loggingServiceUrl),
-    dependencyHealth("rag-service", config.ragServiceUrl),
-    dependencyHealth("chat-service", config.chatServiceUrl)
+    dependencyHealth("logging-service", config.loggingServiceUrl)
   ]);
   const tls = tlsRuntime.getStatus();
   const validToEpoch = tls.validTo ? Date.parse(tls.validTo) : NaN;
@@ -792,6 +786,14 @@ app.get("/admin/secrets/catalog", { preHandler: requireAnyRole(["admin"]) }, asy
   await proxy(request, reply, "GET", config.workflowServiceUrl, "/admin/secrets/catalog");
 });
 
+app.post("/admin/reset/workflows-orders/preview", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/reset/workflows-orders/preview");
+});
+
+app.post("/admin/reset/workflows-orders/execute", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/reset/workflows-orders/execute");
+});
+
 app.post("/admin/secrets/by-path", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
   await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/secrets/by-path");
 });
@@ -817,14 +819,142 @@ app.get("/workflows/:id", { preHandler: requireAnyRole(["admin", "useradmin", "o
   await proxy(request, reply, "GET", config.workflowServiceUrl, `/workflows/${id}`);
 });
 
+app.get("/workflows/:id/versions/:versionId", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+  const { id, versionId } = request.params as { id: string; versionId: string };
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/workflows/${id}/versions/${versionId}`);
+});
+
+app.patch("/workflows/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/workflows/${id}`);
+});
+
+app.post("/workflows/:id/draft", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/draft`);
+});
+
+app.put("/workflows/:id/versions/:versionId/draft", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const { id, versionId } = request.params as { id: string; versionId: string };
+  await proxy(request, reply, "PUT", config.workflowServiceUrl, `/workflows/${id}/versions/${versionId}/draft`);
+});
+
+app.post("/workflows/:id/copy", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/copy`);
+});
+
+app.delete("/workflows/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/workflows/${id}`);
+});
+
 app.post("/workflows/:id/publish", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
   await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/publish`);
 });
 
+app.post("/workflows/:id/versions/:versionId/publish", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  const { id, versionId } = request.params as { id: string; versionId: string };
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/versions/${versionId}/publish`);
+});
+
+app.post("/workflows/:id/versions/:versionId/activate", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  const { id, versionId } = request.params as { id: string; versionId: string };
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/versions/${versionId}/activate`);
+});
+
+app.post("/workflows/import", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/workflows/import");
+});
+
+app.get("/workflows/:id/export", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/workflows/${id}/export`);
+});
+
+app.post("/planner/draft", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/planner/draft");
+});
+
 app.get("/workflows/:id/publish-audits", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
   await proxy(request, reply, "GET", config.workflowServiceUrl, `/workflows/${id}/publish-audits`);
+});
+
+app.get("/rag/discussions", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/discussions");
+});
+
+app.post("/rag/discussions", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/rag/discussions");
+});
+
+app.get("/rag/discussions/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/rag/discussions/${id}`);
+});
+
+app.post("/rag/discussions/:id/messages", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/discussions/${id}/messages`);
+});
+
+app.delete("/rag/discussions/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/discussions/${id}`);
+});
+
+app.post("/node-templates/import", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/node-templates/import");
+});
+
+app.post("/node-templates", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/node-templates");
+});
+
+app.get("/node-templates", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/node-templates");
+});
+
+app.get("/node-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/node-templates/${id}`);
+});
+
+app.patch("/node-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/node-templates/${id}`);
+});
+
+app.delete("/node-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/node-templates/${id}`);
+});
+
+app.post("/node-templates/:id/duplicate", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/node-templates/${id}/duplicate`);
+});
+
+app.get("/node-templates/:id/shares", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/node-templates/${id}/shares`);
+});
+
+app.post("/node-templates/:id/share", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/node-templates/${id}/share`);
+});
+
+app.delete("/node-templates/:id/share/:username", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const params = request.params as { id: string; username: string };
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/node-templates/${params.id}/share/${params.username}`);
+});
+
+app.get("/node-templates/:id/export", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/node-templates/${id}/export`);
 });
 
 app.post("/integrations", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
@@ -986,22 +1116,6 @@ app.get("/logs", { preHandler: requireAnyRole(["admin", "useradmin", "operator",
 
 app.get("/logs/timeline", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.loggingServiceUrl, "/logs/timeline");
-});
-
-app.post("/chat/query", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.chatServiceUrl, "/chat/query");
-});
-
-app.post("/rag/search", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.ragServiceUrl, "/rag/search");
-});
-
-app.post("/rag/index", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.ragServiceUrl, "/rag/index");
-});
-
-app.get("/rag/jobs", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "GET", config.ragServiceUrl, "/rag/jobs");
 });
 
 app.addHook("onClose", async () => {

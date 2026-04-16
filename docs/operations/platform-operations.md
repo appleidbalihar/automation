@@ -6,7 +6,6 @@
 - Skip already configured items.
 - Retry, continue, or roll back based on configured policy.
 - Review status timelines and masked logs.
-- Ask the assistant for workflow usage and troubleshooting help.
 
 ## Failure handling
 - The system keeps execution checkpoints after successful steps.
@@ -18,4 +17,3 @@
 - `operator`: execute and monitor orders
 - `approver`: approve gated nodes
 - `viewer`: read-only access
-

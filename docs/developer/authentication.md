@@ -1,7 +1,7 @@
 # Developer Guide: Authentication and RBAC
 
 ## Overview
-`@platform/auth` supports Keycloak JWT verification for gateway authorization, with legacy local bearer parsing gated behind an explicit development flag.
+`@platform/auth` supports Keycloak JWT verification only for gateway authorization.
 
 ## Token handling
 - If bearer token is JWT-shaped (`header.payload.signature`):
@@ -11,9 +11,7 @@
   - extract roles from:
     - `realm_access.roles`
     - `resource_access[KEYCLOAK_CLIENT_ID].roles`
-- If bearer token is legacy (`user:role[:role...]`):
-  - parse only when `AUTH_ALLOW_LEGACY_BEARER=true`
-  - otherwise resolve to anonymous viewer context
+- If bearer token is not a valid JWT for the configured Keycloak realm/client, resolve to anonymous context and protected routes return `401`.
 
 ## Role model
 - Allowed roles: `admin`, `operator`, `approver`, `viewer`
@@ -25,9 +23,8 @@
 - `KEYCLOAK_ISSUER` (optional explicit issuer override)
 - `KEYCLOAK_REALM`
 - `KEYCLOAK_CLIENT_ID`
-- `AUTH_ALLOW_LEGACY_BEARER` (`false` by default)
 
 ## Security behavior
 - JWT verification failure falls back to anonymous viewer context (no privileged role escalation).
-- Non-JWT bearer tokens are ignored unless explicitly allowed for local/dev compatibility.
+- Non-JWT bearer tokens are ignored.
 - Gateway role checks remain enforced through `requireAnyRole`.

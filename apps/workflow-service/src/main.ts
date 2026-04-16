@@ -1,17 +1,41 @@
 import Fastify from "fastify";
 import amqp from "amqplib";
+import { randomUUID } from "node:crypto";
 import type { Channel, ChannelModel, ConsumeMessage } from "amqplib";
 import { loadConfig } from "@platform/config";
 import { prisma } from "@platform/db";
 import {
+  type NodeTemplateRecord,
+  type NodeTemplateSummary,
   PlatformEvents,
+  type RagDiscussionSendMessageResponse,
+  type RagDiscussionSummary,
+  type RagDiscussionThread,
+  type WorkflowExportPayload,
+  flowDefinitionToWorkflowNodes,
+  isWorkflowFlowDefinition,
+  normalizeWorkflowFlow,
   type ExecutionType,
   type IntegrationAuthType,
+  type WorkflowFlowDefinition,
   type WorkflowNode
 } from "@platform/contracts";
 import { createCorrelationId } from "@platform/observability";
 import { connectAmqp, createTlsRuntime, tlsFetch } from "@platform/tls-runtime";
 import { EventPublisher } from "./events.js";
+import {
+  buildRagThreadExpiry,
+  deriveRagThreadTitle,
+  extractFlowiseText,
+  mapRagDiscussionMessage,
+  mapRagDiscussionSummary,
+  mapRagDiscussionThread
+} from "./rag-chat.js";
+import {
+  mapNodeTemplateRecord,
+  mapNodeTemplateSummary,
+  normalizeNodeTemplateDefinition
+} from "./node-templates.js";
 
 const config = loadConfig("workflow-service", 4001);
 const tlsRuntime = createTlsRuntime({
@@ -38,6 +62,8 @@ const SENSITIVE_KEY_PATTERN = /(password|token|secret|api[-_]?key|private[-_]?ke
 const VAULT_REF_PATTERN = /^vault:[^#\s]+#[^#\s]+$/i;
 const VAULT_KV_MOUNT = String(process.env.VAULT_KV_MOUNT ?? "secret").trim() || "secret";
 const STRICT_VAULT_ONLY = String(process.env.VAULT_STRICT_SECRETS ?? "true").trim().toLowerCase() !== "false";
+const RESET_CONFIRM_TEXT = "RESET WORKFLOWS AND ORDERS";
+let resetInProgress = false;
 
 type SensitiveIssue = {
   path: string;
@@ -296,6 +322,253 @@ function normalizeAuthType(value: unknown): IntegrationAuthType | undefined {
   return AUTH_TYPES.find((entry) => entry === normalized as IntegrationAuthType);
 }
 
+async function requestPlannerDraft(prompt: string, existingFlowDefinition?: WorkflowFlowDefinition): Promise<{
+  flowDefinition: WorkflowFlowDefinition;
+  diagnostics: {
+    attempts: number;
+    plannerStatus: number;
+    latencyMs: number;
+  };
+}> {
+  const maxAttempts = 2;
+  let lastError = "PLANNER_UNKNOWN_ERROR";
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const started = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch(config.flowisePlannerUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(config.flowiseApiKey ? { authorization: `Bearer ${config.flowiseApiKey}` } : {})
+        },
+        body: JSON.stringify({
+          prompt,
+          existingFlowDefinition
+        }),
+        signal: controller.signal
+      });
+      const latencyMs = Date.now() - started;
+      if (!response.ok) {
+        lastError = `PLANNER_HTTP_${response.status}`;
+        continue;
+      }
+      const payload = (await response.json()) as { flowDefinition?: WorkflowFlowDefinition; output?: unknown };
+      const candidate = payload.flowDefinition ?? payload.output;
+      const flowDefinition = normalizeWorkflowFlow(candidate);
+      return {
+        flowDefinition,
+        diagnostics: {
+          attempts: attempt,
+          plannerStatus: response.status,
+          latencyMs
+        }
+      };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : "PLANNER_REQUEST_FAILED";
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  throw new Error(lastError);
+}
+
+function fallbackPlannerDraft(prompt: string, existingFlowDefinition?: WorkflowFlowDefinition): WorkflowFlowDefinition {
+  if (existingFlowDefinition) {
+    return normalizeWorkflowFlow(existingFlowDefinition);
+  }
+  const normalizedPrompt = prompt.trim();
+  return normalizeWorkflowFlow({
+    schemaVersion: "v2",
+    nodes: [
+      {
+        id: "node-1",
+        type: "task",
+        label: "Planned Node 1",
+        position: { x: 160, y: 140 },
+        config: {
+          configType: "SIMPLE",
+          approvalRequired: false,
+          failurePolicy: "RETRY",
+          steps: [
+            {
+              id: "step-1",
+              name: normalizedPrompt ? `Generated from: ${normalizedPrompt.slice(0, 64)}` : "Generated Step 1",
+              executionType: "SCRIPT",
+              commandRef: "echo planner-fallback",
+              inputVariables: {},
+              successCriteria: "ok",
+              retryPolicy: { maxRetries: 1, backoffMs: 100 }
+            }
+          ]
+        }
+      }
+    ],
+    edges: []
+  });
+}
+
+async function pruneExpiredRagDiscussions(): Promise<void> {
+  await prisma.ragDiscussionThread.deleteMany({
+    where: {
+      expiresAt: {
+        lt: new Date()
+      }
+    }
+  });
+}
+
+function normalizeRagMessageContent(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+async function requestOperationsRagReply(question: string, flowiseSessionId: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+  try {
+    const response = await fetch(config.flowiseOperationsChatUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(config.flowiseApiKey ? { authorization: `Bearer ${config.flowiseApiKey}` } : {})
+      },
+      body: JSON.stringify({
+        question,
+        chatId: flowiseSessionId
+      }),
+      signal: controller.signal
+    });
+    const raw = await response.text();
+    const payload = raw.length > 0 ? tryParseJson(raw) ?? raw : {};
+    if (!response.ok) {
+      throw new Error(`FLOWISE_CHAT_HTTP_${response.status}:${typeof payload === "string" ? payload : JSON.stringify(payload)}`);
+    }
+    return extractFlowiseText(payload);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function getOwnedRagDiscussion(threadId: string, ownerId: string): Promise<{
+  id: string;
+  ownerId: string;
+  title: string;
+  flowiseSessionId: string;
+  createdAt: Date;
+  updatedAt: Date;
+  lastMessageAt: Date;
+  expiresAt: Date;
+} | null> {
+  return prisma.ragDiscussionThread.findFirst({
+    where: {
+      id: threadId,
+      ownerId
+    }
+  });
+}
+
+async function listRagDiscussionSummaries(ownerId: string): Promise<RagDiscussionSummary[]> {
+  await pruneExpiredRagDiscussions();
+  const threads = await prisma.ragDiscussionThread.findMany({
+    where: { ownerId },
+    include: {
+      messages: {
+        orderBy: { createdAt: "desc" },
+        take: 1
+      }
+    },
+    orderBy: [{ lastMessageAt: "desc" }]
+  });
+
+  return threads.map((thread) => mapRagDiscussionSummary(thread, thread.messages[0]?.content));
+}
+
+async function getRagDiscussionThread(threadId: string, ownerId: string): Promise<RagDiscussionThread | null> {
+  await pruneExpiredRagDiscussions();
+  const thread = await prisma.ragDiscussionThread.findFirst({
+    where: {
+      id: threadId,
+      ownerId
+    },
+    include: {
+      messages: {
+        orderBy: { createdAt: "asc" }
+      }
+    }
+  });
+  if (!thread) return null;
+  return mapRagDiscussionThread(thread, thread.messages);
+}
+
+async function createRagDiscussion(ownerId: string): Promise<RagDiscussionSummary> {
+  await pruneExpiredRagDiscussions();
+  const now = new Date();
+  const thread = await prisma.ragDiscussionThread.create({
+    data: {
+      ownerId,
+      title: "New discussion",
+      flowiseSessionId: `rag-${randomUUID()}`,
+      lastMessageAt: now,
+      expiresAt: buildRagThreadExpiry(now)
+    }
+  });
+  return mapRagDiscussionSummary(thread);
+}
+
+async function appendRagDiscussionMessage(threadId: string, ownerId: string, content: string): Promise<RagDiscussionSendMessageResponse | null> {
+  await pruneExpiredRagDiscussions();
+  const thread = await getOwnedRagDiscussion(threadId, ownerId);
+  if (!thread) return null;
+
+  const normalizedContent = normalizeRagMessageContent(content);
+  if (!normalizedContent) {
+    throw new Error("RAG_MESSAGE_CONTENT_REQUIRED");
+  }
+
+  const existingMessageCount = await prisma.ragDiscussionMessage.count({
+    where: { threadId: thread.id }
+  });
+  const assistantText = await requestOperationsRagReply(normalizedContent, thread.flowiseSessionId);
+  const now = new Date();
+  const nextTitle = existingMessageCount === 0 ? deriveRagThreadTitle(normalizedContent) : thread.title;
+  const nextExpiry = buildRagThreadExpiry(now);
+
+  const persisted = await prisma.$transaction(async (tx) => {
+    const userMessage = await tx.ragDiscussionMessage.create({
+      data: {
+        threadId: thread.id,
+        role: "user",
+        content: normalizedContent,
+        createdAt: now
+      }
+    });
+    const assistantMessage = await tx.ragDiscussionMessage.create({
+      data: {
+        threadId: thread.id,
+        role: "assistant",
+        content: assistantText,
+        createdAt: now
+      }
+    });
+    const updatedThread = await tx.ragDiscussionThread.update({
+      where: { id: thread.id },
+      data: {
+        title: nextTitle,
+        lastMessageAt: now,
+        expiresAt: nextExpiry
+      }
+    });
+    return { userMessage, assistantMessage, updatedThread };
+  });
+
+  return {
+    thread: mapRagDiscussionSummary(persisted.updatedThread, persisted.assistantMessage.content),
+    userMessage: mapRagDiscussionMessage(persisted.userMessage),
+    assistantMessage: mapRagDiscussionMessage(persisted.assistantMessage)
+  };
+}
+
 function parseScope(value: unknown): "owned" | "shared" | "all" {
   const scope = String(value ?? "owned").trim().toLowerCase();
   if (scope === "shared" || scope === "all") return scope;
@@ -314,8 +587,37 @@ function uniqueById<T extends { id: string }>(items: T[]): T[] {
 }
 
 function toNodeArray(value: unknown): Array<Record<string, unknown>> {
+  if (isWorkflowFlowDefinition(value)) {
+    try {
+      const nodes = flowDefinitionToWorkflowNodes(value).map((node) => JSON.parse(JSON.stringify(node)));
+      return nodes as Array<Record<string, unknown>>;
+    } catch {
+      return [];
+    }
+  }
   if (!Array.isArray(value)) return [];
   return value.filter((entry) => entry && typeof entry === "object") as Array<Record<string, unknown>>;
+}
+
+async function validateCanonicalFlow(flowDefinition: WorkflowFlowDefinition): Promise<{ valid: boolean; errors: string[] }> {
+  try {
+    const workflowNodes = flowDefinitionToWorkflowNodes(flowDefinition);
+    const response = await tlsFetch(tlsRuntime, new URL("/engine/validate-workflow", config.executionEngineServiceUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workflowNodes })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body || body.valid !== true) {
+      return {
+        valid: false,
+        errors: Array.isArray(body?.errors) ? body.errors.map((entry: unknown) => String(entry)) : ["WORKFLOW_ENGINE_VALIDATION_FAILED"]
+      };
+    }
+    return { valid: true, errors: [] };
+  } catch (error) {
+    return { valid: false, errors: [error instanceof Error ? error.message : "WORKFLOW_VALIDATION_ERROR"] };
+  }
 }
 
 function integrationIdUsedInNodes(nodes: unknown, integrationId: string): boolean {
@@ -400,6 +702,18 @@ async function loadEnvironmentWithAccess(environmentId: string, requester: strin
   return { environment, owner, shared, allowed };
 }
 
+async function loadNodeTemplateWithAccess(templateId: string, requester: string, admin: boolean) {
+  const template = await prisma.nodeTemplate.findUnique({
+    where: { id: templateId },
+    include: { shares: true }
+  });
+  if (!template) return { template: null, owner: false, shared: false, allowed: false };
+  const owner = template.ownerId === requester;
+  const shared = template.shares.some((entry) => entry.sharedWithUserId === requester);
+  const allowed = admin || owner || shared;
+  return { template, owner, shared, allowed };
+}
+
 function toIntegrationResponse(
   integration: {
     id: string;
@@ -449,6 +763,44 @@ function toEnvironmentResponse(
     access,
     sharedWithUsers: (environment.shares ?? []).map((entry) => entry.sharedWithUserId)
   };
+}
+
+async function listNodeTemplates(requester: string, admin: boolean, scope: "owned" | "shared" | "all", limit: number): Promise<NodeTemplateSummary[]> {
+  if (scope === "shared") {
+    const shared = await prisma.nodeTemplateShare.findMany({
+      where: { sharedWithUserId: requester },
+      include: { template: { include: { shares: true } } },
+      orderBy: [{ createdAt: "desc" }],
+      take: limit
+    });
+    return shared.map((entry) => mapNodeTemplateSummary(entry.template, requester, admin));
+  }
+
+  if (scope === "all") {
+    const [owned, shared] = await Promise.all([
+      prisma.nodeTemplate.findMany({
+        where: { ownerId: requester },
+        include: { shares: true },
+        orderBy: [{ updatedAt: "desc" }],
+        take: limit
+      }),
+      prisma.nodeTemplateShare.findMany({
+        where: { sharedWithUserId: requester },
+        include: { template: { include: { shares: true } } },
+        orderBy: [{ createdAt: "desc" }],
+        take: limit
+      })
+    ]);
+    return uniqueById([...owned, ...shared.map((entry) => entry.template)]).slice(0, limit).map((entry) => mapNodeTemplateSummary(entry, requester, admin));
+  }
+
+  const owned = await prisma.nodeTemplate.findMany({
+    where: { ownerId: requester },
+    include: { shares: true },
+    orderBy: [{ updatedAt: "desc" }],
+    take: limit
+  });
+  return owned.map((entry) => mapNodeTemplateSummary(entry, requester, admin));
 }
 
 async function startPublishAuditWorker(): Promise<{ connection: ChannelModel; channel: Channel } | undefined> {
@@ -525,8 +877,134 @@ app.get("/security/tls", async (request, reply) => {
   return tlsRuntime.getStatus();
 });
 
+type WorkflowSummaryResponse = {
+  id: string;
+  name: string;
+  description: string | null;
+  version: number | null;
+  state: "DRAFT" | "PUBLISHED" | "NONE";
+  status: "ACTIVE" | "INACTIVE";
+  selectedVersionId: string | null;
+  updatedAt: string;
+};
+
+function normalizeIncomingFlow(flowDefinition: WorkflowFlowDefinition | undefined): WorkflowFlowDefinition {
+  return normalizeWorkflowFlow(flowDefinition);
+}
+
+async function ensureFlowIsValid(flowDefinition: WorkflowFlowDefinition): Promise<{ valid: boolean; errors: string[] }> {
+  return validateCanonicalFlow(flowDefinition);
+}
+
+function summarizeWorkflowVersion(version: {
+  id: string;
+  version: number;
+  status: string;
+  isActive: boolean;
+  createdAt: Date;
+}): {
+  id: string;
+  version: number;
+  state: "DRAFT" | "PUBLISHED";
+  status: "ACTIVE" | "INACTIVE";
+  createdAt: string;
+} {
+  return {
+    id: version.id,
+    version: version.version,
+    state: version.status === "PUBLISHED" ? "PUBLISHED" : "DRAFT",
+    status: version.isActive ? "ACTIVE" : "INACTIVE",
+    createdAt: version.createdAt.toISOString()
+  };
+}
+
+async function buildWorkflowSummaryList(): Promise<WorkflowSummaryResponse[]> {
+  const workflows = await prisma.workflow.findMany({
+    include: {
+      versions: {
+        orderBy: [{ version: "desc" }]
+      }
+    },
+    orderBy: { updatedAt: "desc" }
+  });
+
+  return workflows.map((workflow) => {
+    const draftVersion = workflow.versions.find((entry) => entry.status === "DRAFT");
+    const activePublished = workflow.versions.find((entry) => entry.status === "PUBLISHED" && entry.isActive);
+    const latestVersion = workflow.versions[0];
+    const selectedVersion = draftVersion ?? activePublished ?? latestVersion ?? null;
+    return {
+      id: workflow.id,
+      name: workflow.name,
+      description: workflow.description ?? null,
+      version: selectedVersion?.version ?? null,
+      state: selectedVersion ? (selectedVersion.status === "PUBLISHED" ? "PUBLISHED" : "DRAFT") : "NONE",
+      status: activePublished ? "ACTIVE" : "INACTIVE",
+      selectedVersionId: selectedVersion?.id ?? null,
+      updatedAt: workflow.updatedAt.toISOString()
+    };
+  });
+}
+
+function buildPlannerPreview(existingFlow: WorkflowFlowDefinition | undefined, proposedFlow: WorkflowFlowDefinition) {
+  const previousNodes = new Map((existingFlow?.nodes ?? []).map((node) => [node.id, node]));
+  const nextNodes = new Map(proposedFlow.nodes.map((node) => [node.id, node]));
+  const previousEdges = new Map((existingFlow?.edges ?? []).map((edge) => [edge.id, edge]));
+  const nextEdges = new Map(proposedFlow.edges.map((edge) => [edge.id, edge]));
+
+  const nodesAdded = proposedFlow.nodes.filter((node) => !previousNodes.has(node.id)).map((node) => node.label);
+  const nodesRemoved = (existingFlow?.nodes ?? []).filter((node) => !nextNodes.has(node.id)).map((node) => node.label);
+  const nodesChanged = proposedFlow.nodes
+    .filter((node) => previousNodes.has(node.id))
+    .filter((node) => JSON.stringify(previousNodes.get(node.id)) !== JSON.stringify(node))
+    .map((node) => node.label);
+  const edgesAdded = proposedFlow.edges.filter((edge) => !previousEdges.has(edge.id)).length;
+  const edgesRemoved = (existingFlow?.edges ?? []).filter((edge) => !nextEdges.has(edge.id)).length;
+  const approvalsChanged = proposedFlow.nodes
+    .filter((node) => {
+      const previous = previousNodes.get(node.id);
+      if (!previous) return node.config.approvalMode !== "NONE";
+      return (
+        previous.config.approvalMode !== node.config.approvalMode ||
+        previous.config.autoDecision !== node.config.autoDecision ||
+        previous.config.approvalTimeoutSec !== node.config.approvalTimeoutSec
+      );
+    })
+    .map((node) => node.label);
+
+  return {
+    summary: `Planner proposed ${nodesAdded.length} new nodes, ${nodesChanged.length} node updates, and ${edgesAdded} added edges.`,
+    changePreview: {
+      nodesAdded,
+      nodesRemoved,
+      nodesChanged,
+      edgesAdded,
+      edgesRemoved,
+      approvalsChanged
+    }
+  };
+}
+
 app.post("/workflows", async (request, reply) => {
-  const body = request.body as { name: string; description?: string; nodes?: WorkflowNode[] };
+  const body = request.body as { name: string; description?: string; flowDefinition?: WorkflowFlowDefinition };
+  let normalizedFlow: WorkflowFlowDefinition;
+  try {
+    normalizedFlow = normalizeIncomingFlow(body.flowDefinition);
+  } catch (error) {
+    return reply.code(400).send({
+      error: "INVALID_WORKFLOW_FLOW",
+      details: error instanceof Error ? error.message : "Invalid canonical flow payload"
+    });
+  }
+
+  const validation = await ensureFlowIsValid(normalizedFlow);
+  if (!validation.valid) {
+    return reply.code(400).send({
+      error: "INVALID_WORKFLOW_FLOW",
+      errors: validation.errors
+    });
+  }
+
   const workflow = await prisma.workflow.create({
     data: {
       name: body.name,
@@ -539,7 +1017,8 @@ app.post("/workflows", async (request, reply) => {
       workflowId: workflow.id,
       version: 1,
       status: "DRAFT",
-      nodesJson: JSON.parse(JSON.stringify(body.nodes ?? []))
+      isActive: false,
+      nodesJson: JSON.parse(JSON.stringify(normalizedFlow))
     }
   });
 
@@ -548,34 +1027,367 @@ app.post("/workflows", async (request, reply) => {
     data: { latestVersionId: version.id }
   });
 
-  reply.code(201).send({ workflow, version });
+  reply.code(201).send({ workflow, version: summarizeWorkflowVersion(version) });
 });
 
-app.get("/workflows", async () => prisma.workflow.findMany({ orderBy: { createdAt: "desc" } }));
+app.get("/workflows", async () => buildWorkflowSummaryList());
 
 app.get("/workflows/:id", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const workflow = await prisma.workflow.findUnique({
+    where: { id },
+    include: {
+      versions: {
+        orderBy: [{ version: "desc" }]
+      }
+    }
+  });
+  if (!workflow) {
+    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  }
+
+  const versions = workflow.versions.map((version) => ({
+    ...summarizeWorkflowVersion(version),
+    nodesJson: version.nodesJson
+  }));
+
+  return {
+    workflow: {
+      id: workflow.id,
+      name: workflow.name,
+      description: workflow.description ?? null,
+      latestVersionId: workflow.latestVersionId ?? null,
+      updatedAt: workflow.updatedAt.toISOString()
+    },
+    versions
+  };
+});
+
+app.get("/workflows/:id/versions/:versionId", async (request, reply) => {
+  const params = request.params as { id: string; versionId: string };
+  const version = await prisma.workflowVersion.findFirst({
+    where: {
+      id: params.versionId,
+      workflowId: params.id
+    }
+  });
+  if (!version) {
+    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
+  }
+  return {
+    version: {
+      ...summarizeWorkflowVersion(version),
+      nodesJson: version.nodesJson
+    }
+  };
+});
+
+app.patch("/workflows/:id", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const body = (request.body ?? {}) as { name?: string; description?: string | null };
+  try {
+    const workflow = await prisma.workflow.update({
+      where: { id },
+      data: {
+        name: body.name,
+        description: body.description ?? null
+      }
+    });
+    return { workflow };
+  } catch {
+    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  }
+});
+
+app.post("/workflows/:id/draft", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const body = (request.body ?? {}) as { sourceVersionId?: string };
+  const workflow = await prisma.workflow.findUnique({ where: { id } });
+  if (!workflow) {
+    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  }
+
+  const existingDraft = await prisma.workflowVersion.findFirst({
+    where: { workflowId: id, status: "DRAFT" },
+    orderBy: { version: "desc" }
+  });
+
+  if (existingDraft) {
+    await prisma.workflow.update({
+      where: { id },
+      data: { latestVersionId: existingDraft.id }
+    });
+    return { version: { ...summarizeWorkflowVersion(existingDraft), nodesJson: existingDraft.nodesJson } };
+  }
+
+  const sourceVersion =
+    (body.sourceVersionId
+      ? await prisma.workflowVersion.findFirst({
+          where: { id: body.sourceVersionId, workflowId: id }
+        })
+      : undefined) ??
+    (await prisma.workflowVersion.findFirst({
+      where: { workflowId: id, isActive: true },
+      orderBy: { version: "desc" }
+    })) ??
+    (await prisma.workflowVersion.findFirst({
+      where: { workflowId: id },
+      orderBy: { version: "desc" }
+    }));
+
+  if (!sourceVersion) {
+    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
+  }
+
+  const latestVersion = await prisma.workflowVersion.findFirst({
+    where: { workflowId: id },
+    orderBy: { version: "desc" }
+  });
+
+  const version = await prisma.workflowVersion.create({
+    data: {
+      workflowId: id,
+      version: (latestVersion?.version ?? 0) + 1,
+      status: "DRAFT",
+      isActive: false,
+      nodesJson: JSON.parse(JSON.stringify(sourceVersion.nodesJson ?? {}))
+    }
+  });
+
+  await prisma.workflow.update({
+    where: { id },
+    data: { latestVersionId: version.id }
+  });
+
+  return { version: { ...summarizeWorkflowVersion(version), nodesJson: version.nodesJson } };
+});
+
+app.put("/workflows/:id/versions/:versionId/draft", async (request, reply) => {
+  const params = request.params as { id: string; versionId: string };
+  const body = (request.body ?? {}) as { name?: string; description?: string | null; flowDefinition?: WorkflowFlowDefinition };
+  let normalizedFlow: WorkflowFlowDefinition;
+  try {
+    normalizedFlow = normalizeIncomingFlow(body.flowDefinition);
+  } catch (error) {
+    return reply.code(400).send({
+      error: "INVALID_WORKFLOW_FLOW",
+      details: error instanceof Error ? error.message : "Invalid canonical flow payload"
+    });
+  }
+  const validation = await ensureFlowIsValid(normalizedFlow);
+  if (!validation.valid) {
+    return reply.code(400).send({ error: "INVALID_WORKFLOW_FLOW", errors: validation.errors });
+  }
+
+  const version = await prisma.workflowVersion.findFirst({
+    where: { id: params.versionId, workflowId: params.id }
+  });
+  if (!version) {
+    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
+  }
+  if (version.status !== "DRAFT") {
+    return reply.code(400).send({ error: "ONLY_DRAFT_VERSION_EDITABLE" });
+  }
+
+  const updatedVersion = await prisma.workflowVersion.update({
+    where: { id: version.id },
+    data: {
+      nodesJson: JSON.parse(JSON.stringify(normalizedFlow))
+    }
+  });
+
+  const workflow = await prisma.workflow.update({
+    where: { id: params.id },
+    data: {
+      name: body.name,
+      description: body.description ?? undefined,
+      latestVersionId: updatedVersion.id
+    }
+  });
+
+  return {
+    workflow,
+    version: {
+      ...summarizeWorkflowVersion(updatedVersion),
+      nodesJson: updatedVersion.nodesJson
+    }
+  };
+});
+
+app.post("/workflows/:id/copy", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const body = (request.body ?? {}) as { versionId?: string; name?: string; description?: string };
+  const source = await prisma.workflow.findUnique({
+    where: { id },
+    include: { versions: { orderBy: { version: "desc" } } }
+  });
+  if (!source) {
+    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  }
+  const sourceVersion =
+    source.versions.find((entry) => entry.id === body.versionId) ??
+    source.versions.find((entry) => entry.isActive) ??
+    source.versions[0];
+  if (!sourceVersion) {
+    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
+  }
+
+  const workflow = await prisma.workflow.create({
+    data: {
+      name: body.name?.trim() || `${source.name} Copy`,
+      description: body.description ?? source.description
+    }
+  });
+  const version = await prisma.workflowVersion.create({
+    data: {
+      workflowId: workflow.id,
+      version: 1,
+      status: "DRAFT",
+      isActive: false,
+      nodesJson: JSON.parse(JSON.stringify(sourceVersion.nodesJson ?? {}))
+    }
+  });
+  await prisma.workflow.update({
+    where: { id: workflow.id },
+    data: { latestVersionId: version.id }
+  });
+  return {
+    workflow,
+    version: {
+      ...summarizeWorkflowVersion(version),
+      nodesJson: version.nodesJson
+    }
+  };
+});
+
+app.delete("/workflows/:id", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const workflow = await prisma.workflow.findUnique({
+    where: { id },
+    include: { versions: { select: { id: true } } }
+  });
+  if (!workflow) {
+    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  }
+  const versionIds = workflow.versions.map((entry) => entry.id);
+  const orderCount = await prisma.order.count({
+    where: { workflowVersionId: { in: versionIds.length > 0 ? versionIds : ["__none__"] } }
+  });
+  if (orderCount > 0) {
+    return reply.code(409).send({ error: "WORKFLOW_DELETE_BLOCKED_IN_USE", orderCount });
+  }
+  await prisma.workflow.delete({ where: { id } });
+  return { deleted: true, workflowId: id };
+});
+
+app.post("/workflows/:id/versions/:versionId/publish", async (request, reply) => {
+  const params = request.params as { id: string; versionId: string };
+  const correlationId = String(request.headers["x-correlation-id"] ?? createCorrelationId("workflow-publish"));
+  const version = await prisma.workflowVersion.findFirst({
+    where: { id: params.versionId, workflowId: params.id }
+  });
+  if (!version) {
+    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
+  }
+
+  let canonicalFlow: WorkflowFlowDefinition;
+  try {
+    canonicalFlow = normalizeWorkflowFlow(version.nodesJson);
+  } catch (error) {
+    return reply.code(400).send({
+      error: "WORKFLOW_PUBLISH_VALIDATION_FAILED",
+      errors: [error instanceof Error ? error.message : "Invalid canonical flow payload"]
+    });
+  }
+  const validation = await validateCanonicalFlow(canonicalFlow);
+  if (!validation.valid) {
+    return reply.code(400).send({
+      error: "WORKFLOW_PUBLISH_VALIDATION_FAILED",
+      errors: validation.errors
+    });
+  }
+
+  const activePublishedCount = await prisma.workflowVersion.count({
+    where: {
+      workflowId: params.id,
+      status: "PUBLISHED",
+      isActive: true
+    }
+  });
+
+  const published = await prisma.workflowVersion.update({
+    where: { id: version.id },
+    data: {
+      status: "PUBLISHED",
+      isActive: activePublishedCount === 0
+    }
+  });
+  await prisma.workflow.update({
+    where: { id: params.id },
+    data: { latestVersionId: published.id }
+  });
+
+  await eventPublisher.publish(PlatformEvents.workflowPublished, {
+    workflowId: params.id,
+    workflowVersionId: published.id,
+    version: published.version,
+    status: published.status,
+    correlationId
+  });
+
+  return { event: PlatformEvents.workflowPublished, version: summarizeWorkflowVersion(published), correlationId };
+});
+
+app.post("/workflows/:id/publish", async (request, reply) => {
   const id = (request.params as { id: string }).id;
   const workflow = await prisma.workflow.findUnique({ where: { id } });
   if (!workflow) {
     return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
   }
-  const versions = await prisma.workflowVersion.findMany({ where: { workflowId: id }, orderBy: { version: "desc" } });
-  return { workflow, versions };
-});
-
-app.post("/workflows/:id/publish", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const correlationId = String(request.headers["x-correlation-id"] ?? createCorrelationId("workflow-publish"));
   const latest = await prisma.workflowVersion.findFirst({
-    where: { workflowId: id },
+    where: { workflowId: id, status: "DRAFT" },
     orderBy: { version: "desc" }
   });
   if (!latest) {
     return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
   }
+  const correlationId = String(request.headers["x-correlation-id"] ?? createCorrelationId("workflow-publish"));
+
+  let canonicalFlow: WorkflowFlowDefinition;
+  try {
+    canonicalFlow = normalizeWorkflowFlow(latest.nodesJson);
+  } catch (error) {
+    return reply.code(400).send({
+      error: "WORKFLOW_PUBLISH_VALIDATION_FAILED",
+      errors: [error instanceof Error ? error.message : "Invalid canonical flow payload"]
+    });
+  }
+  const validation = await validateCanonicalFlow(canonicalFlow);
+  if (!validation.valid) {
+    return reply.code(400).send({
+      error: "WORKFLOW_PUBLISH_VALIDATION_FAILED",
+      errors: validation.errors
+    });
+  }
+
+  const activePublishedCount = await prisma.workflowVersion.count({
+    where: {
+      workflowId: id,
+      status: "PUBLISHED",
+      isActive: true
+    }
+  });
+
   const published = await prisma.workflowVersion.update({
     where: { id: latest.id },
-    data: { status: "PUBLISHED" }
+    data: {
+      status: "PUBLISHED",
+      isActive: activePublishedCount === 0
+    }
+  });
+  await prisma.workflow.update({
+    where: { id },
+    data: { latestVersionId: published.id }
   });
 
   await eventPublisher.publish(PlatformEvents.workflowPublished, {
@@ -586,7 +1398,349 @@ app.post("/workflows/:id/publish", async (request, reply) => {
     correlationId
   });
 
-  return { event: PlatformEvents.workflowPublished, version: published, correlationId };
+  return { event: PlatformEvents.workflowPublished, version: summarizeWorkflowVersion(published), correlationId };
+});
+
+app.post("/workflows/:id/versions/:versionId/activate", async (request, reply) => {
+  const params = request.params as { id: string; versionId: string };
+  const version = await prisma.workflowVersion.findFirst({
+    where: { id: params.versionId, workflowId: params.id }
+  });
+  if (!version) {
+    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
+  }
+  if (version.status !== "PUBLISHED") {
+    return reply.code(400).send({ error: "ONLY_PUBLISHED_VERSION_CAN_BE_ACTIVE" });
+  }
+
+  await prisma.$transaction([
+    prisma.workflowVersion.updateMany({
+      where: { workflowId: params.id },
+      data: { isActive: false }
+    }),
+    prisma.workflowVersion.update({
+      where: { id: version.id },
+      data: { isActive: true }
+    }),
+    prisma.workflow.update({
+      where: { id: params.id },
+      data: { latestVersionId: version.id }
+    })
+  ]);
+
+  const activated = await prisma.workflowVersion.findUnique({ where: { id: version.id } });
+  return { version: activated ? summarizeWorkflowVersion(activated) : null };
+});
+
+app.post("/workflows/import", async (request, reply) => {
+  const body = (request.body ?? {}) as { name?: string; description?: string; flowDefinition?: WorkflowFlowDefinition };
+  const name = String(body.name ?? "").trim();
+  if (!name) {
+    return reply.code(400).send({ error: "WORKFLOW_NAME_REQUIRED" });
+  }
+  let normalizedFlow: WorkflowFlowDefinition;
+  try {
+    normalizedFlow = normalizeIncomingFlow(body.flowDefinition);
+  } catch (error) {
+    return reply.code(400).send({ error: "INVALID_WORKFLOW_FLOW", details: error instanceof Error ? error.message : String(error) });
+  }
+  const validation = await ensureFlowIsValid(normalizedFlow);
+  if (!validation.valid) {
+    return reply.code(400).send({ error: "INVALID_WORKFLOW_FLOW", errors: validation.errors });
+  }
+  const workflow = await prisma.workflow.create({
+    data: { name, description: String(body.description ?? "").trim() || null }
+  });
+  const version = await prisma.workflowVersion.create({
+    data: {
+      workflowId: workflow.id,
+      version: 1,
+      status: "DRAFT",
+      isActive: false,
+      nodesJson: toJsonObject(normalizedFlow)
+    }
+  });
+  await prisma.workflow.update({
+    where: { id: workflow.id },
+    data: { latestVersionId: version.id }
+  });
+  return reply.code(201).send({ workflow, version: summarizeWorkflowVersion(version) });
+});
+
+app.get("/workflows/:id/export", async (request, reply) => {
+  const params = request.params as { id: string };
+  const query = request.query as { versionId?: string };
+  const details = await prisma.workflow.findUnique({
+    where: { id: params.id },
+    include: {
+      versions: {
+        orderBy: [{ version: "desc" }]
+      }
+    }
+  });
+  if (!details) {
+    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  }
+  const selected =
+    details.versions.find((version) => version.id === String(query.versionId ?? "").trim()) ??
+    details.versions.find((version) => version.isActive) ??
+    details.versions[0];
+  if (!selected) {
+    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
+  }
+  let flowDefinition: WorkflowFlowDefinition;
+  try {
+    flowDefinition = normalizeIncomingFlow(selected.nodesJson as unknown as WorkflowFlowDefinition);
+  } catch (error) {
+    return reply.code(400).send({ error: "INVALID_WORKFLOW_FLOW", details: error instanceof Error ? error.message : String(error) });
+  }
+  const payload: WorkflowExportPayload = {
+    workflow: {
+      id: details.id,
+      name: details.name,
+      description: details.description
+    },
+    version: {
+      id: selected.id,
+      version: selected.version,
+      state: selected.status === "PUBLISHED" ? "PUBLISHED" : "DRAFT",
+      status: selected.isActive ? "ACTIVE" : "INACTIVE"
+    },
+    flowDefinition
+  };
+  return payload;
+});
+
+app.get("/rag/discussions", async (request) => {
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  return listRagDiscussionSummaries(requester);
+});
+
+app.post("/rag/discussions", async (request, reply) => {
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const thread = await createRagDiscussion(requester);
+  return reply.code(201).send(thread);
+});
+
+app.get("/rag/discussions/:id", async (request, reply) => {
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const threadId = String((request.params as { id: string }).id ?? "").trim();
+  const thread = await getRagDiscussionThread(threadId, requester);
+  if (!thread) {
+    return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
+  }
+  return thread;
+});
+
+app.post("/rag/discussions/:id/messages", async (request, reply) => {
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const threadId = String((request.params as { id: string }).id ?? "").trim();
+  const body = (request.body ?? {}) as { content?: string };
+  const content = normalizeRagMessageContent(body.content);
+  if (!content) {
+    return reply.code(400).send({ error: "RAG_MESSAGE_CONTENT_REQUIRED" });
+  }
+  try {
+    const response = await appendRagDiscussionMessage(threadId, requester, content);
+    if (!response) {
+      return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
+    }
+    return response;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === "RAG_MESSAGE_CONTENT_REQUIRED") {
+      return reply.code(400).send({ error: message });
+    }
+    return reply.code(502).send({
+      error: "RAG_FLOWISE_REQUEST_FAILED",
+      details: message
+    });
+  }
+});
+
+app.delete("/rag/discussions/:id", async (request, reply) => {
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const threadId = String((request.params as { id: string }).id ?? "").trim();
+  const deleted = await prisma.ragDiscussionThread.deleteMany({
+    where: {
+      id: threadId,
+      ownerId: requester
+    }
+  });
+  if (deleted.count === 0) {
+    return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
+  }
+  return { deleted: true };
+});
+
+app.post("/planner/draft", async (request, reply) => {
+  const headers = request.headers as Record<string, unknown>;
+  const auth = requireAdmin(headers);
+  if (!auth.allowed) {
+    return reply.code(403).send(auth.error);
+  }
+  const body = (request.body ?? {}) as { prompt?: string; existingFlowDefinition?: WorkflowFlowDefinition };
+  const prompt = String(body.prompt ?? "").trim();
+  if (!prompt) {
+    return reply.code(400).send({ error: "PLANNER_PROMPT_REQUIRED" });
+  }
+  try {
+    const planner = await requestPlannerDraft(prompt, body.existingFlowDefinition);
+    const validation = await validateCanonicalFlow(planner.flowDefinition);
+    if (!validation.valid) {
+      return reply.code(400).send({
+        error: "PLANNER_FLOW_INVALID",
+        errors: validation.errors
+      });
+    }
+    const preview = buildPlannerPreview(body.existingFlowDefinition, planner.flowDefinition);
+    return {
+      flowDefinition: planner.flowDefinition,
+      summary: preview.summary,
+      changePreview: preview.changePreview,
+      diagnostics: {
+        planner: planner.diagnostics,
+        validated: true,
+        errors: [],
+        degraded: false
+      }
+    };
+  } catch (error) {
+    const flowDefinition = fallbackPlannerDraft(prompt, body.existingFlowDefinition);
+    const validation = await validateCanonicalFlow(flowDefinition);
+    if (!validation.valid) {
+      return reply.code(502).send({
+        error: "PLANNER_UNAVAILABLE",
+        details: error instanceof Error ? error.message : "Planner request failed",
+        validationErrors: validation.errors
+      });
+    }
+    const preview = buildPlannerPreview(body.existingFlowDefinition, flowDefinition);
+    return reply.code(200).send({
+      flowDefinition,
+      summary: preview.summary,
+      changePreview: preview.changePreview,
+      diagnostics: {
+        planner: {
+          attempts: 0,
+          plannerStatus: 0,
+          latencyMs: 0
+        },
+        validated: true,
+        errors: [],
+        degraded: true,
+        fallbackReason: error instanceof Error ? error.message : "Planner request failed"
+      }
+    });
+  }
+});
+
+app.post("/admin/reset/workflows-orders/preview", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+
+  const workflows = await prisma.workflow.findMany({ select: { id: true } });
+  const workflowIds = workflows.map((entry) => entry.id);
+  const versions = await prisma.workflowVersion.findMany({
+    where: { workflowId: { in: workflowIds.length > 0 ? workflowIds : ["__none__"] } },
+    select: { id: true }
+  });
+  const orders = await prisma.order.findMany({
+    where: { workflowVersionId: { in: versions.length > 0 ? versions.map((entry) => entry.id) : ["__none__"] } },
+    select: { id: true }
+  });
+  const orderCount = await prisma.order.count({
+    where: { workflowVersionId: { in: versions.length > 0 ? versions.map((entry) => entry.id) : ["__none__"] } }
+  });
+  const logCount = await prisma.executionLog.count({
+    where: {
+      orderId: { in: orders.length > 0 ? orders.map((entry) => entry.id) : ["__none__"] }
+    }
+  });
+  return {
+    scope: "workflows-orders",
+    dryRun: true,
+    resetInProgress,
+    counts: {
+      workflows: workflowIds.length,
+      workflowVersions: versions.length,
+      orders: orderCount,
+      logs: logCount
+    },
+    timestamp: new Date().toISOString()
+  };
+});
+
+app.post("/admin/reset/workflows-orders/execute", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  if (resetInProgress) {
+    return reply.code(409).send({ error: "RESET_ALREADY_IN_PROGRESS" });
+  }
+
+  const body = (request.body ?? {}) as { dryRun?: boolean; confirmText?: string };
+  if (body.dryRun === true) {
+    return reply.code(400).send({ error: "USE_PREVIEW_ENDPOINT_FOR_DRY_RUN" });
+  }
+  if (String(body.confirmText ?? "") !== RESET_CONFIRM_TEXT) {
+    return reply.code(400).send({ error: "RESET_CONFIRMATION_REQUIRED", expected: RESET_CONFIRM_TEXT });
+  }
+
+  resetInProgress = true;
+  const startedAt = new Date();
+  const correlationId = String(request.headers["x-correlation-id"] ?? createCorrelationId("workflow-order-reset"));
+  try {
+    const workflows = await prisma.workflow.findMany({ select: { id: true } });
+    const workflowIds = workflows.map((entry) => entry.id);
+    const versions = await prisma.workflowVersion.findMany({
+      where: { workflowId: { in: workflowIds.length > 0 ? workflowIds : ["__none__"] } },
+      select: { id: true }
+    });
+    const versionIds = versions.map((entry) => entry.id);
+    const orders = await prisma.order.findMany({
+      where: { workflowVersionId: { in: versionIds.length > 0 ? versionIds : ["__none__"] } },
+      select: { id: true }
+    });
+    const orderIds = orders.map((entry) => entry.id);
+
+    const result = await prisma.$transaction(async (tx) => {
+      const deletedLogs = await tx.executionLog.deleteMany({
+        where: {
+          orderId: { in: orderIds.length > 0 ? orderIds : ["__none__"] }
+        }
+      });
+      const deletedAudits = await tx.workflowPublishAudit.deleteMany({
+        where: { workflowId: { in: workflowIds.length > 0 ? workflowIds : ["__none__"] } }
+      });
+      const deletedOrders = await tx.order.deleteMany({
+        where: { id: { in: orderIds.length > 0 ? orderIds : ["__none__"] } }
+      });
+      const deletedVersions = await tx.workflowVersion.deleteMany({
+        where: { id: { in: versionIds.length > 0 ? versionIds : ["__none__"] } }
+      });
+      const deletedWorkflows = await tx.workflow.deleteMany({
+        where: { id: { in: workflowIds.length > 0 ? workflowIds : ["__none__"] } }
+      });
+      return {
+        logs: deletedLogs.count,
+        publishAudits: deletedAudits.count,
+        orders: deletedOrders.count,
+        workflowVersions: deletedVersions.count,
+        workflows: deletedWorkflows.count
+      };
+    });
+
+    return {
+      scope: "workflows-orders",
+      dryRun: false,
+      correlationId,
+      startedAt: startedAt.toISOString(),
+      finishedAt: new Date().toISOString(),
+      counts: result
+    };
+  } finally {
+    resetInProgress = false;
+  }
 });
 
 app.get("/workflows/:id/publish-audits", async (request) => {
@@ -1076,6 +2230,225 @@ app.post("/admin/secrets/migrate", async (request, reply) => {
   }
 
   return report;
+});
+
+app.post("/node-templates/import", async (request, reply) => {
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const definition = normalizeNodeTemplateDefinition(request.body);
+  const created = await prisma.nodeTemplate.create({
+    data: {
+      ownerId: requester,
+      name: definition.name,
+      description: definition.description,
+      category: definition.category,
+      tagsJson: definition.tags ?? [],
+      nodeType: definition.config.nodeType,
+      configJson: toJsonObject(definition.config),
+      metadataJson: toJsonObject(definition.metadata ?? {})
+    },
+    include: { shares: true }
+  });
+  return reply.code(201).send(mapNodeTemplateRecord(created, requester, admin));
+});
+
+app.post("/node-templates", async (request, reply) => {
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const definition = normalizeNodeTemplateDefinition(body);
+  const created = await prisma.nodeTemplate.create({
+    data: {
+      ownerId: requester,
+      name: definition.name,
+      description: definition.description,
+      category: definition.category,
+      tagsJson: definition.tags ?? [],
+      nodeType: definition.config.nodeType,
+      configJson: toJsonObject(definition.config),
+      metadataJson: toJsonObject(definition.metadata ?? {})
+    },
+    include: { shares: true }
+  });
+  return reply.code(201).send(mapNodeTemplateRecord(created, requester, admin));
+});
+
+app.get("/node-templates", async (request) => {
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const query = request.query as { scope?: string; limit?: string };
+  const scope = parseScope(query.scope);
+  const limit = Math.min(Math.max(Number(query.limit ?? 100) || 100, 1), 500);
+  return listNodeTemplates(requester, admin, scope, limit);
+});
+
+app.get("/node-templates/:id", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const access = await loadNodeTemplateWithAccess(id, requester, admin);
+  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
+  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_ACCESS" });
+  return mapNodeTemplateRecord(access.template, requester, admin);
+});
+
+app.patch("/node-templates/:id", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const access = await loadNodeTemplateWithAccess(id, requester, admin);
+  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
+  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_MUTATION" });
+
+  const currentDefinition = normalizeNodeTemplateDefinition({
+    name: access.template.name,
+    description: access.template.description ?? undefined,
+    category: access.template.category ?? undefined,
+    tags: access.template.tagsJson,
+    config: access.template.configJson,
+    metadata: access.template.metadataJson
+  });
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const nextDefinition = normalizeNodeTemplateDefinition({
+    name: body.name ?? currentDefinition.name,
+    description: body.description ?? currentDefinition.description,
+    category: body.category ?? currentDefinition.category,
+    tags: body.tags ?? currentDefinition.tags,
+    config: body.config ?? currentDefinition.config,
+    metadata: body.metadata ?? currentDefinition.metadata
+  });
+
+  const updated = await prisma.nodeTemplate.update({
+    where: { id },
+    data: {
+      name: nextDefinition.name,
+      description: nextDefinition.description,
+      category: nextDefinition.category,
+      tagsJson: nextDefinition.tags ?? [],
+      nodeType: nextDefinition.config.nodeType,
+      configJson: toJsonObject(nextDefinition.config),
+      metadataJson: toJsonObject(nextDefinition.metadata ?? {})
+    },
+    include: { shares: true }
+  });
+  return mapNodeTemplateRecord(updated, requester, admin);
+});
+
+app.delete("/node-templates/:id", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const access = await loadNodeTemplateWithAccess(id, requester, admin);
+  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
+  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_MUTATION" });
+  await prisma.nodeTemplate.delete({ where: { id } });
+  return { deleted: true, templateId: id };
+});
+
+app.post("/node-templates/:id/duplicate", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const access = await loadNodeTemplateWithAccess(id, requester, admin);
+  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
+  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_ACCESS" });
+  const body = (request.body ?? {}) as { name?: string };
+  const name = String(body.name ?? `${access.template.name} Copy`).trim();
+  if (!name) return reply.code(400).send({ error: "NODE_TEMPLATE_NAME_REQUIRED" });
+  const copy = await prisma.nodeTemplate.create({
+    data: {
+      ownerId: requester,
+      name,
+      description: access.template.description,
+      category: access.template.category,
+      tagsJson: access.template.tagsJson ?? [],
+      nodeType: access.template.nodeType,
+      configJson: toJsonObject(access.template.configJson),
+      metadataJson: toJsonObject(access.template.metadataJson ?? {})
+    },
+    include: { shares: true }
+  });
+  return reply.code(201).send(mapNodeTemplateRecord(copy, requester, admin));
+});
+
+app.get("/node-templates/:id/shares", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const access = await loadNodeTemplateWithAccess(id, requester, admin);
+  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
+  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_ACCESS" });
+  return access.template.shares.map((entry) => ({
+    username: entry.sharedWithUserId,
+    createdBy: entry.createdBy,
+    createdAt: entry.createdAt
+  }));
+});
+
+app.post("/node-templates/:id/share", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const body = (request.body ?? {}) as { username?: string };
+  const username = String(body.username ?? "").trim();
+  if (!username) return reply.code(400).send({ error: "SHARE_USERNAME_REQUIRED" });
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const access = await loadNodeTemplateWithAccess(id, requester, admin);
+  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
+  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_SHARE" });
+  if (username === access.template.ownerId) return reply.code(400).send({ error: "OWNER_ALREADY_HAS_ACCESS" });
+  await prisma.nodeTemplateShare.upsert({
+    where: { templateId_sharedWithUserId: { templateId: id, sharedWithUserId: username } },
+    create: {
+      templateId: id,
+      sharedWithUserId: username,
+      createdBy: requester
+    },
+    update: {}
+  });
+  const updated = await prisma.nodeTemplate.findUnique({
+    where: { id },
+    include: { shares: true }
+  });
+  return mapNodeTemplateRecord(updated!, requester, admin);
+});
+
+app.delete("/node-templates/:id/share/:username", async (request, reply) => {
+  const params = request.params as { id: string; username: string };
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const access = await loadNodeTemplateWithAccess(params.id, requester, admin);
+  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
+  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_SHARE" });
+  await prisma.nodeTemplateShare.deleteMany({
+    where: {
+      templateId: params.id,
+      sharedWithUserId: params.username
+    }
+  });
+  const updated = await prisma.nodeTemplate.findUnique({
+    where: { id: params.id },
+    include: { shares: true }
+  });
+  return mapNodeTemplateRecord(updated!, requester, admin);
+});
+
+app.get("/node-templates/:id/export", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const requester = requesterUserId(request.headers as Record<string, unknown>);
+  const admin = isAdmin(request.headers as Record<string, unknown>);
+  const access = await loadNodeTemplateWithAccess(id, requester, admin);
+  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
+  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_ACCESS" });
+  const record = mapNodeTemplateRecord(access.template, requester, admin);
+  return {
+    schemaVersion: "v1",
+    name: record.name,
+    description: record.description,
+    category: record.category,
+    tags: record.tags,
+    config: record.config,
+    metadata: record.metadata ?? {}
+  };
 });
 
 app.post("/integrations", async (request, reply) => {

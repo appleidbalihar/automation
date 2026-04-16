@@ -16,8 +16,6 @@ export interface AppConfig {
   executionEngineServiceUrl: string;
   integrationServiceUrl: string;
   loggingServiceUrl: string;
-  chatServiceUrl: string;
-  ragServiceUrl: string;
   mtlsRequired: boolean;
   tlsCertPath: string;
   tlsKeyPath: string;
@@ -26,6 +24,12 @@ export interface AppConfig {
   tlsVerifyPeer: boolean;
   tlsServerName?: string;
   securityDiagnosticsToken?: string;
+  temporalAddress: string;
+  temporalNamespace: string;
+  temporalTaskQueue: string;
+  flowisePlannerUrl: string;
+  flowiseOperationsChatUrl: string;
+  flowiseApiKey?: string;
 }
 
 function bootstrapEnv(): void {
@@ -73,8 +77,6 @@ export function loadConfig(serviceName: string, fallbackPort: number): AppConfig
     executionEngineServiceUrl: required("EXECUTION_ENGINE_SERVICE_URL", "https://localhost:4003"),
     integrationServiceUrl: required("INTEGRATION_SERVICE_URL", "https://localhost:4004"),
     loggingServiceUrl: required("LOGGING_SERVICE_URL", "https://localhost:4005"),
-    chatServiceUrl: required("CHAT_SERVICE_URL", "https://localhost:4007"),
-    ragServiceUrl: required("RAG_SERVICE_URL", "https://localhost:4006"),
     mtlsRequired: boolEnv("MTLS_REQUIRED", true),
     tlsCertPath: required("TLS_CERT_PATH", "/tls/cert.pem"),
     tlsKeyPath: required("TLS_KEY_PATH", "/tls/key.pem"),
@@ -82,6 +84,15 @@ export function loadConfig(serviceName: string, fallbackPort: number): AppConfig
     tlsReloadDebounceMs: Number(process.env.TLS_RELOAD_DEBOUNCE_MS ?? 1000),
     tlsVerifyPeer: boolEnv("TLS_VERIFY_PEER", true),
     tlsServerName: process.env.TLS_SERVER_NAME,
-    securityDiagnosticsToken: process.env.SECURITY_DIAGNOSTICS_TOKEN
+    securityDiagnosticsToken: process.env.SECURITY_DIAGNOSTICS_TOKEN,
+    temporalAddress: required("TEMPORAL_ADDRESS", "temporal:7233"),
+    temporalNamespace: required("TEMPORAL_NAMESPACE", "default"),
+    temporalTaskQueue: required("TEMPORAL_TASK_QUEUE", "automation-task-queue"),
+    flowisePlannerUrl: required("FLOWISE_PLANNER_URL", "http://flowise:3000"),
+    flowiseOperationsChatUrl: required(
+      "FLOWISE_OPERATIONS_CHAT_URL",
+      "http://flowise:3000/api/v1/prediction/4b37e62c-da5c-43e5-ba10-8a1cfc9d06f1"
+    ),
+    flowiseApiKey: process.env.FLOWISE_API_KEY
   };
 }

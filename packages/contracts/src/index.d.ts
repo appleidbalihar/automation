@@ -77,17 +77,6 @@ export interface OrderExecutionRequest {
     input: Record<string, unknown>;
     initiatedBy: string;
 }
-export interface ChatQuery {
-    query: string;
-    workflowId?: string;
-    orderId?: string;
-    userId: string;
-}
-export interface ChatResponse {
-    answer: string;
-    citations: string[];
-    restricted: boolean;
-}
 export interface PlatformEvent<T> {
     event: string;
     timestamp: string;
@@ -106,6 +95,5 @@ export declare const PlatformEvents: {
     readonly executionRollbackStarted: "execution.rollback.started";
     readonly executionRollbackCompleted: "execution.rollback.completed";
     readonly logsIngest: "logs.ingest";
-    readonly ragIndexRequested: "rag.index.requested";
 };
 //# sourceMappingURL=index.d.ts.map

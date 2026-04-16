@@ -21,6 +21,6 @@ Validate that role restrictions and retry-resume behavior are both functioning a
    - timeline shows failure and resumed running transition history
 
 ## Failure hints
-- If viewer requests are not rejected, verify gateway auth/rbac settings and `AUTH_ALLOW_LEGACY_BEARER` policy.
+- If viewer requests are not rejected, verify gateway auth/rbac settings and Keycloak token role mapping.
 - If retry resume pointer mismatches order state, inspect order-service checkpoint writes and retry handler behavior.
 - If timeline transitions are missing, verify logging-service timeline endpoint and event/log ingestion health.

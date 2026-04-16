@@ -15,8 +15,6 @@ RabbitMQ topic exchange `platform.events` now carries execution-domain events be
   - `execution.rollback.completed`
 - `workflow-service` publishes:
   - `workflow.published`
-- `rag-service` publishes:
-  - `rag.index.requested`
 
 ## Envelope format
 All published messages follow:
@@ -32,15 +30,12 @@ All published messages follow:
   - masked payload
 - Dedicated workers:
   - `workflow-service.publish-audit.v1` handles `workflow.published`
-  - `rag-service.index-worker.v1` handles `rag.index.requested`
 
 ## Delivery tests
 - `workflow-service` publisher tests verify:
   - routing key equals event name
   - envelope contains `event`, `timestamp`, `payload`
   - messages are published persistent with `application/json`
-- `rag-service` publisher tests verify the same delivery contract for `rag.index.requested`.
-
 ## Reliability notes
 - Publisher failures are non-blocking to order API responses.
 - Consumer uses manual ack/nack and requeues transient processing failures.

@@ -34,22 +34,6 @@ function fallbackContext(): AuthContext {
   return { userId: "anonymous", roles: ["viewer"] };
 }
 
-function legacyBearerEnabled(): boolean {
-  const value = (process.env.AUTH_ALLOW_LEGACY_BEARER ?? "").trim().toLowerCase();
-  return value === "true" || value === "1" || value === "yes";
-}
-
-export function parseAuthHeader(authHeader?: string): AuthContext {
-  if (!authHeader) {
-    return fallbackContext();
-  }
-  const token = authHeader.replace(/^Bearer\s+/i, "");
-  const [userId, ...roleParts] = token.split(":");
-  const roles = filterAllowedRoles(roleParts);
-  const effectiveRoles = roles.length > 0 ? roles : (["viewer"] as Role[]);
-  return { userId: userId || "unknown", roles: effectiveRoles };
-}
-
 export function extractRolesFromClaims(
   claims: JWTPayload,
   keycloakClientId: string
@@ -158,9 +142,6 @@ export async function resolveAuthContext(authHeader?: string): Promise<AuthConte
   }
 
   if (!isLikelyJwt(token)) {
-    if (legacyBearerEnabled()) {
-      return parseAuthHeader(authHeader);
-    }
     return fallbackContext();
   }
 
@@ -186,9 +167,14 @@ export async function authHook(request: FastifyRequest): Promise<void> {
 export function requireAnyRole(roles: Role[]) {
   return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
     const context = request.auth ?? { userId: "anonymous", roles: ["viewer"] };
+    if (!context.userId || context.userId === "anonymous") {
+      reply.code(401).send({ error: "UNAUTHENTICATED" });
+      return;
+    }
     const allowed = roles.some((role) => context.roles.includes(role));
     if (!allowed) {
       reply.code(403).send({ error: "FORBIDDEN", requiredRoles: roles });
+      return;
     }
   };
 }

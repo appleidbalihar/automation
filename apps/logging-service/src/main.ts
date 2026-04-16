@@ -96,12 +96,23 @@ async function storeEventBusLog(parsed: {
   }
   const nodeId = typeof payload.nodeId === "string" ? payload.nodeId : undefined;
   const stepId = typeof payload.stepId === "string" ? payload.stepId : undefined;
+  const executionId = typeof payload.correlationId === "string" ? payload.correlationId : undefined;
+  const workflowId = typeof payload.workflowId === "string" ? payload.workflowId : undefined;
+  const workflowVersionId = typeof payload.workflowVersionId === "string" ? payload.workflowVersionId : undefined;
+  const taskId =
+    typeof payload.taskId === "string" ? payload.taskId : typeof payload.stepId === "string" ? payload.stepId : undefined;
+  const initiatedBy = typeof payload.initiatedBy === "string" ? payload.initiatedBy : undefined;
   const durationMs = typeof payload.durationMs === "number" ? payload.durationMs : undefined;
   await prisma.executionLog.create({
     data: {
       orderId,
+      executionId,
+      workflowId,
+      workflowVersionId,
       nodeId,
       stepId,
+      taskId,
+      initiatedBy,
       severity: eventSeverity(parsed.event),
       source: "event-bus",
       maskedPayload: mask(payload) as object,
@@ -162,8 +173,13 @@ app.get("/security/tls", async (request, reply) => {
 app.post("/logs/ingest", async (request, reply) => {
   const body = request.body as {
     orderId: string;
+    executionId?: string;
+    workflowId?: string;
+    workflowVersionId?: string;
     nodeId?: string;
     stepId?: string;
+    taskId?: string;
+    initiatedBy?: string;
     severity: string;
     source: string;
     payload?: Record<string, unknown>;
@@ -183,8 +199,13 @@ app.post("/logs/ingest", async (request, reply) => {
   const log = await prisma.executionLog.create({
     data: {
       orderId: resolvedOrderId,
+      executionId: body.executionId ?? body.correlationId,
+      workflowId: body.workflowId,
+      workflowVersionId: body.workflowVersionId,
       nodeId: body.nodeId,
       stepId: body.stepId,
+      taskId: body.taskId ?? body.stepId,
+      initiatedBy: body.initiatedBy,
       severity: body.severity,
       source: body.source,
       maskedPayload: mask(body.payload) as object,

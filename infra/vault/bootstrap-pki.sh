@@ -15,8 +15,6 @@ order-service
 execution-engine
 integration-service
 logging-service
-rag-service
-chat-service
 web
 postgres
 rabbitmq

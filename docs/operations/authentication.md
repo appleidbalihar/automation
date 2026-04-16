@@ -11,7 +11,7 @@ Control API access with role enforcement backed by Keycloak JWTs.
   - optional explicit override: `KEYCLOAK_ISSUER`
 - Token/client binding is validated against `KEYCLOAK_CLIENT_ID` using `azp`, `aud`, or `resource_access`.
 - Role checks are enforced at API gateway route level.
-- Legacy bearer tokens (`user:role`) are accepted only when `AUTH_ALLOW_LEGACY_BEARER=true`.
+- Non-JWT or invalid bearer tokens are rejected as unauthenticated.
 
 ## Key configuration
 - `KEYCLOAK_URL`
@@ -19,7 +19,6 @@ Control API access with role enforcement backed by Keycloak JWTs.
 - `KEYCLOAK_ISSUER` (optional explicit issuer value)
 - `KEYCLOAK_REALM`
 - `KEYCLOAK_CLIENT_ID`
-- `AUTH_ALLOW_LEGACY_BEARER` (set only for local/dev compatibility; keep `false` for production-like runs)
 
 ## Validation checklist
 1. Gateway health: `GET /health`
@@ -32,5 +31,4 @@ Control API access with role enforcement backed by Keycloak JWTs.
    - verify web login can fetch token from `/api/auth/token`
 
 ## Smoke impact
-- Smoke scripts set `AUTH_ALLOW_LEGACY_BEARER=true` explicitly while running.
-- For production-like verification, run gateway requests using real Keycloak access tokens.
+- Use real Keycloak access tokens in smoke and integration tests.

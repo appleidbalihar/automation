@@ -3,7 +3,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DATABASE_URL="${DATABASE_URL:-postgresql://platform:platform@localhost:5432/automation?schema=public}"
-export AUTH_ALLOW_LEGACY_BEARER="${AUTH_ALLOW_LEGACY_BEARER:-true}"
 
 workflow_pid=""
 order_pid=""
@@ -78,7 +77,7 @@ echo "Creating a workflow as admin..."
 create_resp="$(curl -sS -X POST http://localhost:4000/workflows \
   -H 'authorization: Bearer smoke-admin:admin' \
   -H 'content-type: application/json' \
-  -d '{"name":"RBAC Resume Smoke Workflow","description":"RBAC + resume e2e validation","nodes":[{"id":"node-1","name":"Node 1","order":0,"configType":"SIMPLE","approvalRequired":false,"failurePolicy":"RETRY","steps":[{"id":"step-1","name":"Step 1","executionType":"SCRIPT","commandRef":"echo ok","inputVariables":{},"successCriteria":"ok","retryPolicy":{"maxRetries":1,"backoffMs":50}},{"id":"step-2","name":"Step 2","executionType":"SCRIPT","commandRef":"fail-command","inputVariables":{},"successCriteria":"ok","retryPolicy":{"maxRetries":1,"backoffMs":50}}]}]}')"
+  -d '{"name":"RBAC Resume Smoke Workflow","description":"RBAC + resume e2e validation","flowDefinition":{"schemaVersion":"v2","nodes":[{"id":"node-1","type":"task","label":"Node 1","position":{"x":120,"y":120},"config":{"configType":"SIMPLE","approvalRequired":false,"failurePolicy":"RETRY","steps":[{"id":"step-1","name":"Step 1","executionType":"SCRIPT","commandRef":"echo ok","inputVariables":{},"successCriteria":"ok","retryPolicy":{"maxRetries":1,"backoffMs":50}},{"id":"step-2","name":"Step 2","executionType":"SCRIPT","commandRef":"fail-command","inputVariables":{},"successCriteria":"ok","retryPolicy":{"maxRetries":1,"backoffMs":50}}]}}],"edges":[]}}')"
 
 workflow_id="$(printf '%s' "${create_resp}" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{const j=JSON.parse(d);process.stdout.write(j.workflow?.id||"");});')"
 if [[ -z "${workflow_id}" ]]; then

@@ -8,14 +8,17 @@ x-shared-env: &shared-env
   KEYCLOAK_REALM: ${KEYCLOAK_REALM:-automation-platform}
   KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-automation-web}
   KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-replace-me}
-  AUTH_ALLOW_LEGACY_BEARER: ${AUTH_ALLOW_LEGACY_BEARER:-false}
   WORKFLOW_SERVICE_URL: https://workflow-service:4001
   ORDER_SERVICE_URL: https://order-service:4002
   EXECUTION_ENGINE_SERVICE_URL: https://execution-engine:4003
   INTEGRATION_SERVICE_URL: https://integration-service:4004
   LOGGING_SERVICE_URL: https://logging-service:4005
-  RAG_SERVICE_URL: https://rag-service:4006
-  CHAT_SERVICE_URL: https://chat-service:4007
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+  TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-automation-task-queue}
+  FLOWISE_PLANNER_URL: ${FLOWISE_PLANNER_URL:-http://flowise:3000/api/v1/prediction/default}
+  FLOWISE_OPERATIONS_CHAT_URL: ${FLOWISE_OPERATIONS_CHAT_URL:-http://flowise:3000/api/v1/prediction/4b37e62c-da5c-43e5-ba10-8a1cfc9d06f1}
+  FLOWISE_API_KEY: ${FLOWISE_API_KEY:-}
   INTEGRATION_REST_URL_ALLOWLIST: ${INTEGRATION_REST_URL_ALLOWLIST:-^https?://|^http://localhost:}
   INTEGRATION_SCRIPT_ALLOWLIST: ${INTEGRATION_SCRIPT_ALLOWLIST:-.*}
   INTEGRATION_SSH_ALLOWLIST: ${INTEGRATION_SSH_ALLOWLIST:-.*}
@@ -232,6 +235,57 @@ services:
       - vault_data:/vault/file:ro
       - tls_keycloak:/tls
 
+  temporal-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - temporal_pg_data:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/auto-setup:1.26.2
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: temporal-postgres
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/development-sql.yaml
+    depends_on:
+      temporal-postgres:
+        condition: service_started
+    volumes:
+      - ./infra/temporal/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
+
+  temporal-ui:
+    image: temporalio/ui:2.30.3
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+    depends_on:
+      temporal:
+        condition: service_started
+    ports:
+      - "8088:8080"
+
+  flowise:
+    image: flowiseai/flowise:2.2.3
+    environment:
+      PORT: 3000
+      DATABASE_TYPE: sqlite
+      DATABASE_PATH: /root/.flowise
+      FLOWISE_OPENAI_BASEPATH: ${FLOWISE_OPENAI_BASEPATH:-}
+      FLOWISE_TECH_ENGINEER_REPO_LINK: ${FLOWISE_TECH_ENGINEER_REPO_LINK:-https://github.com/appleidbalihar/automation}
+      FLOWISE_TECH_ENGINEER_REPO_BRANCH: ${FLOWISE_TECH_ENGINEER_REPO_BRANCH:-master}
+      FLOWISE_OPENAI_CHAT_MODEL: ${FLOWISE_OPENAI_CHAT_MODEL:-gpt-4o-mini}
+      FLOWISE_OPENAI_EMBEDDING_MODEL: ${FLOWISE_OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+    ports:
+      - "3001:3000"
+    volumes:
+      - flowise_data:/root/.flowise
+
   vault:
     image: *infra-vault-image
     cap_add:
@@ -299,6 +353,8 @@ services:
         condition: service_completed_successfully
       rabbitmq:
         condition: service_started
+      flowise:
+        condition: service_started
       workflow-service-vault-agent:
         condition: service_started
     restart: unless-stopped
@@ -327,6 +383,8 @@ services:
       db-migrate:
         condition: service_completed_successfully
       rabbitmq:
+        condition: service_started
+      temporal:
         condition: service_started
       order-service-vault-agent:
         condition: service_started
@@ -418,62 +476,6 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  rag-service-vault-agent:
-    <<: *vault-agent
-    environment:
-      VAULT_ADDR: http://vault:8200
-      SERVICE_NAME: rag-service
-      CERT_COMMON_NAME: rag-service
-      CERT_ALT_NAMES: rag-service,localhost
-    volumes:
-      - ./infra/vault:/vault/scripts:ro
-      - vault_data:/vault/file:ro
-      - tls_rag_service:/tls
-
-  rag-service:
-    image: *app-service-image
-    environment:
-      <<: *shared-env
-      PORT: 4006
-      SERVICE_NAME: rag-service
-    volumes:
-      - tls_rag_service:/tls:ro
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-      rabbitmq:
-        condition: service_started
-      rag-service-vault-agent:
-        condition: service_started
-    restart: unless-stopped
-
-  chat-service-vault-agent:
-    <<: *vault-agent
-    environment:
-      VAULT_ADDR: http://vault:8200
-      SERVICE_NAME: chat-service
-      CERT_COMMON_NAME: chat-service
-      CERT_ALT_NAMES: chat-service,localhost
-    volumes:
-      - ./infra/vault:/vault/scripts:ro
-      - vault_data:/vault/file:ro
-      - tls_chat_service:/tls
-
-  chat-service:
-    image: *app-service-image
-    environment:
-      <<: *shared-env
-      PORT: 4007
-      SERVICE_NAME: chat-service
-    volumes:
-      - tls_chat_service:/tls:ro
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-      chat-service-vault-agent:
-        condition: service_started
-    restart: unless-stopped
-
   api-gateway-vault-agent:
     <<: *vault-agent
     environment:
@@ -501,10 +503,6 @@ services:
       order-service:
         condition: service_started
       logging-service:
-        condition: service_started
-      rag-service:
-        condition: service_started
-      chat-service:
         condition: service_started
       api-gateway-vault-agent:
         condition: service_started
@@ -594,8 +592,6 @@ services:
       - tls_execution_engine:/tls/execution-engine:ro
       - tls_integration_service:/tls/integration-service:ro
       - tls_logging_service:/tls/logging-service:ro
-      - tls_rag_service:/tls/rag-service:ro
-      - tls_chat_service:/tls/chat-service:ro
       - rotation_control:/rotation-control
     depends_on:
       vault-bootstrap:
@@ -613,8 +609,6 @@ volumes:
   tls_execution_engine:
   tls_integration_service:
   tls_logging_service:
-  tls_rag_service:
-  tls_chat_service:
   rotation_control:
   tls_postgres:
   tls_rabbitmq:
@@ -623,3 +617,5 @@ volumes:
   tls_minio:
   tls_web:
   tls_web_ingress:
+  temporal_pg_data:
+  flowise_data:

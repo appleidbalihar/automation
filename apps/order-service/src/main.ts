@@ -1,11 +1,22 @@
-import Fastify from "fastify";
-import amqp from "amqplib";
-import type { Channel, ChannelModel } from "amqplib";
 import { loadConfig } from "@platform/config";
+import {
+  PlatformEvents,
+  flowDefinitionToWorkflowNodes,
+  normalizeWorkflowFlow,
+  type OrderExecutionRequest,
+  type WorkflowNode,
+  type WorkflowStep
+} from "@platform/contracts";
 import { prisma } from "@platform/db";
 import { createCorrelationId } from "@platform/observability";
-import { PlatformEvents, type OrderExecutionRequest, type WorkflowNode, type WorkflowStep } from "@platform/contracts";
 import { connectAmqp, createTlsRuntime, tlsFetch } from "@platform/tls-runtime";
+import { Client, Connection } from "@temporalio/client";
+import { NativeConnection, Worker } from "@temporalio/worker";
+import type { Channel, ChannelModel } from "amqplib";
+import amqp from "amqplib";
+import Fastify from "fastify";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const config = loadConfig("order-service", 4002);
 const tlsRuntime = createTlsRuntime({
@@ -109,12 +120,14 @@ function toJsonValue(value: unknown): any {
 type RuntimeOrderState = {
   id: string;
   workflowVersionId: string;
+  workflowId?: string;
   environmentId?: string | null;
   status: string;
   currentNodeOrder: number;
   currentStepIndex: number;
   failurePolicy: string;
   correlationId: string;
+  initiatedBy?: string;
   inputJson: unknown;
   envSnapshotJson?: unknown;
 };
@@ -124,6 +137,12 @@ type EngineRunResult = {
   currentNodeOrder: number;
   currentStepIndex: number;
   failureReason?: string;
+  autoApprovals?: Array<{
+    nodeOrder: number;
+    nodeId: string;
+    decision: "APPROVE" | "REJECT";
+    timeoutSec: number;
+  }>;
 };
 
 type EngineRunResponse = {
@@ -150,6 +169,114 @@ type RuntimeIntegrationProfile = {
   baseConfigJson: unknown;
   credentialJson: unknown;
 };
+
+type TemporalRunPayload = {
+  order: RuntimeOrderState;
+  nodes: WorkflowNode[];
+  integrationProfilesByNode: Record<
+    string,
+    { id: string; executionType: string; authType: string; baseConfig: Record<string, unknown>; credentials: Record<string, unknown> }
+  >;
+  nodeEnvironmentsByNode: Record<string, Record<string, unknown>>;
+  approvedNodeOrders?: number[];
+};
+
+let temporalClientPromise: Promise<Client> | undefined;
+let temporalWorkerPromise: Promise<Worker> | undefined;
+
+function workflowModulePath(): string {
+  const file = fileURLToPath(import.meta.url);
+  const dir = dirname(file);
+  const ext = file.endsWith(".ts") ? "workflows.ts" : "workflows.js";
+  return resolve(dir, "temporal", ext);
+}
+
+async function temporalClient(): Promise<Client> {
+  if (!temporalClientPromise) {
+    temporalClientPromise = (async () => {
+      for (let attempt = 1; attempt <= 10; attempt++) {
+        try {
+          const connection = await Connection.connect({ address: config.temporalAddress });
+          return new Client({
+            connection,
+            namespace: config.temporalNamespace
+          });
+        } catch (error) {
+          if (attempt === 10) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+      }
+      throw new Error("Failed to connect to Temporal client");
+    })();
+  }
+  try {
+    return await temporalClientPromise;
+  } catch (error) {
+    temporalClientPromise = undefined;
+    throw error;
+  }
+}
+
+async function startTemporalWorkerIfNeeded(): Promise<void> {
+  if (temporalWorkerPromise) return;
+  temporalWorkerPromise = (async () => {
+    let connection: NativeConnection | undefined;
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      try {
+        connection = await NativeConnection.connect({ address: config.temporalAddress });
+        break;
+      } catch (error) {
+        if (attempt === 10) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
+    if (!connection) throw new Error("Failed to connect Temporal worker");
+
+    const worker = await Worker.create({
+      connection,
+      namespace: config.temporalNamespace,
+      taskQueue: config.temporalTaskQueue,
+      workflowsPath: workflowModulePath(),
+      activities: {
+        executeOrderWorkflowActivity: async (payload: TemporalRunPayload) =>
+          runExecutionForOrder(
+            payload.order,
+            payload.nodes,
+            payload.integrationProfilesByNode,
+            payload.nodeEnvironmentsByNode,
+            payload.approvedNodeOrders
+          )
+      }
+    });
+    void worker.run();
+    return worker;
+  })();
+  try {
+    await temporalWorkerPromise;
+  } catch (error) {
+    temporalWorkerPromise = undefined;
+    throw error;
+  }
+}
+
+async function runExecutionViaTemporal(
+  workflowId: string,
+  payload: TemporalRunPayload
+): Promise<EngineRunResult> {
+  await startTemporalWorkerIfNeeded();
+  const client = await temporalClient();
+  const handle = await client.workflow.start("orderExecutionWorkflow", {
+    workflowId,
+    taskQueue: config.temporalTaskQueue,
+    args: [payload]
+  });
+  return (await handle.result()) as EngineRunResult;
+}
+
+function extractWorkflowNodesFromVersion(nodesJson: unknown): WorkflowNode[] {
+  const flow = normalizeWorkflowFlow(nodesJson);
+  return flowDefinitionToWorkflowNodes(flow);
+}
 
 function requesterUserId(headers: Record<string, unknown>): string {
   return String(headers["x-user-id"] ?? "").trim() || "unknown";
@@ -239,6 +366,59 @@ function buildNodeEnvironmentMap(
   return byNode;
 }
 
+function stepLookupKey(nodeId: string, stepId: string): string {
+  return `${nodeId}:${stepId}`;
+}
+
+async function emitDetailedStepLog(
+  order: RuntimeOrderState,
+  workflowId: string | undefined,
+  audit: {
+    nodeId: string;
+    stepId: string;
+    status: "SUCCESS" | "FAILED" | "SKIPPED";
+    durationMs: number;
+    errorMessage?: string;
+    requestPayload?: Record<string, unknown>;
+    responsePayload?: Record<string, unknown>;
+  }
+): Promise<void> {
+  try {
+    await tlsFetch(tlsRuntime, new URL("/logs/ingest", config.loggingServiceUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        orderId: order.id,
+        executionId: order.correlationId,
+        workflowId,
+        workflowVersionId: order.workflowVersionId,
+        nodeId: audit.nodeId,
+        stepId: audit.stepId,
+        taskId: audit.stepId,
+        initiatedBy: order.initiatedBy,
+        severity: audit.status === "FAILED" ? "ERROR" : "INFO",
+        source: "workflow-step",
+        durationMs: audit.durationMs,
+        message: audit.status === "FAILED" ? `Step ${audit.stepId} failed` : `Step ${audit.stepId} completed`,
+        payload: {
+          executionId: order.correlationId,
+          orderId: order.id,
+          workflowId,
+          workflowVersionId: order.workflowVersionId,
+          nodeId: audit.nodeId,
+          taskId: audit.stepId,
+          status: audit.status,
+          errorMessage: audit.errorMessage,
+          requestPayload: audit.requestPayload,
+          responsePayload: audit.responsePayload
+        }
+      })
+    });
+  } catch (error) {
+    console.warn("[order-service] failed to emit detailed step log", error instanceof Error ? error.message : String(error));
+  }
+}
+
 async function callExecutionEngine(
   order: RuntimeOrderState,
   nodes: WorkflowNode[],
@@ -289,6 +469,7 @@ async function runExecutionForOrder(
 ): Promise<EngineRunResult> {
   const engineResponse = await callExecutionEngine(order, nodes, integrationProfilesByNode, nodeEnvironmentsByNode, approvedNodeOrders);
   const result = engineResponse.result;
+  const stepByKey = new Map(nodes.flatMap((node) => node.steps.map((step) => [stepLookupKey(node.id, step.id), step] as const)));
 
   for (const checkpoint of engineResponse.checkpoints) {
     await prisma.executionCheckpoint.create({
@@ -318,6 +499,11 @@ async function runExecutionForOrder(
       }
     });
 
+    const step = stepByKey.get(stepLookupKey(audit.nodeId, audit.stepId));
+    if (step?.loggingEnabled) {
+      await emitDetailedStepLog(order, order.workflowId, audit);
+    }
+
     const event = audit.status === "FAILED" ? PlatformEvents.executionStepFailed : PlatformEvents.executionStepCompleted;
     await eventPublisher.publish(event, {
       orderId: order.id,
@@ -328,6 +514,21 @@ async function runExecutionForOrder(
       durationMs: audit.durationMs,
       errorMessage: audit.errorMessage,
       correlationId: order.correlationId
+    });
+  }
+
+  for (const approval of result.autoApprovals ?? []) {
+    await prisma.approvalDecision.create({
+      data: {
+        orderId: order.id,
+        nodeOrder: approval.nodeOrder,
+        decision: approval.decision,
+        decidedBy: "system-auto",
+        comment:
+          approval.timeoutSec > 0
+            ? `Automatic ${approval.decision.toLowerCase()} after timeout (${approval.timeoutSec}s) for node ${approval.nodeId}`
+            : `Automatic ${approval.decision.toLowerCase()} for node ${approval.nodeId}`
+      }
     });
   }
 
@@ -569,7 +770,7 @@ app.post("/orders/execute", async (request, reply) => {
     data: { orderId: order.id, from: "PENDING", to: "RUNNING", reason: "Order created and started" }
   });
 
-  const nodes = JSON.parse(JSON.stringify(version.nodesJson ?? [])) as unknown as WorkflowNode[];
+  const nodes = extractWorkflowNodesFromVersion(version.nodesJson);
   const integrationIds = extractNodeIntegrationIds(nodes);
   const integrations =
     integrationIds.length > 0
@@ -589,7 +790,15 @@ app.post("/orders/execute", async (request, reply) => {
   const integrationProfilesByNode = buildIntegrationMapByNode(nodes, integrations);
   const nodeEnvironmentsByNode = buildNodeEnvironmentMap(nodes, nodeEnvironments);
   try {
-    const result = await runExecutionForOrder(order, nodes, integrationProfilesByNode, nodeEnvironmentsByNode);
+    const result = await runExecutionViaTemporal(`order-execute-${order.id}`, {
+      order: {
+        ...order,
+        workflowId: version.workflowId
+      },
+      nodes,
+      integrationProfilesByNode,
+      nodeEnvironmentsByNode
+    });
     return reply.code(201).send({ orderId: order.id, result });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Execution failed";
@@ -810,7 +1019,7 @@ app.post("/orders/:id/approve", async (request, reply) => {
   if (!version) {
     return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
   }
-  const nodes = JSON.parse(JSON.stringify(version.nodesJson ?? [])) as unknown as WorkflowNode[];
+  const nodes = extractWorkflowNodesFromVersion(version.nodesJson);
   const integrationIds = extractNodeIntegrationIds(nodes);
   const integrations =
     integrationIds.length > 0
@@ -830,24 +1039,26 @@ app.post("/orders/:id/approve", async (request, reply) => {
   const integrationProfilesByNode = buildIntegrationMapByNode(nodes, integrations);
   const nodeEnvironmentsByNode = buildNodeEnvironmentMap(nodes, nodeEnvironments);
   try {
-    const result = await runExecutionForOrder(
-      {
+    const result = await runExecutionViaTemporal(`order-approve-${order.id}-${Date.now()}`, {
+      order: {
         id: order.id,
         workflowVersionId: order.workflowVersionId,
+        workflowId: version.workflowId,
         environmentId: order.environmentId,
         status: "RUNNING",
         currentNodeOrder: order.currentNodeOrder,
         currentStepIndex: order.currentStepIndex,
         failurePolicy: order.failurePolicy,
         correlationId: order.correlationId,
+        initiatedBy: order.initiatedBy,
         inputJson: order.inputJson,
         envSnapshotJson: order.envSnapshotJson
       },
       nodes,
       integrationProfilesByNode,
       nodeEnvironmentsByNode,
-      [order.currentNodeOrder]
-    );
+      approvedNodeOrders: [order.currentNodeOrder]
+    });
 
     return { status: "APPROVAL_ACCEPTED", orderId: id, result };
   } catch (error) {
@@ -953,7 +1164,7 @@ app.post("/orders/:id/retry", async (request, reply) => {
   if (!version) {
     return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
   }
-  const nodes = JSON.parse(JSON.stringify(version.nodesJson ?? [])) as unknown as WorkflowNode[];
+  const nodes = extractWorkflowNodesFromVersion(version.nodesJson);
   const integrationIds = extractNodeIntegrationIds(nodes);
   const integrations =
     integrationIds.length > 0
@@ -974,23 +1185,25 @@ app.post("/orders/:id/retry", async (request, reply) => {
   const nodeEnvironmentsByNode = buildNodeEnvironmentMap(nodes, nodeEnvironments);
 
   try {
-    const result = await runExecutionForOrder(
-      {
+    const result = await runExecutionViaTemporal(`order-retry-${order.id}-${Date.now()}`, {
+      order: {
         id: order.id,
         workflowVersionId: order.workflowVersionId,
+        workflowId: version.workflowId,
         environmentId: order.environmentId,
         status: "RUNNING",
         currentNodeOrder: order.currentNodeOrder,
         currentStepIndex: order.currentStepIndex,
         failurePolicy: order.failurePolicy,
         correlationId: order.correlationId,
+        initiatedBy: order.initiatedBy,
         inputJson: order.inputJson,
         envSnapshotJson: order.envSnapshotJson
       },
       nodes,
       integrationProfilesByNode,
       nodeEnvironmentsByNode
-    );
+    });
     return { status: "RETRY_COMPLETED", resumeFrom: { node: order.currentNodeOrder, step: order.currentStepIndex }, result };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Execution failed";
@@ -1041,18 +1254,20 @@ app.post("/orders/:id/rollback", async (request, reply) => {
   if (!version) {
     return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
   }
-  const nodes = JSON.parse(JSON.stringify(version.nodesJson ?? [])) as unknown as WorkflowNode[];
+  const nodes = extractWorkflowNodesFromVersion(version.nodesJson);
 
   try {
     const rollback = await runRollbackForOrder(
       {
         id: order.id,
         workflowVersionId: order.workflowVersionId,
+        workflowId: version.workflowId,
         status: "ROLLING_BACK",
         currentNodeOrder: order.currentNodeOrder,
         currentStepIndex: order.currentStepIndex,
         failurePolicy: order.failurePolicy,
         correlationId: order.correlationId,
+        initiatedBy: order.initiatedBy,
         inputJson: order.inputJson
       },
       nodes

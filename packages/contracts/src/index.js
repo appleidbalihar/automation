@@ -10,7 +10,6 @@ export const PlatformEvents = {
     executionStepFailed: "execution.step.failed",
     executionRollbackStarted: "execution.rollback.started",
     executionRollbackCompleted: "execution.rollback.completed",
-    logsIngest: "logs.ingest",
-    ragIndexRequested: "rag.index.requested"
+    logsIngest: "logs.ingest"
 };
 //# sourceMappingURL=index.js.map

@@ -1,0 +1,795 @@
+{
+  "description": "Technical engineer support RAG over the platform GitHub repository",
+  "badge": "CUSTOM",
+  "usecases": ["Documents QnA", "Customer Support"],
+  "framework": ["Langchain"],
+  "nodes": [
+    {
+      "width": 300,
+      "height": 378,
+      "id": "markdownTextSplitter_0",
+      "position": {
+        "x": 1020,
+        "y": -100
+      },
+      "type": "customNode",
+      "data": {
+        "id": "markdownTextSplitter_0",
+        "label": "Markdown Text Splitter",
+        "version": 1,
+        "name": "markdownTextSplitter",
+        "type": "MarkdownTextSplitter",
+        "baseClasses": ["MarkdownTextSplitter", "RecursiveCharacterTextSplitter", "TextSplitter", "BaseDocumentTransformer"],
+        "category": "Text Splitters",
+        "description": "Split your content into documents based on the Markdown headers",
+        "inputParams": [
+          {
+            "label": "Chunk Size",
+            "name": "chunkSize",
+            "type": "number",
+            "default": 1000,
+            "optional": true,
+            "id": "markdownTextSplitter_0-input-chunkSize-number"
+          },
+          {
+            "label": "Chunk Overlap",
+            "name": "chunkOverlap",
+            "type": "number",
+            "optional": true,
+            "id": "markdownTextSplitter_0-input-chunkOverlap-number"
+          }
+        ],
+        "inputAnchors": [],
+        "inputs": {
+          "chunkSize": "1800",
+          "chunkOverlap": "200"
+        },
+        "outputAnchors": [
+          {
+            "id": "markdownTextSplitter_0-output-markdownTextSplitter-MarkdownTextSplitter|RecursiveCharacterTextSplitter|TextSplitter|BaseDocumentTransformer",
+            "name": "markdownTextSplitter",
+            "label": "MarkdownTextSplitter",
+            "type": "MarkdownTextSplitter | RecursiveCharacterTextSplitter | TextSplitter | BaseDocumentTransformer"
+          }
+        ],
+        "outputs": {}
+      },
+      "positionAbsolute": {
+        "x": 1020,
+        "y": -100
+      }
+    },
+    {
+      "width": 300,
+      "height": 820,
+      "id": "github_0",
+      "position": {
+        "x": 1400,
+        "y": -120
+      },
+      "type": "customNode",
+      "data": {
+        "id": "github_0",
+        "label": "Github",
+        "version": 3,
+        "name": "github",
+        "type": "Document",
+        "baseClasses": ["Document"],
+        "category": "Document Loaders",
+        "description": "Load data from a GitHub repository",
+        "inputParams": [
+          {
+            "label": "Connect Credential",
+            "name": "credential",
+            "type": "credential",
+            "description": "Only needed when accessing private repo",
+            "optional": true,
+            "credentialNames": ["githubApi"],
+            "id": "github_0-input-credential-credential"
+          },
+          {
+            "label": "Repo Link",
+            "name": "repoLink",
+            "type": "string",
+            "placeholder": "https://github.com/FlowiseAI/Flowise",
+            "id": "github_0-input-repoLink-string"
+          },
+          {
+            "label": "Branch",
+            "name": "branch",
+            "type": "string",
+            "default": "main",
+            "id": "github_0-input-branch-string"
+          },
+          {
+            "label": "Recursive",
+            "name": "recursive",
+            "type": "boolean",
+            "optional": true,
+            "id": "github_0-input-recursive-boolean"
+          },
+          {
+            "label": "Max Concurrency",
+            "name": "maxConcurrency",
+            "type": "number",
+            "step": 1,
+            "optional": true,
+            "additionalParams": true,
+            "id": "github_0-input-maxConcurrency-number"
+          },
+          {
+            "label": "Ignore Paths",
+            "name": "ignorePath",
+            "type": "string",
+            "description": "An array of paths to be ignored",
+            "placeholder": "[\"*.md\"]",
+            "rows": 4,
+            "optional": true,
+            "additionalParams": true,
+            "id": "github_0-input-ignorePath-string"
+          },
+          {
+            "label": "Max Retries",
+            "name": "maxRetries",
+            "description": "The maximum number of retries that can be made for a single call, with an exponential backoff between each attempt. Defaults to 2.",
+            "type": "number",
+            "optional": true,
+            "additionalParams": true,
+            "id": "github_0-input-maxRetries-number"
+          },
+          {
+            "label": "Metadata",
+            "name": "metadata",
+            "type": "json",
+            "optional": true,
+            "additionalParams": true,
+            "id": "github_0-input-metadata-json"
+          },
+          {
+            "label": "Omit Metadata Keys",
+            "name": "omitMetadataKeys",
+            "type": "string",
+            "rows": 4,
+            "description": "Each document loader comes with default metadata. Use comma-separated keys to omit some of them, or * to omit all default metadata keys.",
+            "placeholder": "key1, key2, key3.nestedKey1",
+            "optional": true,
+            "additionalParams": true,
+            "id": "github_0-input-omitMetadataKeys-string"
+          }
+        ],
+        "inputAnchors": [
+          {
+            "label": "Text Splitter",
+            "name": "textSplitter",
+            "type": "TextSplitter",
+            "optional": true,
+            "id": "github_0-input-textSplitter-TextSplitter"
+          }
+        ],
+        "inputs": {
+          "repoLink": "{{$vars.FLOWISE_TECH_ENGINEER_REPO_LINK}}",
+          "branch": "{{$vars.FLOWISE_TECH_ENGINEER_REPO_BRANCH}}",
+          "recursive": true,
+          "maxConcurrency": "4",
+          "ignorePath": "[]",
+          "maxRetries": "3",
+          "textSplitter": "{{markdownTextSplitter_0.data.instance}}",
+          "metadata": "{\"kb\":\"automation-platform\",\"role\":\"technical-engineer\"}",
+          "omitMetadataKeys": ""
+        },
+        "outputAnchors": [
+          {
+            "id": "github_0-output-document-Document",
+            "name": "document",
+            "label": "Document",
+            "type": "Document"
+          },
+          {
+            "id": "github_0-output-text-string|json",
+            "name": "text",
+            "label": "Text",
+            "type": "string | json"
+          }
+        ],
+        "outputs": {
+          "output": "document"
+        }
+      },
+      "positionAbsolute": {
+        "x": 1400,
+        "y": -120
+      }
+    },
+    {
+      "width": 300,
+      "height": 390,
+      "id": "openAIEmbeddings_0",
+      "position": {
+        "x": 1100,
+        "y": 470
+      },
+      "type": "customNode",
+      "data": {
+        "id": "openAIEmbeddings_0",
+        "label": "OpenAI Embeddings Custom",
+        "version": 2,
+        "name": "openAIEmbeddingsCustom",
+        "type": "OpenAIEmbeddingsCustom",
+        "baseClasses": ["OpenAIEmbeddingsCustom", "Embeddings", "OpenAIEmbeddings"],
+        "category": "Embeddings",
+        "description": "OpenAI API to generate embeddings for a given text",
+        "inputParams": [
+          {
+            "label": "Connect Credential",
+            "name": "credential",
+            "type": "credential",
+            "credentialNames": ["openAIApi"],
+            "id": "openAIEmbeddings_0-input-credential-credential"
+          },
+          {
+            "label": "Strip New Lines",
+            "name": "stripNewLines",
+            "type": "boolean",
+            "optional": true,
+            "additionalParams": true,
+            "id": "openAIEmbeddings_0-input-stripNewLines-boolean"
+          },
+          {
+            "label": "Batch Size",
+            "name": "batchSize",
+            "type": "number",
+            "optional": true,
+            "additionalParams": true,
+            "id": "openAIEmbeddings_0-input-batchSize-number"
+          },
+          {
+            "label": "Timeout",
+            "name": "timeout",
+            "type": "number",
+            "optional": true,
+            "additionalParams": true,
+            "id": "openAIEmbeddings_0-input-timeout-number"
+          },
+          {
+            "label": "BasePath",
+            "name": "basepath",
+            "type": "string",
+            "optional": true,
+            "additionalParams": true,
+            "id": "openAIEmbeddings_0-input-basepath-string"
+          },
+          {
+            "label": "Model Name",
+            "name": "modelName",
+            "type": "string",
+            "optional": true,
+            "id": "openAIEmbeddings_0-input-modelName-string"
+          },
+          {
+            "label": "Dimensions",
+            "name": "dimensions",
+            "type": "number",
+            "optional": true,
+            "additionalParams": true,
+            "id": "openAIEmbeddings_0-input-dimensions-number"
+          }
+        ],
+        "inputAnchors": [],
+        "inputs": {
+          "modelName": "{{$vars.FLOWISE_OPENAI_EMBEDDING_MODEL}}",
+          "stripNewLines": true,
+          "batchSize": "64",
+          "timeout": "120000",
+          "basepath": "{{$vars.FLOWISE_OPENAI_BASEPATH}}",
+          "dimensions": ""
+        },
+        "outputAnchors": [
+          {
+            "id": "openAIEmbeddings_0-output-openAIEmbeddingsCustom-OpenAIEmbeddingsCustom|Embeddings|OpenAIEmbeddings",
+            "name": "openAIEmbeddingsCustom",
+            "label": "OpenAIEmbeddingsCustom",
+            "description": "OpenAI API to generate embeddings for a given text",
+            "type": "OpenAIEmbeddingsCustom | Embeddings | OpenAIEmbeddings"
+          }
+        ],
+        "outputs": {}
+      },
+      "positionAbsolute": {
+        "x": 1100,
+        "y": 470
+      }
+    },
+    {
+      "width": 300,
+      "height": 407,
+      "id": "memoryVectorStore_0",
+      "position": {
+        "x": 1830,
+        "y": 470
+      },
+      "type": "customNode",
+      "data": {
+        "id": "memoryVectorStore_0",
+        "label": "In-Memory Vector Store",
+        "version": 1,
+        "name": "memoryVectorStore",
+        "type": "Memory",
+        "baseClasses": ["Memory", "VectorStoreRetriever", "BaseRetriever"],
+        "category": "Vector Stores",
+        "description": "In-memory vectorstore that stores embeddings and does an exact, linear search for the most similar embeddings.",
+        "inputParams": [
+          {
+            "label": "Top K",
+            "name": "topK",
+            "description": "Number of top results to fetch. Default to 4",
+            "placeholder": "4",
+            "type": "number",
+            "optional": true,
+            "id": "memoryVectorStore_0-input-topK-number"
+          }
+        ],
+        "inputAnchors": [
+          {
+            "label": "Document",
+            "name": "document",
+            "type": "Document",
+            "list": true,
+            "id": "memoryVectorStore_0-input-document-Document"
+          },
+          {
+            "label": "Embeddings",
+            "name": "embeddings",
+            "type": "Embeddings",
+            "id": "memoryVectorStore_0-input-embeddings-Embeddings"
+          }
+        ],
+        "inputs": {
+          "document": ["{{github_0.data.instance}}"],
+          "embeddings": "{{openAIEmbeddings_0.data.instance}}",
+          "topK": "6"
+        },
+        "outputAnchors": [
+          {
+            "name": "output",
+            "label": "Output",
+            "type": "options",
+            "options": [
+              {
+                "id": "memoryVectorStore_0-output-retriever-Memory|VectorStoreRetriever|BaseRetriever",
+                "name": "retriever",
+                "label": "Memory Retriever",
+                "type": "Memory | VectorStoreRetriever | BaseRetriever"
+              },
+              {
+                "id": "memoryVectorStore_0-output-vectorStore-Memory|VectorStore",
+                "name": "vectorStore",
+                "label": "Memory Vector Store",
+                "type": "Memory | VectorStore"
+              }
+            ],
+            "default": "retriever"
+          }
+        ],
+        "outputs": {
+          "output": "retriever"
+        }
+      },
+      "positionAbsolute": {
+        "x": 1830,
+        "y": 470
+      }
+    },
+    {
+      "width": 300,
+      "height": 590,
+      "id": "chatOpenAI_0",
+      "position": {
+        "x": 1835,
+        "y": -210
+      },
+      "type": "customNode",
+      "data": {
+        "id": "chatOpenAI_0",
+        "label": "ChatOpenAI Custom",
+        "version": 4,
+        "name": "chatOpenAICustom",
+        "type": "ChatOpenAI-Custom",
+        "baseClasses": ["ChatOpenAI-Custom", "ChatOpenAI", "BaseChatModel", "BaseLanguageModel"],
+        "category": "Chat Models",
+        "description": "Custom/FineTuned model using OpenAI Chat compatible API",
+        "inputParams": [
+          {
+            "label": "Connect Credential",
+            "name": "credential",
+            "type": "credential",
+            "credentialNames": ["openAIApi"],
+            "id": "chatOpenAI_0-input-credential-credential"
+          },
+          {
+            "label": "Model Name",
+            "name": "modelName",
+            "type": "string",
+            "placeholder": "ft:gpt-3.5-turbo:my-org:custom_suffix:id",
+            "id": "chatOpenAI_0-input-modelName-string"
+          },
+          {
+            "label": "Temperature",
+            "name": "temperature",
+            "type": "number",
+            "step": 0.1,
+            "default": 0.9,
+            "optional": true,
+            "id": "chatOpenAI_0-input-temperature-number"
+          },
+          {
+            "label": "Streaming",
+            "name": "streaming",
+            "type": "boolean",
+            "default": true,
+            "optional": true,
+            "additionalParams": true,
+            "id": "chatOpenAI_0-input-streaming-boolean"
+          },
+          {
+            "label": "Max Tokens",
+            "name": "maxTokens",
+            "type": "number",
+            "step": 1,
+            "optional": true,
+            "additionalParams": true,
+            "id": "chatOpenAI_0-input-maxTokens-number"
+          },
+          {
+            "label": "Top Probability",
+            "name": "topP",
+            "type": "number",
+            "step": 0.1,
+            "optional": true,
+            "additionalParams": true,
+            "id": "chatOpenAI_0-input-topP-number"
+          },
+          {
+            "label": "Frequency Penalty",
+            "name": "frequencyPenalty",
+            "type": "number",
+            "step": 0.1,
+            "optional": true,
+            "additionalParams": true,
+            "id": "chatOpenAI_0-input-frequencyPenalty-number"
+          },
+          {
+            "label": "Presence Penalty",
+            "name": "presencePenalty",
+            "type": "number",
+            "step": 0.1,
+            "optional": true,
+            "additionalParams": true,
+            "id": "chatOpenAI_0-input-presencePenalty-number"
+          },
+          {
+            "label": "Timeout",
+            "name": "timeout",
+            "type": "number",
+            "step": 1,
+            "optional": true,
+            "additionalParams": true,
+            "id": "chatOpenAI_0-input-timeout-number"
+          },
+          {
+            "label": "BasePath",
+            "name": "basepath",
+            "type": "string",
+            "optional": true,
+            "additionalParams": true,
+            "id": "chatOpenAI_0-input-basepath-string"
+          },
+          {
+            "label": "BaseOptions",
+            "name": "baseOptions",
+            "type": "json",
+            "optional": true,
+            "additionalParams": true,
+            "id": "chatOpenAI_0-input-baseOptions-json"
+          }
+        ],
+        "inputAnchors": [
+          {
+            "label": "Cache",
+            "name": "cache",
+            "type": "BaseCache",
+            "optional": true,
+            "id": "chatOpenAI_0-input-cache-BaseCache"
+          }
+        ],
+        "inputs": {
+          "modelName": "{{$vars.FLOWISE_OPENAI_CHAT_MODEL}}",
+          "temperature": 0.2,
+          "streaming": true,
+          "maxTokens": "1024",
+          "topP": "",
+          "frequencyPenalty": "",
+          "presencePenalty": "",
+          "timeout": "120000",
+          "basepath": "{{$vars.FLOWISE_OPENAI_BASEPATH}}",
+          "baseOptions": ""
+        },
+        "outputAnchors": [
+          {
+            "id": "chatOpenAI_0-output-chatOpenAICustom-ChatOpenAI-Custom|ChatOpenAI|BaseChatModel|BaseLanguageModel",
+            "name": "chatOpenAICustom",
+            "label": "ChatOpenAICustom",
+            "type": "ChatOpenAI-Custom | ChatOpenAI | BaseChatModel | BaseLanguageModel"
+          }
+        ],
+        "outputs": {}
+      },
+      "positionAbsolute": {
+        "x": 1835,
+        "y": -210
+      }
+    },
+    {
+      "width": 300,
+      "height": 532,
+      "id": "conversationalRetrievalQAChain_0",
+      "position": {
+        "x": 2250,
+        "y": 220
+      },
+      "type": "customNode",
+      "data": {
+        "id": "conversationalRetrievalQAChain_0",
+        "label": "Conversational Retrieval QA Chain",
+        "version": 3,
+        "name": "conversationalRetrievalQAChain",
+        "type": "ConversationalRetrievalQAChain",
+        "baseClasses": ["ConversationalRetrievalQAChain", "BaseChain", "Runnable"],
+        "category": "Chains",
+        "description": "Document QA - built on RetrievalQAChain to provide a chat history component",
+        "inputParams": [
+          {
+            "label": "Return Source Documents",
+            "name": "returnSourceDocuments",
+            "type": "boolean",
+            "optional": true,
+            "id": "conversationalRetrievalQAChain_0-input-returnSourceDocuments-boolean"
+          },
+          {
+            "label": "Rephrase Prompt",
+            "name": "rephrasePrompt",
+            "type": "string",
+            "description": "Using previous chat history, rephrase question into a standalone question",
+            "warning": "Prompt must include input variables: {chat_history} and {question}",
+            "rows": 4,
+            "additionalParams": true,
+            "optional": true,
+            "default": "Given the following conversation and a follow up question, rephrase the follow up question to be a standalone question.\n\nChat History:\n{chat_history}\nFollow Up Input: {question}\nStandalone Question:",
+            "id": "conversationalRetrievalQAChain_0-input-rephrasePrompt-string"
+          },
+          {
+            "label": "Response Prompt",
+            "name": "responsePrompt",
+            "type": "string",
+            "description": "Taking the rephrased question, search for answer from the provided context",
+            "warning": "Prompt must include input variable: {context}",
+            "rows": 4,
+            "additionalParams": true,
+            "optional": true,
+            "default": "You are a helpful assistant. Using the provided context, answer the user's question to the best of your ability using the resources provided.\nIf there is nothing in the context relevant to the question at hand, just say \"Hmm, I'm not sure.\" Don't try to make up an answer.\n------------\n{context}\n------------\nREMEMBER: If there is no relevant information within the context, just say \"Hmm, I'm not sure.\" Don't try to make up an answer.",
+            "id": "conversationalRetrievalQAChain_0-input-responsePrompt-string"
+          }
+        ],
+        "inputAnchors": [
+          {
+            "label": "Chat Model",
+            "name": "model",
+            "type": "BaseChatModel",
+            "id": "conversationalRetrievalQAChain_0-input-model-BaseChatModel"
+          },
+          {
+            "label": "Vector Store Retriever",
+            "name": "vectorStoreRetriever",
+            "type": "BaseRetriever",
+            "id": "conversationalRetrievalQAChain_0-input-vectorStoreRetriever-BaseRetriever"
+          },
+          {
+            "label": "Memory",
+            "name": "memory",
+            "type": "BaseMemory",
+            "optional": true,
+            "description": "If left empty, a default BufferMemory will be used",
+            "id": "conversationalRetrievalQAChain_0-input-memory-BaseMemory"
+          },
+          {
+            "label": "Input Moderation",
+            "description": "Detect text that could generate harmful output and prevent it from being sent to the language model",
+            "name": "inputModeration",
+            "type": "Moderation",
+            "optional": true,
+            "list": true,
+            "id": "conversationalRetrievalQAChain_0-input-inputModeration-Moderation"
+          }
+        ],
+        "inputs": {
+          "inputModeration": "",
+          "model": "{{chatOpenAI_0.data.instance}}",
+          "vectorStoreRetriever": "{{memoryVectorStore_0.data.instance}}",
+          "memory": "",
+          "returnSourceDocuments": true,
+          "rephrasePrompt": "Given the following conversation and a follow up question, rephrase the follow up question to be a standalone question that is specific to the automation platform documentation.\n\nChat History:\n{chat_history}\nFollow Up Input: {question}\nStandalone Question:",
+          "responsePrompt": "You are the automation platform technical engineer assisting customers from the platform knowledge base.\n\nRules:\n- Answer like a technical support engineer who knows the product and operations docs.\n- Prefer concise, practical steps and mention the relevant service, page, endpoint, or document when possible.\n- Only answer with information supported by the provided context.\n- If the answer is incomplete in the context, say exactly what is known and what is missing.\n- If the docs do not contain the answer, say \"I can't confirm that from the current documentation.\" Do not invent details.\n\nContext:\n------------\n{context}\n------------"
+        },
+        "outputAnchors": [
+          {
+            "id": "conversationalRetrievalQAChain_0-output-conversationalRetrievalQAChain-ConversationalRetrievalQAChain|BaseChain|Runnable",
+            "name": "conversationalRetrievalQAChain",
+            "label": "ConversationalRetrievalQAChain",
+            "type": "ConversationalRetrievalQAChain | BaseChain | Runnable"
+          }
+        ],
+        "outputs": {}
+      },
+      "positionAbsolute": {
+        "x": 2250,
+        "y": 220
+      }
+    },
+    {
+      "id": "stickyNote_0",
+      "position": {
+        "x": 1035,
+        "y": 290
+      },
+      "type": "stickyNote",
+      "data": {
+        "id": "stickyNote_0",
+        "label": "Sticky Note",
+        "version": 2,
+        "name": "stickyNote",
+        "type": "StickyNote",
+        "baseClasses": ["StickyNote"],
+        "tags": ["Utilities"],
+        "category": "Utilities",
+        "description": "Add a sticky note",
+        "inputParams": [
+          {
+            "label": "",
+            "name": "note",
+            "type": "string",
+            "rows": 1,
+            "placeholder": "Type something here",
+            "optional": true,
+            "id": "stickyNote_0-input-note-string"
+          }
+        ],
+        "inputAnchors": [],
+        "inputs": {
+          "note": "Docs source is limited to the GitHub path configured in Flowise Variables and currently targets `docs/operations`. Leave the Github credential empty for this public repository. Only connect a Github token if you switch to a private repo."
+        },
+        "outputAnchors": [
+          {
+            "id": "stickyNote_0-output-stickyNote-StickyNote",
+            "name": "stickyNote",
+            "label": "StickyNote",
+            "description": "Add a sticky note",
+            "type": "StickyNote"
+          }
+        ],
+        "outputs": {}
+      },
+      "width": 300,
+      "height": 110,
+      "positionAbsolute": {
+        "x": 1035,
+        "y": 290
+      }
+    },
+    {
+      "id": "stickyNote_1",
+      "position": {
+        "x": 1835,
+        "y": 610
+      },
+      "type": "stickyNote",
+      "data": {
+        "id": "stickyNote_1",
+        "label": "Sticky Note",
+        "version": 2,
+        "name": "stickyNote",
+        "type": "StickyNote",
+        "baseClasses": ["StickyNote"],
+        "tags": ["Utilities"],
+        "category": "Utilities",
+        "description": "Add a sticky note",
+        "inputParams": [
+          {
+            "label": "",
+            "name": "note",
+            "type": "string",
+            "rows": 1,
+            "placeholder": "Type something here",
+            "optional": true,
+            "id": "stickyNote_1-input-note-string"
+          }
+        ],
+        "inputAnchors": [],
+        "inputs": {
+          "note": "Connect the same OpenAI API credential to both custom OpenAI nodes. Enter the exact chat and embedding model names, and set BasePath to your OpenAI-compatible provider `/v1` endpoint."
+        },
+        "outputAnchors": [
+          {
+            "id": "stickyNote_1-output-stickyNote-StickyNote",
+            "name": "stickyNote",
+            "label": "StickyNote",
+            "description": "Add a sticky note",
+            "type": "StickyNote"
+          }
+        ],
+        "outputs": {}
+      },
+      "width": 300,
+      "height": 110,
+      "positionAbsolute": {
+        "x": 1835,
+        "y": 610
+      }
+    }
+  ],
+  "edges": [
+    {
+      "source": "markdownTextSplitter_0",
+      "sourceHandle": "markdownTextSplitter_0-output-markdownTextSplitter-MarkdownTextSplitter|RecursiveCharacterTextSplitter|TextSplitter|BaseDocumentTransformer",
+      "target": "github_0",
+      "targetHandle": "github_0-input-textSplitter-TextSplitter",
+      "type": "buttonedge",
+      "id": "markdownTextSplitter_0-markdownTextSplitter_0-output-markdownTextSplitter-MarkdownTextSplitter|RecursiveCharacterTextSplitter|TextSplitter|BaseDocumentTransformer-github_0-github_0-input-textSplitter-TextSplitter",
+      "data": {
+        "label": ""
+      }
+    },
+    {
+      "source": "github_0",
+      "sourceHandle": "github_0-output-document-Document",
+      "target": "memoryVectorStore_0",
+      "targetHandle": "memoryVectorStore_0-input-document-Document",
+      "type": "buttonedge",
+      "id": "github_0-github_0-output-document-Document-memoryVectorStore_0-memoryVectorStore_0-input-document-Document",
+      "data": {
+        "label": ""
+      }
+    },
+    {
+      "source": "openAIEmbeddings_0",
+      "sourceHandle": "openAIEmbeddings_0-output-openAIEmbeddingsCustom-OpenAIEmbeddingsCustom|Embeddings|OpenAIEmbeddings",
+      "target": "memoryVectorStore_0",
+      "targetHandle": "memoryVectorStore_0-input-embeddings-Embeddings",
+      "type": "buttonedge",
+      "id": "openAIEmbeddings_0-openAIEmbeddings_0-output-openAIEmbeddingsCustom-OpenAIEmbeddingsCustom|Embeddings|OpenAIEmbeddings-memoryVectorStore_0-memoryVectorStore_0-input-embeddings-Embeddings",
+      "data": {
+        "label": ""
+      }
+    },
+    {
+      "source": "chatOpenAI_0",
+      "sourceHandle": "chatOpenAI_0-output-chatOpenAICustom-ChatOpenAI-Custom|ChatOpenAI|BaseChatModel|BaseLanguageModel",
+      "target": "conversationalRetrievalQAChain_0",
+      "targetHandle": "conversationalRetrievalQAChain_0-input-model-BaseChatModel",
+      "type": "buttonedge",
+      "id": "chatOpenAI_0-chatOpenAI_0-output-chatOpenAICustom-ChatOpenAI-Custom|ChatOpenAI|BaseChatModel|BaseLanguageModel-conversationalRetrievalQAChain_0-conversationalRetrievalQAChain_0-input-model-BaseChatModel",
+      "data": {
+        "label": ""
+      }
+    },
+    {
+      "source": "memoryVectorStore_0",
+      "sourceHandle": "memoryVectorStore_0-output-retriever-Memory|VectorStoreRetriever|BaseRetriever",
+      "target": "conversationalRetrievalQAChain_0",
+      "targetHandle": "conversationalRetrievalQAChain_0-input-vectorStoreRetriever-BaseRetriever",
+      "type": "buttonedge",
+      "id": "memoryVectorStore_0-memoryVectorStore_0-output-retriever-Memory|VectorStoreRetriever|BaseRetriever-conversationalRetrievalQAChain_0-conversationalRetrievalQAChain_0-input-vectorStoreRetriever-BaseRetriever",
+      "data": {
+        "label": ""
+      }
+    }
+  ]
+}

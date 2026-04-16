@@ -22,6 +22,7 @@ model WorkflowVersion {
   workflowId String
   version    Int
   status     String
+  isActive   Boolean  @default(false)
   nodesJson  Json
   createdAt  DateTime @default(now())
   workflow   Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
@@ -143,24 +144,23 @@ model StepExecution {
 model ExecutionLog {
   id            String   @id @default(cuid())
   orderId       String
+  executionId   String?
+  workflowId    String?
+  workflowVersionId String?
   nodeId        String?
   stepId        String?
+  taskId        String?
+  initiatedBy   String?
   severity      String
   source        String
   maskedPayload Json?
   message       String
   durationMs    Int?
   createdAt     DateTime @default(now())
-}
 
-model ChatHistory {
-  id         String   @id @default(cuid())
-  userId     String
-  query      String
-  answer     String
-  workflowId String?
-  orderId    String?
-  createdAt  DateTime @default(now())
+  @@index([orderId, createdAt])
+  @@index([executionId, createdAt])
+  @@index([workflowId, workflowVersionId, createdAt])
 }
 
 model WorkflowPublishAudit {
@@ -177,30 +177,6 @@ model WorkflowPublishAudit {
   updatedAt         DateTime @updatedAt
 }
 
-model RagIndexJob {
-  id                 String   @id @default(cuid())
-  source             String
-  correlationId      String?
-  requestedDocuments Int?
-  status             String
-  errorMessage       String?
-  processedAt        DateTime?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-}
-
-model RagDocument {
-  id         String   @id @default(cuid())
-  source     String
-  externalId String
-  title      String
-  text       String
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  @@unique([source, externalId])
-}
-
 model ApprovalDecision {
   id        String   @id @default(cuid())
   orderId   String
@@ -212,4 +188,60 @@ model ApprovalDecision {
   order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([orderId, createdAt])
+}
+
+model RagDiscussionThread {
+  id              String                 @id @default(cuid())
+  ownerId         String
+  title           String
+  flowiseSessionId String                @unique
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+  lastMessageAt   DateTime
+  expiresAt       DateTime
+  messages        RagDiscussionMessage[]
+
+  @@index([ownerId, lastMessageAt])
+  @@index([expiresAt])
+}
+
+model RagDiscussionMessage {
+  id        String              @id @default(cuid())
+  threadId   String
+  role      String
+  content   String
+  createdAt DateTime            @default(now())
+  thread    RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, createdAt])
+}
+
+model NodeTemplate {
+  id           String              @id @default(cuid())
+  ownerId      String
+  name         String
+  description  String?
+  category     String?
+  tagsJson     Json?
+  nodeType     String
+  configJson   Json
+  metadataJson Json?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  shares       NodeTemplateShare[]
+
+  @@index([ownerId, updatedAt])
+  @@index([nodeType, updatedAt])
+}
+
+model NodeTemplateShare {
+  id               String       @id @default(cuid())
+  templateId       String
+  sharedWithUserId String
+  createdBy        String
+  createdAt        DateTime     @default(now())
+  template         NodeTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, sharedWithUserId])
+  @@index([sharedWithUserId, createdAt])
 }

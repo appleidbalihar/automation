@@ -49,6 +49,12 @@ export interface EngineRunResult {
   currentNodeOrder: number;
   currentStepIndex: number;
   failureReason?: string;
+  autoApprovals?: Array<{
+    nodeOrder: number;
+    nodeId: string;
+    decision: "APPROVE" | "REJECT";
+    timeoutSec: number;
+  }>;
 }
 
 function nextOnFailure(policy: FailurePolicy): "CONTINUE_NODE" | "ROLLBACK" | "FAIL" {
@@ -62,6 +68,7 @@ export async function runWorkflowFromCheckpoint(context: EngineRunContext): Prom
   let currentStepIndex = context.order.currentStepIndex;
   let partial = false;
   const approvedNodeOrders = new Set(context.approvedNodeOrders ?? []);
+  const autoApprovals: EngineRunResult["autoApprovals"] = [];
 
   for (const node of context.workflowNodes) {
     if (node.order < currentNodeOrder) {
@@ -70,12 +77,37 @@ export async function runWorkflowFromCheckpoint(context: EngineRunContext): Prom
 
     const startStep = node.order === currentNodeOrder ? currentStepIndex : 0;
     if (startStep === 0 && node.approvalRequired && !approvedNodeOrders.has(node.order)) {
-      return {
-        status: "PENDING_APPROVAL",
-        currentNodeOrder: node.order,
-        currentStepIndex: 0,
-        failureReason: `Approval required for node ${node.id}`
-      };
+      if (node.approvalMode === "AUTO_WITH_TIMEOUT") {
+        const timeoutSec = Math.max(0, Number(node.approvalTimeoutSec ?? 0));
+        if (timeoutSec > 0) {
+          await new Promise((resolve) => setTimeout(resolve, timeoutSec * 1000));
+        }
+        const decision = node.autoDecision ?? "APPROVE";
+        autoApprovals.push({
+          nodeOrder: node.order,
+          nodeId: node.id,
+          decision,
+          timeoutSec
+        });
+        if (decision === "REJECT") {
+          return {
+            status: "FAILED",
+            currentNodeOrder: node.order,
+            currentStepIndex: 0,
+            failureReason: `Auto approval rejected node ${node.id}`,
+            autoApprovals
+          };
+        }
+        approvedNodeOrders.add(node.order);
+      } else {
+        return {
+          status: "PENDING_APPROVAL",
+          currentNodeOrder: node.order,
+          currentStepIndex: 0,
+          failureReason: `Approval required for node ${node.id}`,
+          autoApprovals
+        };
+      }
     }
 
     for (let stepIndex = startStep; stepIndex < node.steps.length; stepIndex += 1) {
@@ -111,14 +143,16 @@ export async function runWorkflowFromCheckpoint(context: EngineRunContext): Prom
             status: "FAILED",
             currentNodeOrder: node.order,
             currentStepIndex: stepIndex,
-            failureReason: `Rollback required after failure on ${node.id}/${step.id}: ${run.error ?? "unknown"}`
+            failureReason: `Rollback required after failure on ${node.id}/${step.id}: ${run.error ?? "unknown"}`,
+            autoApprovals
           };
         }
         return {
           status: "FAILED",
           currentNodeOrder: node.order,
           currentStepIndex: stepIndex,
-          failureReason: run.error ?? "Execution failed"
+          failureReason: run.error ?? "Execution failed",
+          autoApprovals
         };
       }
 
@@ -147,6 +181,7 @@ export async function runWorkflowFromCheckpoint(context: EngineRunContext): Prom
   return {
     status: partial ? "PARTIAL" : "SUCCESS",
     currentNodeOrder,
-    currentStepIndex
+    currentStepIndex,
+    autoApprovals
   };
 }

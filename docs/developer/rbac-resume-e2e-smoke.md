@@ -25,5 +25,5 @@
 - `pnpm smoke:rbac`
 
 ## Notes
-- Script enables legacy local bearer auth explicitly via `AUTH_ALLOW_LEGACY_BEARER=true` for smoke compatibility.
+- Script must use real Keycloak JWT tokens for role validation.
 - Services are started only when not already healthy and only script-started processes are stopped on exit.
