@@ -1,28 +1,14 @@
-import Fastify from "fastify";
-import amqp from "amqplib";
-import { randomUUID } from "node:crypto";
-import type { Channel, ChannelModel, ConsumeMessage } from "amqplib";
 import { loadConfig } from "@platform/config";
-import { prisma } from "@platform/db";
-import {
-  type NodeTemplateRecord,
-  type NodeTemplateSummary,
-  PlatformEvents,
-  type RagDiscussionSendMessageResponse,
-  type RagDiscussionSummary,
-  type RagDiscussionThread,
-  type WorkflowExportPayload,
-  flowDefinitionToWorkflowNodes,
-  isWorkflowFlowDefinition,
-  normalizeWorkflowFlow,
-  type ExecutionType,
-  type IntegrationAuthType,
-  type WorkflowFlowDefinition,
-  type WorkflowNode
+import { logInfo } from "@platform/observability";
+import type {
+  RagDiscussionSendMessageResponse,
+  RagDiscussionSummary,
+  RagDiscussionThread
 } from "@platform/contracts";
-import { createCorrelationId } from "@platform/observability";
-import { connectAmqp, createTlsRuntime, tlsFetch } from "@platform/tls-runtime";
-import { EventPublisher } from "./events.js";
+import { prisma } from "@platform/db";
+import { createTlsRuntime, tlsFetch } from "@platform/tls-runtime";
+import Fastify from "fastify";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   buildRagThreadExpiry,
   deriveRagThreadTitle,
@@ -31,11 +17,6 @@ import {
   mapRagDiscussionSummary,
   mapRagDiscussionThread
 } from "./rag-chat.js";
-import {
-  mapNodeTemplateRecord,
-  mapNodeTemplateSummary,
-  normalizeNodeTemplateDefinition
-} from "./node-templates.js";
 
 const config = loadConfig("workflow-service", 4001);
 const tlsRuntime = createTlsRuntime({
@@ -52,40 +33,22 @@ const tlsRuntime = createTlsRuntime({
   diagnosticsToken: config.securityDiagnosticsToken
 });
 const app = Fastify({ logger: false, https: tlsRuntime.getServerOptions() } as any);
-const eventPublisher = new EventPublisher(config.rabbitmqUrl, "platform.events", (url) =>
-  connectAmqp(tlsRuntime, amqp.connect, url) as Promise<ChannelModel>
-);
-const WORKFLOW_PUBLISH_AUDIT_QUEUE = "workflow-service.publish-audit.v1";
-const EXECUTION_TYPES: ExecutionType[] = ["REST", "SSH", "NETCONF", "SCRIPT"];
-const AUTH_TYPES: IntegrationAuthType[] = ["NO_AUTH", "OAUTH2", "BASIC", "MTLS", "API_KEY", "OIDC", "JWT"];
-const SENSITIVE_KEY_PATTERN = /(password|token|secret|api[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|passphrase)/i;
-const VAULT_REF_PATTERN = /^vault:[^#\s]+#[^#\s]+$/i;
+
 const VAULT_KV_MOUNT = String(process.env.VAULT_KV_MOUNT ?? "secret").trim() || "secret";
-const STRICT_VAULT_ONLY = String(process.env.VAULT_STRICT_SECRETS ?? "true").trim().toLowerCase() !== "false";
-const RESET_CONFIRM_TEXT = "RESET WORKFLOWS AND ORDERS";
-let resetInProgress = false;
-
-type SensitiveIssue = {
-  path: string;
-  code: "PLAINTEXT_SECRET_BLOCKED" | "ENV_SECRET_REF_BLOCKED" | "VAULT_SECRET_NOT_FOUND";
-  message: string;
+const DEFAULT_WORKFLOW_IDS: Record<string, string> = {
+  github: "rag-sync-github",
+  gitlab: "rag-sync-gitlab",
+  googledrive: "rag-sync-gdrive",
+  web: "rag-sync-web",
+  upload: ""
 };
-
-function tryParseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
 
 function requesterUserId(headers: Record<string, unknown>): string {
   return String(headers["x-user-id"] ?? "").trim() || "unknown";
 }
 
 function requesterRoles(headers: Record<string, unknown>): string[] {
-  const raw = String(headers["x-user-roles"] ?? "");
-  return raw
+  return String(headers["x-user-roles"] ?? "")
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
@@ -95,100 +58,23 @@ function isAdmin(headers: Record<string, unknown>): boolean {
   return requesterRoles(headers).includes("admin");
 }
 
-function toJsonObject(value: unknown): any {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  return JSON.parse(JSON.stringify(value));
-}
-
-function isVaultRef(value: unknown): boolean {
-  return typeof value === "string" && VAULT_REF_PATTERN.test(value.trim());
-}
-
-function validateSecretFields(
-  value: unknown,
-  options: {
-    pathPrefix: string;
-    allowSensitiveKeys: boolean;
-    requireVaultRefForSensitive: boolean;
-  },
-  path: string[] = []
-): SensitiveIssue[] {
-  const issues: SensitiveIssue[] = [];
-  if (Array.isArray(value)) {
-    for (const [index, entry] of value.entries()) {
-      issues.push(...validateSecretFields(entry, options, [...path, String(index)]));
-    }
-    return issues;
-  }
-  if (!value || typeof value !== "object") {
-    return issues;
-  }
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    const currentPath = [...path, key];
-    const pointer = `${options.pathPrefix}.${currentPath.join(".")}`;
-    if (typeof entry === "string" && entry.startsWith("env:")) {
-      issues.push({
-        path: pointer,
-        code: "ENV_SECRET_REF_BLOCKED",
-        message: `env secret reference is blocked at ${pointer}`
-      });
-    }
-    if (SENSITIVE_KEY_PATTERN.test(key)) {
-      if (!options.allowSensitiveKeys) {
-        issues.push({
-          path: pointer,
-          code: "PLAINTEXT_SECRET_BLOCKED",
-          message: `sensitive key is not allowed in ${options.pathPrefix}`
-        });
-      } else if (options.requireVaultRefForSensitive && !isVaultRef(entry)) {
-        issues.push({
-          path: pointer,
-          code: "PLAINTEXT_SECRET_BLOCKED",
-          message: `sensitive key must use vault: reference at ${pointer}`
-        });
-      }
-    }
-    if (entry && typeof entry === "object") {
-      issues.push(...validateSecretFields(entry, options, currentPath));
-    }
-  }
-  return issues;
-}
-
-function collectAllVaultRefs(value: unknown, refs: Set<string> = new Set<string>()): Set<string> {
-  if (Array.isArray(value)) {
-    for (const item of value) collectAllVaultRefs(item, refs);
-    return refs;
-  }
-  if (value && typeof value === "object") {
-    for (const item of Object.values(value as Record<string, unknown>)) {
-      collectAllVaultRefs(item, refs);
-    }
-    return refs;
-  }
-  if (typeof value === "string" && value.startsWith("vault:")) {
-    refs.add(value.trim());
-  }
-  return refs;
-}
-
 function requireAdmin(headers: Record<string, unknown>): { allowed: boolean; error?: { error: string } } {
-  if (!isAdmin(headers)) {
-    return { allowed: false, error: { error: "FORBIDDEN_ADMIN_ONLY" } };
-  }
+  if (!isAdmin(headers)) return { allowed: false, error: { error: "FORBIDDEN_ADMIN_ONLY" } };
   return { allowed: true };
 }
 
 function secretLogicalPath(input: { scope: string; username?: string; group?: string }): string {
   const group = String(input.group ?? "default").trim().replace(/[^a-zA-Z0-9/_-]/g, "_");
-  if (input.scope === "global") {
-    return `platform/global/${group}`;
-  }
+  if (input.scope === "global") return `platform/global/${group}`;
   const username = String(input.username ?? "").trim();
-  if (!username) {
-    throw new Error("USERNAME_REQUIRED_FOR_USER_SCOPE");
-  }
+  if (!username) throw new Error("USERNAME_REQUIRED_FOR_USER_SCOPE");
   return `platform/users/${username}/${group}`;
+}
+
+function sanitizeLogicalPath(path: string): string {
+  const normalized = String(path ?? "").trim().replace(/^\/+/, "").replace(/\/+$/, "");
+  if (!normalized.startsWith("platform/")) throw new Error("SECRET_PATH_MUST_START_WITH_PLATFORM");
+  return normalized;
 }
 
 function secretDataPath(logicalPath: string): string {
@@ -199,8 +85,16 @@ function secretMetadataPath(logicalPath: string): string {
   return `${VAULT_KV_MOUNT}/metadata/${logicalPath}`;
 }
 
+function userSourceSecretPath(userId: string, kbId: string): string {
+  return `platform/users/${userId}/sources/${kbId}`;
+}
+
+function userRagConfigPath(userId: string): string {
+  return `platform/users/${userId}/rag/config`;
+}
+
 async function vaultCall(method: string, path: string, body?: Record<string, unknown>): Promise<Response> {
-  const response = await fetch(new URL(`/v1/${path}`, process.env.VAULT_ADDR ?? "http://vault:8200"), {
+  return fetch(new URL(`/v1/${path}`, process.env.VAULT_ADDR ?? "http://vault:8200"), {
     method,
     headers: {
       "content-type": "application/json",
@@ -208,32 +102,19 @@ async function vaultCall(method: string, path: string, body?: Record<string, unk
     },
     body: body ? JSON.stringify(body) : undefined
   });
-  return response;
 }
 
 async function readVaultKv(logicalPath: string): Promise<Record<string, unknown>> {
   const response = await vaultCall("GET", secretDataPath(logicalPath));
   if (response.status === 404) return {};
-  if (!response.ok) {
-    throw new Error(`VAULT_SECRET_NOT_FOUND:${logicalPath}`);
-  }
+  if (!response.ok) throw new Error(`VAULT_SECRET_NOT_FOUND:${logicalPath}`);
   const payload = (await response.json()) as { data?: { data?: Record<string, unknown> } };
   return payload.data?.data ?? {};
 }
 
 async function writeVaultKv(logicalPath: string, data: Record<string, unknown>): Promise<void> {
   const response = await vaultCall("POST", secretDataPath(logicalPath), { data });
-  if (!response.ok) {
-    throw new Error(`VAULT_WRITE_FAILED:${logicalPath}`);
-  }
-}
-
-function sanitizeLogicalPath(path: string): string {
-  const normalized = String(path ?? "").trim().replace(/^\/+/, "").replace(/\/+$/, "");
-  if (!normalized.startsWith("platform/")) {
-    throw new Error("SECRET_PATH_MUST_START_WITH_PLATFORM");
-  }
-  return normalized;
+  if (!response.ok) throw new Error(`VAULT_WRITE_FAILED:${logicalPath}`);
 }
 
 async function readVaultKvMetadata(logicalPath: string): Promise<{ version: number; updatedAt: string | null }> {
@@ -249,163 +130,657 @@ async function readVaultKvMetadata(logicalPath: string): Promise<{ version: numb
 async function listVaultChildren(prefix: string): Promise<string[]> {
   const response = await vaultCall("GET", `${VAULT_KV_MOUNT}/metadata/${prefix}?list=true`);
   if (response.status === 404) return [];
-  if (!response.ok) {
-    throw new Error(`VAULT_LIST_FAILED:${prefix}`);
-  }
+  if (!response.ok) throw new Error(`VAULT_LIST_FAILED:${prefix}`);
   const payload = (await response.json()) as { data?: { keys?: string[] } };
   return payload.data?.keys ?? [];
 }
 
 async function listVaultLeafPaths(prefix: string): Promise<string[]> {
   const children = await listVaultChildren(prefix);
-  const output: string[] = [];
-  for (const key of children) {
-    const next = `${prefix}/${key}`.replace(/\/+/g, "/");
-    if (key.endsWith("/")) {
-      const nested = await listVaultLeafPaths(next.replace(/\/+$/, ""));
-      output.push(...nested);
+  const leaves: string[] = [];
+  for (const child of children) {
+    const next = `${prefix}/${child}`.replace(/\/+/g, "/");
+    if (child.endsWith("/")) {
+      leaves.push(...(await listVaultLeafPaths(next.replace(/\/+$/, ""))));
     } else {
-      output.push(next);
+      leaves.push(next);
     }
   }
-  return output;
+  return leaves;
 }
 
-async function vaultRefExists(ref: string): Promise<boolean> {
-  if (!isVaultRef(ref)) return false;
-  const raw = ref.slice("vault:".length);
-  const [path, field] = raw.split("#");
-  if (!path || !field) return false;
-  const response = await vaultCall("GET", path);
-  if (!response.ok) return false;
-  const payload = (await response.json()) as { data?: { data?: Record<string, unknown> } & Record<string, unknown> };
-  const kv2 = payload.data?.data?.[field];
-  const kv1 = (payload.data as Record<string, unknown> | undefined)?.[field];
-  return kv2 !== undefined || kv1 !== undefined;
+function nonEmptyString(value: unknown): string | undefined {
+  const normalized = String(value ?? "").trim();
+  return normalized ? normalized : undefined;
 }
 
-async function enforceStrictSecretPolicy(): Promise<void> {
-  if (!STRICT_VAULT_ONLY) return;
-  const [integrations, environments] = await Promise.all([
-    prisma.integrationProfile.findMany({ select: { id: true, credentialJson: true } }),
-    prisma.userEnvironment.findMany({ select: { id: true, variablesJson: true } })
-  ]);
-  const violations: string[] = [];
-  for (const integration of integrations) {
-    const issues = validateSecretFields(integration.credentialJson, {
-      pathPrefix: `integration:${integration.id}.credentials`,
-      allowSensitiveKeys: true,
-      requireVaultRefForSensitive: true
-    });
-    violations.push(...issues.map((entry) => `${entry.code}:${entry.path}`));
+function normalizeAccessToken(value: unknown): string | undefined {
+  let token = String(value ?? "").trim();
+  token = token.replace(/^Bearer\s+/i, "");
+  token = token.replace(/^PRIVATE-TOKEN\s*[:=]\s*/i, "");
+  token = token.replace(/^token\s*[:=]\s*/i, "");
+  token = token.replace(/^["']|["']$/g, "").trim();
+  return token || undefined;
+}
+
+function buildSourceSecretPayload(
+  sourceType: string,
+  credentials: Record<string, unknown> | undefined
+): Record<string, string> {
+  const payload: Record<string, string> = {};
+  if (!credentials) return payload;
+  if (sourceType === "github") {
+    const token = normalizeAccessToken(credentials.githubToken);
+    if (token) payload.github_token = token;
+  } else if (sourceType === "gitlab") {
+    const token = normalizeAccessToken(credentials.gitlabToken);
+    if (token) payload.gitlab_token = token;
+  } else if (sourceType === "googledrive") {
+    const token = normalizeAccessToken(credentials.googleDriveAccessToken);
+    const refresh = normalizeAccessToken(credentials.googleDriveRefreshToken);
+    if (token) payload.gdrive_token = token;
+    if (refresh) payload.gdrive_refresh = refresh;
   }
-  for (const environment of environments) {
-    const issues = validateSecretFields(environment.variablesJson, {
-      pathPrefix: `environment:${environment.id}.variables`,
-      allowSensitiveKeys: false,
-      requireVaultRefForSensitive: false
-    });
-    violations.push(...issues.map((entry) => `${entry.code}:${entry.path}`));
+  return payload;
+}
+
+function sourceCredentialConfigured(sourceType: string, secrets: Record<string, unknown>): boolean {
+  // GitHub/GitLab tokens are optional because public repositories can sync
+  // without user credentials. Private sources still pass tokens to n8n when set.
+  if (sourceType === "github" || sourceType === "gitlab") return true;
+  if (sourceType === "googledrive") {
+    return Boolean(nonEmptyString(secrets.gdrive_token) || nonEmptyString(secrets.gdrive_refresh));
   }
-  if (violations.length > 0) {
-    throw new Error(`STRICT_VAULT_ONLY_POLICY_VIOLATIONS:${violations.slice(0, 20).join(",")}`);
+  return true;
+}
+
+function normalizeSourceType(sourceType: string, sourceUrl?: string): string {
+  const requested = sourceType === "gdrive" ? "googledrive" : sourceType;
+  const url = String(sourceUrl ?? "").toLowerCase();
+  if (url.includes("gitlab.")) return "gitlab";
+  if (url.includes("github.")) return "github";
+  if (url.includes("drive.google.") || url.includes("docs.google.")) return "googledrive";
+  return requested;
+}
+
+function supportedDocumentPath(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase();
+  return Boolean(ext && ["md", "txt", "rst", "mdx"].includes(ext));
+}
+
+function sourceAccessError(sourceType: string, status: number, details: string): string {
+  const suffix = details ? ` Provider response: ${details.slice(0, 240)}` : "";
+  if (status === 401 || status === 403 || status === 404) {
+    return `${sourceType} source is not accessible from the sync worker. If this is a private repository, add a personal access token with read repository permission and sync again.${suffix}`;
   }
+  return `${sourceType} source preflight failed with HTTP ${status}.${suffix}`;
 }
 
-function normalizeExecutionType(value: unknown): ExecutionType | undefined {
-  const normalized = String(value ?? "").trim().toUpperCase();
-  return EXECUTION_TYPES.find((entry) => entry === normalized as ExecutionType);
-}
-
-function normalizeAuthType(value: unknown): IntegrationAuthType | undefined {
-  const normalized = String(value ?? "").trim().toUpperCase().replace(/\s+/g, "_");
-  return AUTH_TYPES.find((entry) => entry === normalized as IntegrationAuthType);
-}
-
-async function requestPlannerDraft(prompt: string, existingFlowDefinition?: WorkflowFlowDefinition): Promise<{
-  flowDefinition: WorkflowFlowDefinition;
-  diagnostics: {
-    attempts: number;
-    plannerStatus: number;
-    latencyMs: number;
-  };
-}> {
-  const maxAttempts = 2;
-  let lastError = "PLANNER_UNKNOWN_ERROR";
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const started = Date.now();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    try {
-      const response = await fetch(config.flowisePlannerUrl, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(config.flowiseApiKey ? { authorization: `Bearer ${config.flowiseApiKey}` } : {})
-        },
-        body: JSON.stringify({
-          prompt,
-          existingFlowDefinition
-        }),
-        signal: controller.signal
-      });
-      const latencyMs = Date.now() - started;
-      if (!response.ok) {
-        lastError = `PLANNER_HTTP_${response.status}`;
-        continue;
+async function preflightGitHubSource(input: {
+  sourceUrl: string;
+  sourceBranch: string;
+  sourcePath: string;
+  token?: string;
+}): Promise<number> {
+  const match = input.sourceUrl.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
+  if (!match) throw new Error("Invalid GitHub repository URL");
+  const owner = match[1];
+  const repo = match[2].replace(/\.git$/i, "");
+  const response = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(input.sourceBranch)}?recursive=1`,
+    {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "platform-rag-sync/1.0",
+        ...(input.token ? { authorization: `Bearer ${input.token}` } : {})
       }
-      const payload = (await response.json()) as { flowDefinition?: WorkflowFlowDefinition; output?: unknown };
-      const candidate = payload.flowDefinition ?? payload.output;
-      const flowDefinition = normalizeWorkflowFlow(candidate);
-      return {
-        flowDefinition,
-        diagnostics: {
-          attempts: attempt,
-          plannerStatus: response.status,
-          latencyMs
-        }
-      };
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : "PLANNER_REQUEST_FAILED";
-    } finally {
-      clearTimeout(timeout);
     }
+  );
+  if (!response.ok) {
+    throw new Error(sourceAccessError("GitHub", response.status, await response.text().catch(() => "")));
   }
-  throw new Error(lastError);
+  const payload = (await response.json()) as { tree?: Array<{ path?: string; type?: string }> };
+  const basePath = input.sourcePath.replace(/^\/+|\/+$/g, "");
+  return (payload.tree ?? []).filter((item) => {
+    const path = String(item.path ?? "");
+    return item.type === "blob" && supportedDocumentPath(path) && (!basePath || path.startsWith(basePath));
+  }).length;
 }
 
-function fallbackPlannerDraft(prompt: string, existingFlowDefinition?: WorkflowFlowDefinition): WorkflowFlowDefinition {
-  if (existingFlowDefinition) {
-    return normalizeWorkflowFlow(existingFlowDefinition);
+async function preflightGitLabSource(input: {
+  sourceUrl: string;
+  sourceBranch: string;
+  sourcePath: string;
+  token?: string;
+}): Promise<number> {
+  const match = input.sourceUrl.match(/gitlab\.com\/([^?#]+?)(?:\/-\/.*)?$/i);
+  if (!match) throw new Error("Invalid GitLab repository URL");
+  const projectPath = match[1].replace(/\.git$/i, "").replace(/\/+$/g, "");
+  const encodedProjectPath = encodeURIComponent(projectPath);
+  const basePath = input.sourcePath.replace(/^\/+|\/+$/g, "");
+  let page = 1;
+  let total = 0;
+
+  while (page <= 10) {
+    const url = new URL(`https://gitlab.com/api/v4/projects/${encodedProjectPath}/repository/tree`);
+    url.searchParams.set("ref", input.sourceBranch);
+    url.searchParams.set("recursive", "true");
+    url.searchParams.set("per_page", "100");
+    url.searchParams.set("page", String(page));
+
+    const response = await fetch(url, {
+      headers: {
+        "user-agent": "platform-rag-sync/1.0",
+        ...(input.token ? { "PRIVATE-TOKEN": input.token } : {})
+      }
+    });
+    if (!response.ok) {
+      throw new Error(sourceAccessError("GitLab", response.status, await response.text().catch(() => "")));
+    }
+
+    const files = (await response.json()) as Array<{ path?: string; type?: string }>;
+    total += files.filter((item) => {
+      const path = String(item.path ?? "");
+      return item.type === "blob" && supportedDocumentPath(path) && (!basePath || path.startsWith(basePath));
+    }).length;
+
+    const nextPage = response.headers.get("x-next-page");
+    if (!nextPage) break;
+    page = Number(nextPage);
+    if (!Number.isFinite(page) || page <= 0) break;
   }
-  const normalizedPrompt = prompt.trim();
-  return normalizeWorkflowFlow({
-    schemaVersion: "v2",
-    nodes: [
-      {
-        id: "node-1",
-        type: "task",
-        label: "Planned Node 1",
-        position: { x: 160, y: 140 },
-        config: {
-          configType: "SIMPLE",
-          approvalRequired: false,
-          failurePolicy: "RETRY",
-          steps: [
+
+  return total;
+}
+
+async function preflightSourceDocumentCount(
+  kb: {
+    sourceType: string | null;
+    sourceUrl: string | null;
+    sourceBranch: string | null;
+    sourcePath: string | null;
+  },
+  sourceSecrets: Record<string, unknown>
+): Promise<number | null> {
+  const sourceType = normalizeSourceType(String(kb.sourceType ?? ""), String(kb.sourceUrl ?? ""));
+  const sourceUrl = nonEmptyString(kb.sourceUrl);
+  if (!sourceUrl) return null;
+  const sourceBranch = nonEmptyString(kb.sourceBranch) ?? "main";
+  const sourcePath = String(kb.sourcePath ?? "").trim();
+
+  if (sourceType === "github") {
+    return preflightGitHubSource({
+      sourceUrl,
+      sourceBranch,
+      sourcePath,
+      token: nonEmptyString(sourceSecrets.github_token)
+    });
+  }
+  if (sourceType === "gitlab") {
+    return preflightGitLabSource({
+      sourceUrl,
+      sourceBranch,
+      sourcePath,
+      token: nonEmptyString(sourceSecrets.gitlab_token)
+    });
+  }
+
+  return null;
+}
+
+async function readUserRagConfig(userId: string): Promise<Record<string, unknown>> {
+  return readVaultKv(userRagConfigPath(userId));
+}
+
+async function setUserDefaultKnowledgeBase(userId: string, knowledgeBaseId: string): Promise<void> {
+  const existing = await readUserRagConfig(userId);
+  await writeVaultKv(userRagConfigPath(userId), {
+    ...existing,
+    default_kb_id: knowledgeBaseId
+  });
+}
+
+async function clearUserDefaultKnowledgeBaseIfMatches(userId: string, knowledgeBaseId: string): Promise<void> {
+  const existing = await readUserRagConfig(userId);
+  if (String(existing.default_kb_id ?? "").trim() !== knowledgeBaseId) return;
+  const next = { ...existing };
+  delete next.default_kb_id;
+  await writeVaultKv(userRagConfigPath(userId), next);
+}
+
+async function deleteVaultSecret(logicalPath: string): Promise<void> {
+  await vaultCall("DELETE", secretMetadataPath(logicalPath)).catch(() => undefined);
+}
+
+async function readGlobalDifyProvisioningDefaults(sourceType: string): Promise<{
+  difyAppUrl: string;
+  defaultApiKey?: string;
+  workflowId: string;
+}> {
+  const configSecret = await readVaultKv("platform/global/dify/config");
+  const normalizedType = sourceType === "gdrive" ? "googledrive" : sourceType;
+  const workflowId =
+    nonEmptyString(configSecret[`${normalizedType}_workflow_id`]) ??
+    DEFAULT_WORKFLOW_IDS[normalizedType] ??
+    "";
+  return {
+    difyAppUrl: nonEmptyString(configSecret.default_app_url) ?? config.difyApiBaseUrl,
+    defaultApiKey: nonEmptyString(configSecret.default_api_key),
+    workflowId
+  };
+}
+
+type DifyProvisioningConfig = {
+  difyAppUrl: string;
+  consoleEmail: string;
+  consoleName: string;
+  consolePassword: string;
+  initPassword?: string;
+  modelProvider: string;
+  modelApiKey?: string;
+  modelApiBase?: string;
+  chatModel: string;
+  embeddingModel: string;
+  workflowId: string;
+};
+
+type DifyConsoleSession = {
+  baseUrl: string;
+  token: string;
+  config: DifyProvisioningConfig;
+};
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function ragSyncProgressCallbackBaseUrl(): string {
+  const explicit = String(process.env.RAG_SYNC_PROGRESS_CALLBACK_BASE_URL ?? "").trim();
+  if (explicit) return trimTrailingSlash(explicit);
+  return "https://api-gateway:4000";
+}
+
+function truncateDifyName(value: string): string {
+  const normalized = value.trim();
+  if (normalized.length <= 40) return normalized;
+  return normalized.slice(0, 37).trimEnd() + "...";
+}
+
+function buildDifyResourceName(name: string, kbId: string): string {
+  const suffix = kbId.slice(-8);
+  const base = name.trim() || "Operations AI KB";
+  const maxBaseLength = Math.max(1, 40 - suffix.length - 3);
+  return `${base.slice(0, maxBaseLength).trimEnd()} - ${suffix}`;
+}
+
+function generateDifyPassword(): string {
+  return `Dify-${randomBytes(18).toString("base64url")}1a!`;
+}
+
+async function readDifyProvisioningConfig(sourceType: string): Promise<DifyProvisioningConfig> {
+  const configSecret = await readVaultKv("platform/global/dify/config");
+  const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
+  const difyAppUrl = nonEmptyString(configSecret.default_app_url) ?? defaults.difyAppUrl;
+  const consoleEmail = nonEmptyString(configSecret.console_email) ?? "operations-ai@automation-platform.local";
+  const consoleName = nonEmptyString(configSecret.console_name) ?? "Automation Platform";
+  let consolePassword = nonEmptyString(configSecret.console_password);
+
+  if (!consolePassword) {
+    consolePassword = generateDifyPassword();
+    await writeVaultKv("platform/global/dify/config", {
+      ...configSecret,
+      default_app_url: difyAppUrl,
+      console_email: consoleEmail,
+      console_name: consoleName,
+      console_password: consolePassword,
+      model_provider: nonEmptyString(configSecret.model_provider) ?? "openai",
+      chat_model: nonEmptyString(configSecret.chat_model) ?? "gpt-4o-mini",
+      embedding_model: nonEmptyString(configSecret.embedding_model) ?? "text-embedding-3-small"
+    });
+  }
+
+  return {
+    difyAppUrl,
+    consoleEmail,
+    consoleName,
+    consolePassword,
+    initPassword: nonEmptyString(configSecret.init_password),
+    modelProvider: nonEmptyString(configSecret.model_provider) ?? "openai",
+    modelApiKey: nonEmptyString(configSecret.model_api_key),
+    modelApiBase: nonEmptyString(configSecret.model_api_base),
+    chatModel: nonEmptyString(configSecret.chat_model) ?? "gpt-4o-mini",
+    embeddingModel: nonEmptyString(configSecret.embedding_model) ?? "text-embedding-3-small",
+    workflowId: defaults.workflowId
+  };
+}
+
+async function difyConsoleFetch(
+  baseUrl: string,
+  path: string,
+  options: {
+    method?: string;
+    token?: string;
+    body?: Record<string, unknown>;
+    cookie?: string;
+    ok?: number[];
+  } = {}
+): Promise<{ response: Response; payload: Record<string, any>; cookie?: string }> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: options.method ?? "GET",
+    headers: {
+      "content-type": "application/json",
+      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+      ...(options.cookie ? { cookie: options.cookie } : {})
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) as Record<string, any> : {};
+  const expected = options.ok ?? [200, 201];
+  if (!expected.includes(response.status)) {
+    const message = typeof payload.message === "string" ? payload.message : text;
+    throw new Error(`DIFY_CONSOLE_REQUEST_FAILED:${path}:${response.status}:${message}`);
+  }
+  return {
+    response,
+    payload,
+    cookie: response.headers.get("set-cookie")?.split(";")[0]
+  };
+}
+
+async function ensureDifyConsoleSession(sourceType: string): Promise<DifyConsoleSession> {
+  const provisioningConfig = await readDifyProvisioningConfig(sourceType);
+  if (!provisioningConfig.modelApiKey) {
+    throw new Error("DIFY_MODEL_PROVIDER_KEY_NOT_CONFIGURED");
+  }
+
+  const baseUrl = `${trimTrailingSlash(provisioningConfig.difyAppUrl)}/console/api`;
+  const setupStatus = await difyConsoleFetch(baseUrl, "/setup");
+
+  if (setupStatus.payload.step !== "finished") {
+    let setupCookie = "";
+    if (provisioningConfig.initPassword) {
+      const init = await difyConsoleFetch(baseUrl, "/init", {
+        method: "POST",
+        body: { password: provisioningConfig.initPassword }
+      });
+      setupCookie = init.cookie ?? "";
+    }
+
+    await difyConsoleFetch(baseUrl, "/setup", {
+      method: "POST",
+      cookie: setupCookie || undefined,
+      body: {
+        email: provisioningConfig.consoleEmail,
+        name: provisioningConfig.consoleName,
+        password: provisioningConfig.consolePassword
+      },
+      ok: [201]
+    });
+  }
+
+  const login = await difyConsoleFetch(baseUrl, "/login", {
+    method: "POST",
+    body: {
+      email: provisioningConfig.consoleEmail,
+      password: provisioningConfig.consolePassword,
+      remember_me: false
+    }
+  });
+  const token = nonEmptyString(login.payload.data);
+  if (!token) throw new Error("DIFY_CONSOLE_LOGIN_TOKEN_MISSING");
+
+  const modelCredentials = {
+    openai_api_key: provisioningConfig.modelApiKey,
+    ...(provisioningConfig.modelApiBase ? { openai_api_base: provisioningConfig.modelApiBase } : {})
+  };
+
+  try {
+    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}`, {
+      method: "POST",
+      token,
+      body: { credentials: modelCredentials },
+      ok: [201]
+    });
+  } catch (error) {
+    // Some OpenAI-compatible gateways authorize only selected models. Dify's
+    // provider-level validation probes a default model, so fall back to explicit
+    // per-model credentials for the chat and embedding models we actually use.
+    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/models`, {
+      method: "POST",
+      token,
+      body: {
+        model: provisioningConfig.chatModel,
+        model_type: "llm",
+        credentials: modelCredentials
+      }
+    });
+    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/models`, {
+      method: "POST",
+      token,
+      body: {
+        model: provisioningConfig.embeddingModel,
+        model_type: "text-embedding",
+        credentials: modelCredentials
+      }
+    });
+  }
+
+  await difyConsoleFetch(
+    baseUrl,
+    `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/preferred-provider-type`,
+    {
+      method: "POST",
+      token,
+      body: { preferred_provider_type: "custom" }
+    }
+  );
+
+  await difyConsoleFetch(baseUrl, "/workspaces/current/default-model", {
+    method: "POST",
+    token,
+    body: {
+      model_settings: [
+        {
+          model_type: "llm",
+          provider: provisioningConfig.modelProvider,
+          model: provisioningConfig.chatModel
+        },
+        {
+          model_type: "text-embedding",
+          provider: provisioningConfig.modelProvider,
+          model: provisioningConfig.embeddingModel
+        }
+      ]
+    }
+  });
+
+  return { baseUrl, token, config: provisioningConfig };
+}
+
+async function createDifyDataset(session: DifyConsoleSession, name: string): Promise<string> {
+  const created = await difyConsoleFetch(session.baseUrl, "/datasets", {
+    method: "POST",
+    token: session.token,
+    body: {
+      name: truncateDifyName(name),
+      indexing_technique: "high_quality"
+    },
+    ok: [201]
+  });
+  const datasetId = nonEmptyString(created.payload.id);
+  if (!datasetId) throw new Error("DIFY_DATASET_ID_MISSING");
+  return datasetId;
+}
+
+async function createDifyApp(session: DifyConsoleSession, name: string, description?: string | null): Promise<string> {
+  const created = await difyConsoleFetch(session.baseUrl, "/apps", {
+    method: "POST",
+    token: session.token,
+    body: {
+      name: truncateDifyName(name),
+      description: description ?? "",
+      mode: "chat",
+      icon: "🤖",
+      icon_background: "#D1E9FF"
+    },
+    ok: [201]
+  });
+  const appId = nonEmptyString(created.payload.id);
+  if (!appId) throw new Error("DIFY_APP_ID_MISSING");
+  return appId;
+}
+
+async function configureDifyApp(session: DifyConsoleSession, appId: string, datasetId: string): Promise<void> {
+  await difyConsoleFetch(session.baseUrl, `/apps/${appId}/model-config`, {
+    method: "POST",
+    token: session.token,
+    body: {
+      model: {
+        provider: session.config.modelProvider,
+        name: session.config.chatModel,
+        mode: "chat",
+        completion_params: {
+          temperature: 0.2,
+          top_p: 1,
+          presence_penalty: 0,
+          frequency_penalty: 0,
+          max_tokens: 2048,
+          stop: []
+        }
+      },
+      prompt_type: "simple",
+      pre_prompt:
+        "You are Operations AI. Answer using the connected knowledge source when it is relevant. " +
+        "If the answer is not present in the user's configured documents, say what is missing and suggest the next operational step.",
+      dataset_configs: {
+        retrieval_model: "single",
+        datasets: {
+          strategy: "router",
+          datasets: [
             {
-              id: "step-1",
-              name: normalizedPrompt ? `Generated from: ${normalizedPrompt.slice(0, 64)}` : "Generated Step 1",
-              executionType: "SCRIPT",
-              commandRef: "echo planner-fallback",
-              inputVariables: {},
-              successCriteria: "ok",
-              retryPolicy: { maxRetries: 1, backoffMs: 100 }
+              dataset: {
+                enabled: true,
+                id: datasetId
+              }
             }
           ]
         }
-      }
-    ],
-    edges: []
+      },
+      retriever_resource: { enabled: true },
+      suggested_questions: [],
+      suggested_questions_after_answer: { enabled: false },
+      speech_to_text: { enabled: false },
+      text_to_speech: { enabled: false, language: "", voice: "" },
+      user_input_form: [],
+      opening_statement: "",
+      more_like_this: { enabled: false },
+      sensitive_word_avoidance: { enabled: false, type: "", configs: [] }
+    }
+  });
+}
+
+async function createDifyAppApiKey(session: DifyConsoleSession, appId: string): Promise<string> {
+  const created = await difyConsoleFetch(session.baseUrl, `/apps/${appId}/api-keys`, {
+    method: "POST",
+    token: session.token,
+    ok: [201]
+  });
+  const apiKey = nonEmptyString(created.payload.token);
+  if (!apiKey) throw new Error("DIFY_APP_API_KEY_MISSING");
+  return apiKey;
+}
+
+async function createDifyDatasetApiKey(session: DifyConsoleSession): Promise<string> {
+  // Dify 0.6.x validates dataset service API keys by tenant/type, not by
+  // dataset_id. Its per-dataset console route exists but raises a 500 because
+  // ApiToken has no dataset_id column in this version.
+  const created = await difyConsoleFetch(session.baseUrl, "/datasets/api-keys", {
+    method: "POST",
+    token: session.token,
+    ok: [200, 201]
+  });
+  const apiKey = nonEmptyString(created.payload.token);
+  if (!apiKey) throw new Error("DIFY_DATASET_API_KEY_MISSING");
+  return apiKey;
+}
+
+async function deleteDifyResourceIfPresent(
+  session: DifyConsoleSession,
+  path: string,
+  expectedStatuses: number[] = [204]
+): Promise<void> {
+  try {
+    await difyConsoleFetch(session.baseUrl, path, {
+      method: "DELETE",
+      token: session.token,
+      ok: [...expectedStatuses, 404]
+    });
+  } catch (error) {
+    throw new Error(`DIFY_DELETE_FAILED:${path}:${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function deleteDifyKnowledgeBaseResources(kb: {
+  id: string;
+  sourceType?: string | null;
+  difyDatasetId?: string | null;
+}): Promise<void> {
+  const existingSecrets = await readVaultKv(`platform/global/dify/${kb.id}`);
+  const sourceType = String(kb.sourceType ?? "github");
+  const session = await ensureDifyConsoleSession(sourceType);
+  const appId = nonEmptyString(existingSecrets.app_id);
+  const datasetId = nonEmptyString(kb.difyDatasetId) ?? nonEmptyString(existingSecrets.dataset_id);
+  if (appId) {
+    await deleteDifyResourceIfPresent(session, `/apps/${appId}`);
+  }
+  if (datasetId) {
+    await deleteDifyResourceIfPresent(session, `/datasets/${datasetId}`);
+  }
+}
+
+async function ensureDifyKnowledgeBaseProvisioned(kbId: string): Promise<void> {
+  const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId } });
+  if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
+
+  const sourceType = String(kb.sourceType ?? "github");
+  const existingSecrets = await readVaultKv(`platform/global/dify/${kbId}`);
+  const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
+  const session = await ensureDifyConsoleSession(sourceType);
+
+  let datasetId = nonEmptyString(kb.difyDatasetId) ?? nonEmptyString(existingSecrets.dataset_id);
+  if (!datasetId) {
+    datasetId = await createDifyDataset(session, buildDifyResourceName(kb.name, kbId));
+    await (prisma as any).ragKnowledgeBase.update({
+      where: { id: kbId },
+      data: { difyDatasetId: datasetId, difyAppUrl: session.config.difyAppUrl }
+    });
+  }
+
+  let appId = nonEmptyString(existingSecrets.app_id);
+  if (!appId) {
+    appId = await createDifyApp(session, buildDifyResourceName(kb.name, kbId), kb.description);
+  }
+
+  await configureDifyApp(session, appId, datasetId);
+
+  const legacyApiKey = nonEmptyString(existingSecrets.api_key);
+  const appApiKey =
+    nonEmptyString(existingSecrets.app_api_key) ??
+    (legacyApiKey?.startsWith("app-") ? legacyApiKey : undefined) ??
+    await createDifyAppApiKey(session, appId);
+  const datasetApiKey =
+    nonEmptyString(existingSecrets.dataset_api_key) ??
+    (legacyApiKey?.startsWith("ds-") || legacyApiKey?.startsWith("dataset-") ? legacyApiKey : undefined) ??
+    await createDifyDatasetApiKey(session);
+  await writeVaultKv(`platform/global/dify/${kbId}`, {
+    ...existingSecrets,
+    api_key: appApiKey,
+    app_api_key: appApiKey,
+    dataset_api_key: datasetApiKey,
+    app_id: appId,
+    dataset_id: datasetId,
+    n8n_workflow_id: nonEmptyString(existingSecrets.n8n_workflow_id) ?? defaults.workflowId
   });
 }
 
@@ -419,47 +794,7 @@ async function pruneExpiredRagDiscussions(): Promise<void> {
   });
 }
 
-function normalizeRagMessageContent(value: unknown): string {
-  return String(value ?? "").trim();
-}
-
-async function requestOperationsRagReply(question: string, flowiseSessionId: string): Promise<string> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
-  try {
-    const response = await fetch(config.flowiseOperationsChatUrl, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(config.flowiseApiKey ? { authorization: `Bearer ${config.flowiseApiKey}` } : {})
-      },
-      body: JSON.stringify({
-        question,
-        chatId: flowiseSessionId
-      }),
-      signal: controller.signal
-    });
-    const raw = await response.text();
-    const payload = raw.length > 0 ? tryParseJson(raw) ?? raw : {};
-    if (!response.ok) {
-      throw new Error(`FLOWISE_CHAT_HTTP_${response.status}:${typeof payload === "string" ? payload : JSON.stringify(payload)}`);
-    }
-    return extractFlowiseText(payload);
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function getOwnedRagDiscussion(threadId: string, ownerId: string): Promise<{
-  id: string;
-  ownerId: string;
-  title: string;
-  flowiseSessionId: string;
-  createdAt: Date;
-  updatedAt: Date;
-  lastMessageAt: Date;
-  expiresAt: Date;
-} | null> {
+async function getOwnedRagDiscussion(threadId: string, ownerId: string) {
   return prisma.ragDiscussionThread.findFirst({
     where: {
       id: threadId,
@@ -478,19 +813,65 @@ async function listRagDiscussionSummaries(ownerId: string): Promise<RagDiscussio
         take: 1
       }
     },
-    orderBy: [{ lastMessageAt: "desc" }]
+    orderBy: { lastMessageAt: "desc" }
   });
-
   return threads.map((thread) => mapRagDiscussionSummary(thread, thread.messages[0]?.content));
+}
+
+async function resolveVisibleKnowledgeBaseForDiscussion(
+  ownerId: string,
+  headers: Record<string, unknown>,
+  requestedKnowledgeBaseId?: string
+): Promise<{ id: string } | null> {
+  const privileged = isAdminOrUserAdmin(headers);
+  const where = requestedKnowledgeBaseId
+    ? privileged
+      ? { id: requestedKnowledgeBaseId }
+      : {
+          id: requestedKnowledgeBaseId,
+          OR: [{ scope: "global" }, { ownerId }]
+        }
+    : privileged
+      ? {}
+      : {
+          OR: [{ scope: "global" }, { ownerId }]
+        };
+
+  if (requestedKnowledgeBaseId) {
+    return prisma.ragKnowledgeBase.findFirst({
+      where,
+      select: { id: true }
+    });
+  }
+
+  const userConfig = await readUserRagConfig(ownerId);
+  const userDefaultId = nonEmptyString(userConfig.default_kb_id);
+  if (userDefaultId) {
+    const preferred = await prisma.ragKnowledgeBase.findFirst({
+      where: privileged
+        ? { id: userDefaultId }
+        : {
+            id: userDefaultId,
+            OR: [{ scope: "global" }, { ownerId }]
+          },
+      select: { id: true }
+    });
+    if (preferred) return preferred;
+  }
+
+  const visible = await prisma.ragKnowledgeBase.findMany({
+    where,
+    select: { id: true },
+    orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }],
+    take: 1
+  });
+  return visible[0] ?? null;
 }
 
 async function getRagDiscussionThread(threadId: string, ownerId: string): Promise<RagDiscussionThread | null> {
   await pruneExpiredRagDiscussions();
   const thread = await prisma.ragDiscussionThread.findFirst({
-    where: {
-      id: threadId,
-      ownerId
-    },
+    where: { id: threadId, ownerId },
     include: {
       messages: {
         orderBy: { createdAt: "asc" }
@@ -501,14 +882,26 @@ async function getRagDiscussionThread(threadId: string, ownerId: string): Promis
   return mapRagDiscussionThread(thread, thread.messages);
 }
 
-async function createRagDiscussion(ownerId: string): Promise<RagDiscussionSummary> {
+async function createRagDiscussion(
+  ownerId: string,
+  headers: Record<string, unknown>,
+  knowledgeBaseId?: string
+): Promise<RagDiscussionSummary> {
   await pruneExpiredRagDiscussions();
+  const resolvedKnowledgeBase = await resolveVisibleKnowledgeBaseForDiscussion(ownerId, headers, knowledgeBaseId);
+  if (!resolvedKnowledgeBase) {
+    if (knowledgeBaseId) {
+      throw new Error("KNOWLEDGE_BASE_NOT_VISIBLE");
+    }
+    throw new Error("OPERATIONS_AI_NOT_CONFIGURED");
+  }
   const now = new Date();
   const thread = await prisma.ragDiscussionThread.create({
     data: {
       ownerId,
       title: "New discussion",
       flowiseSessionId: `rag-${randomUUID()}`,
+      knowledgeBaseId: resolvedKnowledgeBase.id,
       lastMessageAt: now,
       expiresAt: buildRagThreadExpiry(now)
     }
@@ -516,47 +909,124 @@ async function createRagDiscussion(ownerId: string): Promise<RagDiscussionSummar
   return mapRagDiscussionSummary(thread);
 }
 
+async function sendToFlowise(content: string, sessionId: string): Promise<string> {
+  const response = await fetch(config.flowiseOperationsChatUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(config.flowiseApiKey ? { authorization: `Bearer ${config.flowiseApiKey}` } : {})
+    },
+    body: JSON.stringify({ question: content, overrideConfig: { sessionId } })
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`FLOWISE_REQUEST_FAILED:${response.status}:${text}`);
+  }
+  return extractFlowiseText(await response.json());
+}
+
+/**
+ * Calls Dify chat-messages API for a given knowledge base.
+ * The API key is fetched from Vault at runtime — it is never stored in env vars.
+ * Vault path: platform/global/dify/{kbId} → app_api_key
+ * Returns the answer text and Dify's conversation_id for session continuity.
+ */
+async function sendToDify(
+  content: string,
+  difyConversationId: string | null,
+  kbId: string,
+  difyAppUrl: string,
+  userId: string
+): Promise<{ answer: string; conversationId: string }> {
+  // Fetch the Dify API key from Vault — never from env vars
+  const secrets = await readVaultKv(`platform/global/dify/${kbId}`);
+  const apiKey = String(secrets.app_api_key ?? secrets.api_key ?? "").trim();
+  if (!apiKey) throw new Error(`DIFY_API_KEY_NOT_CONFIGURED:${kbId}`);
+
+  const response = await fetch(`${difyAppUrl}/v1/chat-messages`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      inputs: {},
+      query: content,
+      response_mode: "blocking",
+      // Pass empty string for first message; Dify creates a new conversation
+      conversation_id: difyConversationId ?? "",
+      user: userId
+    })
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`DIFY_REQUEST_FAILED:${response.status}:${text}`);
+  }
+  const payload = await response.json() as Record<string, unknown>;
+  const answer = typeof payload.answer === "string" && payload.answer.trim()
+    ? payload.answer
+    : (() => { throw new Error("DIFY_EMPTY_RESPONSE"); })();
+  const conversationId = typeof payload.conversation_id === "string" ? payload.conversation_id : "";
+  return { answer, conversationId };
+}
+
+/**
+ * Sends a message to the appropriate RAG backend based on whether the thread
+ * has a knowledge base (Dify) or is a legacy Flowise thread.
+ * This dual-routing ensures backward compatibility with existing threads.
+ */
 async function appendRagDiscussionMessage(threadId: string, ownerId: string, content: string): Promise<RagDiscussionSendMessageResponse | null> {
   await pruneExpiredRagDiscussions();
-  const thread = await getOwnedRagDiscussion(threadId, ownerId);
+
+  // Fetch thread with its optional knowledge base relation
+  const thread = await prisma.ragDiscussionThread.findFirst({
+    where: { id: threadId, ownerId },
+    include: { knowledgeBase: true }
+  });
   if (!thread) return null;
 
-  const normalizedContent = normalizeRagMessageContent(content);
-  if (!normalizedContent) {
-    throw new Error("RAG_MESSAGE_CONTENT_REQUIRED");
-  }
+  const trimmed = content.trim();
+  if (!trimmed) throw new Error("MESSAGE_CONTENT_REQUIRED");
 
-  const existingMessageCount = await prisma.ragDiscussionMessage.count({
-    where: { threadId: thread.id }
-  });
-  const assistantText = await requestOperationsRagReply(normalizedContent, thread.flowiseSessionId);
   const now = new Date();
-  const nextTitle = existingMessageCount === 0 ? deriveRagThreadTitle(normalizedContent) : thread.title;
-  const nextExpiry = buildRagThreadExpiry(now);
+  const existingMessageCount = await prisma.ragDiscussionMessage.count({ where: { threadId } });
+
+  let assistantReply: string;
+  let newDifyConversationId: string | null = thread.difyConversationId ?? null;
+
+  if (thread.knowledgeBaseId && thread.knowledgeBase) {
+    // ── Dify path: thread is linked to a knowledge base ──
+    const result = await sendToDify(
+      trimmed,
+      thread.difyConversationId ?? null,
+      thread.knowledgeBaseId,
+      thread.knowledgeBase.difyAppUrl,
+      ownerId
+    );
+    assistantReply = result.answer;
+    newDifyConversationId = result.conversationId || newDifyConversationId;
+  } else {
+    // ── Flowise path: legacy thread with no knowledge base ──
+    assistantReply = await sendToFlowise(trimmed, thread.flowiseSessionId);
+  }
 
   const persisted = await prisma.$transaction(async (tx) => {
     const userMessage = await tx.ragDiscussionMessage.create({
-      data: {
-        threadId: thread.id,
-        role: "user",
-        content: normalizedContent,
-        createdAt: now
-      }
+      data: { threadId, role: "user", content: trimmed }
     });
     const assistantMessage = await tx.ragDiscussionMessage.create({
-      data: {
-        threadId: thread.id,
-        role: "assistant",
-        content: assistantText,
-        createdAt: now
-      }
+      data: { threadId, role: "assistant", content: assistantReply }
     });
     const updatedThread = await tx.ragDiscussionThread.update({
-      where: { id: thread.id },
+      where: { id: threadId },
       data: {
-        title: nextTitle,
+        title: existingMessageCount === 0 ? deriveRagThreadTitle(trimmed) : thread.title,
         lastMessageAt: now,
-        expiresAt: nextExpiry
+        expiresAt: buildRagThreadExpiry(now),
+        // Persist updated Dify conversation_id for session continuity
+        ...(newDifyConversationId !== thread.difyConversationId
+          ? { difyConversationId: newDifyConversationId }
+          : {})
       }
     });
     return { userMessage, assistantMessage, updatedThread };
@@ -569,302 +1039,343 @@ async function appendRagDiscussionMessage(threadId: string, ownerId: string, con
   };
 }
 
-function parseScope(value: unknown): "owned" | "shared" | "all" {
-  const scope = String(value ?? "owned").trim().toLowerCase();
-  if (scope === "shared" || scope === "all") return scope;
-  return "owned";
+// ─── Knowledge Base helpers ───────────────────────────────────────────────────
+
+function isAdminOrUserAdmin(headers: Record<string, unknown>): boolean {
+  const roles = requesterRoles(headers);
+  return roles.includes("admin") || roles.includes("useradmin");
 }
 
-function uniqueById<T extends { id: string }>(items: T[]): T[] {
-  const seen = new Set<string>();
-  const output: T[] = [];
-  for (const item of items) {
-    if (seen.has(item.id)) continue;
-    seen.add(item.id);
-    output.push(item);
+async function buildIntegrationResponse(
+  kb: Record<string, any>,
+  viewerUserId: string
+): Promise<Record<string, unknown>> {
+  const ownerId = String(kb.ownerId ?? viewerUserId).trim() || viewerUserId;
+  const [sourceSecrets, difySecrets, userConfig] = await Promise.all([
+    readVaultKv(userSourceSecretPath(ownerId, kb.id)),
+    readVaultKv(`platform/global/dify/${kb.id}`),
+    readUserRagConfig(ownerId)
+  ]);
+  const workflowId =
+    nonEmptyString(difySecrets.n8n_workflow_id) ??
+    (await readGlobalDifyProvisioningDefaults(String(kb.sourceType ?? "github"))).workflowId;
+  const credentialConfigured = sourceCredentialConfigured(String(kb.sourceType ?? "github"), sourceSecrets);
+  const chatReady = Boolean(nonEmptyString(difySecrets.app_api_key) ?? nonEmptyString(difySecrets.api_key));
+  const syncProvisioned = chatReady && Boolean(nonEmptyString(difySecrets.dataset_api_key)) && Boolean(nonEmptyString(kb.difyDatasetId));
+  const syncReady =
+    credentialConfigured &&
+    syncProvisioned &&
+    Boolean(workflowId || String(kb.sourceType ?? "") === "web" || String(kb.sourceType ?? "") === "upload");
+
+  const authMethod = nonEmptyString(sourceSecrets.auth_method) ?? (
+    // Infer from existing token fields for KBs created before this feature
+    nonEmptyString(sourceSecrets.github_token) || nonEmptyString(sourceSecrets.gitlab_token) ||
+    nonEmptyString(sourceSecrets.gdrive_token) ? "pat" : null
+  );
+
+  const oauthAppConfigured = !!nonEmptyString(sourceSecrets.oauth_client_id);
+
+  return {
+    id: kb.id,
+    name: kb.name,
+    description: kb.description ?? null,
+    sourceType: kb.sourceType,
+    sourceUrl: kb.sourceUrl,
+    sourceBranch: kb.sourceBranch ?? null,
+    sourcePath: kb.sourcePath ?? null,
+    syncSchedule: kb.syncSchedule ?? null,
+    ownerId: kb.ownerId ?? null,
+    createdAt: kb.createdAt instanceof Date ? kb.createdAt.toISOString() : kb.createdAt,
+    updatedAt: kb.updatedAt instanceof Date ? kb.updatedAt.toISOString() : kb.updatedAt,
+    credentialConfigured,
+    chatReady,
+    syncReady,
+    workflowAssigned: Boolean(workflowId),
+    isDefault: String(userConfig.default_kb_id ?? "").trim() === kb.id,
+    latestSyncJob: Array.isArray(kb.syncJobs) ? kb.syncJobs[0] ?? null : null,
+    config: kb.config ?? null,
+    authMethod,
+    oauthAppConfigured
+  };
+}
+
+async function getVisibleKnowledgeBases(userId: string, isPrivileged: boolean) {
+  // Users see platform-wide KBs + their own KBs
+  // Admins/useradmins see all KBs
+  if (isPrivileged) {
+    return prisma.ragKnowledgeBase.findMany({
+      include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 } },
+      orderBy: { createdAt: "desc" }
+    });
   }
-  return output;
+  return prisma.ragKnowledgeBase.findMany({
+    where: {
+      OR: [
+        { scope: "global" },
+        { ownerId: userId }
+      ]
+    },
+    include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 } },
+    orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }]
+  });
 }
 
-function toNodeArray(value: unknown): Array<Record<string, unknown>> {
-  if (isWorkflowFlowDefinition(value)) {
-    try {
-      const nodes = flowDefinitionToWorkflowNodes(value).map((node) => JSON.parse(JSON.stringify(node)));
-      return nodes as Array<Record<string, unknown>>;
-    } catch {
-      return [];
+/**
+ * Triggers a document sync for a knowledge base via n8n webhook.
+ * The n8n workflow ID is stored in Vault at platform/global/dify/{kbId} → n8n_workflow_id.
+ * Progress is tracked in RagKbSyncJob and updated by n8n webhook callbacks.
+ */
+async function triggerKbSync(kbId: string, triggeredById: string, trigger: string): Promise<string> {
+  let kb = await prisma.ragKnowledgeBase.findUnique({ where: { id: kbId } });
+  if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
+
+  try {
+    await ensureDifyKnowledgeBaseProvisioned(kbId);
+    kb = await prisma.ragKnowledgeBase.findUnique({ where: { id: kbId } });
+    if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
+  } catch (error) {
+    const syncJob = await prisma.ragKbSyncJob.create({
+      data: {
+        knowledgeBaseId: kbId,
+        trigger,
+        triggeredById,
+        status: "failed",
+        startedAt: new Date(),
+        completedAt: new Date(),
+        errorMessage: `Dify provisioning failed: ${error instanceof Error ? error.message : String(error)}`
+      }
+    });
+    return syncJob.id;
+  }
+
+  // Read n8n workflow ID from Vault
+  const [difySecrets, sourceSecrets] = await Promise.all([
+    readVaultKv(`platform/global/dify/${kbId}`),
+    readVaultKv(userSourceSecretPath(String(kb.ownerId ?? triggeredById).trim() || triggeredById, kbId))
+  ]);
+  const n8nWorkflowId = String(difySecrets.n8n_workflow_id ?? "").trim();
+  const difyApiKey = String(difySecrets.dataset_api_key ?? "").trim();
+  const difyDatasetId = String(kb.difyDatasetId ?? "").trim();
+  const sourceType = String(kb.sourceType ?? "").trim();
+  const workflowOptional = sourceType === "web" || sourceType === "upload";
+
+  // Prevent near-simultaneous duplicate syncs for the same knowledge base.
+  // Older stale jobs are ignored so a previously wedged run does not block a new sync forever.
+  const duplicateWindowStart = new Date(Date.now() - 10 * 60 * 1000);
+  const existingActiveJob = await prisma.ragKbSyncJob.findFirst({
+    where: {
+      knowledgeBaseId: kbId,
+      status: { in: ["pending", "running"] },
+      createdAt: { gte: duplicateWindowStart }
+    },
+    orderBy: { createdAt: "desc" }
+  });
+  if (existingActiveJob) {
+    return existingActiveJob.id;
+  }
+
+  const missingRequirements: string[] = [];
+  if (!workflowOptional && !n8nWorkflowId) missingRequirements.push("n8n workflow");
+  if (!workflowOptional && !config.n8nWebhookToken) missingRequirements.push("n8n callback token");
+  if (!difyApiKey) missingRequirements.push("Dify dataset API key");
+  if (!difyDatasetId) missingRequirements.push("Dify dataset");
+
+  if (missingRequirements.length > 0) {
+    const syncJob = await prisma.ragKbSyncJob.create({
+      data: {
+        knowledgeBaseId: kbId,
+        trigger,
+        triggeredById,
+        status: "failed",
+        startedAt: new Date(),
+        completedAt: new Date(),
+        n8nWebhookUrl: n8nWorkflowId ? `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}` : null,
+        errorMessage: `Sync prerequisites missing: ${missingRequirements.join(", ")}`
+      }
+    });
+    return syncJob.id;
+  }
+
+  let filesTotal: number | null = null;
+  try {
+    filesTotal = await preflightSourceDocumentCount(
+      {
+        sourceType: kb.sourceType,
+        sourceUrl: kb.sourceUrl,
+        sourceBranch: kb.sourceBranch,
+        sourcePath: kb.sourcePath
+      },
+      sourceSecrets
+    );
+  } catch (error) {
+    const syncJob = await prisma.ragKbSyncJob.create({
+      data: {
+        knowledgeBaseId: kbId,
+        trigger,
+        triggeredById,
+        status: "failed",
+        startedAt: new Date(),
+        completedAt: new Date(),
+        n8nWebhookUrl: n8nWorkflowId ? `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}` : null,
+        errorMessage: error instanceof Error ? error.message : String(error)
+      }
+    });
+    return syncJob.id;
+  }
+
+  if (filesTotal === 0) {
+    const syncJob = await prisma.ragKbSyncJob.create({
+      data: {
+        knowledgeBaseId: kbId,
+        trigger,
+        triggeredById,
+        status: "completed",
+        startedAt: new Date(),
+        completedAt: new Date(),
+        filesTotal: 0,
+        filesProcessed: 0,
+        n8nWebhookUrl: n8nWorkflowId ? `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}` : null,
+        errorMessage: "No supported documents found in the configured source path"
+      }
+    });
+    return syncJob.id;
+  }
+
+  // Create a sync job record for progress tracking
+  const syncJob = await prisma.ragKbSyncJob.create({
+    data: {
+      knowledgeBaseId: kbId,
+      trigger,
+      triggeredById,
+      status: "running",
+      startedAt: new Date(),
+      filesTotal,
+      n8nWebhookUrl: n8nWorkflowId
+        ? `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}`
+        : null
+    }
+  });
+
+  // Refresh OAuth token if it is close to expiry (within 5 minutes)
+  const effectiveSourceSecrets = { ...sourceSecrets };
+  if (String(sourceSecrets.auth_method ?? "") === "oauth") {
+    const expiry = nonEmptyString(sourceSecrets.token_expiry);
+    if (expiry) {
+      const expiresAt = new Date(expiry).getTime();
+      const nowPlusFive = Date.now() + 5 * 60 * 1000;
+      if (expiresAt < nowPlusFive) {
+        const refreshToken = nonEmptyString(sourceSecrets.gitlab_refresh) ?? nonEmptyString(sourceSecrets.gdrive_refresh);
+        const sourceTypeStr = String(kb.sourceType ?? "");
+        const refreshUrl = sourceTypeStr === "gitlab" ? "https://gitlab.com/oauth/token" : "https://oauth2.googleapis.com/token";
+        const clientIdKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_ID" : "GOOGLE_CLIENT_ID";
+        const clientSecretKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_SECRET" : "GOOGLE_CLIENT_SECRET";
+        const clientId = String(process.env[clientIdKey] ?? "").trim();
+        const clientSecret = String(process.env[clientSecretKey] ?? "").trim();
+        if (refreshToken && clientId && clientSecret) {
+          try {
+            const refreshRes = await fetch(refreshUrl, {
+              method: "POST",
+              headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+              body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId, client_secret: clientSecret }).toString()
+            });
+            const refreshPayload = (await refreshRes.json()) as Record<string, unknown>;
+            const newToken = String(refreshPayload.access_token ?? "").trim();
+            const newExpiry = Number(refreshPayload.expires_in ?? 0);
+            if (newToken) {
+              const newTokenExpiry = newExpiry > 0 ? new Date(Date.now() + newExpiry * 1000).toISOString() : undefined;
+              const ownerId = String(kb.ownerId ?? triggeredById).trim() || triggeredById;
+              const updatedSecrets: Record<string, string> = {
+                ...Object.fromEntries(Object.entries(sourceSecrets).map(([k, v]) => [k, String(v)])),
+                ...(sourceTypeStr === "gitlab" ? { gitlab_token: newToken } : { gdrive_token: newToken }),
+                ...(newTokenExpiry ? { token_expiry: newTokenExpiry } : {})
+              };
+              await writeVaultKv(userSourceSecretPath(ownerId, kbId), updatedSecrets).catch((e) =>
+                logInfo("OAuth token refresh Vault write failed", { service: "workflow-service", kbId, error: e instanceof Error ? e.message : String(e) })
+              );
+              if (sourceTypeStr === "gitlab") effectiveSourceSecrets.gitlab_token = newToken;
+              else effectiveSourceSecrets.gdrive_token = newToken;
+            }
+          } catch (err) {
+            logInfo("OAuth token refresh failed — using existing token", { service: "workflow-service", kbId, error: err instanceof Error ? err.message : String(err) });
+          }
+        } else if (!refreshToken) {
+          // No refresh token and token is expired — fail the sync with a clear message
+          await prisma.ragKbSyncJob.update({
+            where: { id: syncJob.id },
+            data: { status: "failed", completedAt: new Date(), errorMessage: "OAuth access token expired. Please reconnect the integration." }
+          });
+          return syncJob.id;
+        }
+      }
     }
   }
-  if (!Array.isArray(value)) return [];
-  return value.filter((entry) => entry && typeof entry === "object") as Array<Record<string, unknown>>;
-}
 
-async function validateCanonicalFlow(flowDefinition: WorkflowFlowDefinition): Promise<{ valid: boolean; errors: string[] }> {
-  try {
-    const workflowNodes = flowDefinitionToWorkflowNodes(flowDefinition);
-    const response = await tlsFetch(tlsRuntime, new URL("/engine/validate-workflow", config.executionEngineServiceUrl), {
+  // If n8n workflow is configured, trigger it via webhook and capture execution ID
+  if (n8nWorkflowId) {
+    const progressCallbackUrl = `${ragSyncProgressCallbackBaseUrl()}/rag/knowledge-bases/${kbId}/sync-progress`;
+    const webhookUrl = `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}`;
+    void fetch(webhookUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workflowNodes })
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || !body || body.valid !== true) {
-      return {
-        valid: false,
-        errors: Array.isArray(body?.errors) ? body.errors.map((entry: unknown) => String(entry)) : ["WORKFLOW_ENGINE_VALIDATION_FAILED"]
-      };
-    }
-    return { valid: true, errors: [] };
-  } catch (error) {
-    return { valid: false, errors: [error instanceof Error ? error.message : "WORKFLOW_VALIDATION_ERROR"] };
-  }
-}
-
-function integrationIdUsedInNodes(nodes: unknown, integrationId: string): boolean {
-  return toNodeArray(nodes).some((node) => String(node.integrationProfileId ?? "").trim() === integrationId);
-}
-
-function environmentIdUsedInNodes(nodes: unknown, environmentId: string): boolean {
-  return toNodeArray(nodes).some((node) => String(node.environmentId ?? "").trim() === environmentId);
-}
-
-async function findIntegrationWorkflowUsage(integrationId: string): Promise<
-  Array<{
-    workflowId: string;
-    workflowName: string;
-    workflowVersionId: string;
-    version: number;
-    status: string;
-  }>
-> {
-  const versions = await prisma.workflowVersion.findMany({
-    include: { workflow: true },
-    orderBy: [{ createdAt: "desc" }]
-  });
-  const usage = versions
-    .filter((version) => integrationIdUsedInNodes(version.nodesJson, integrationId))
-    .map((version) => ({
-      workflowId: version.workflowId,
-      workflowName: version.workflow.name,
-      workflowVersionId: version.id,
-      version: version.version,
-      status: version.status
-    }));
-  return uniqueById(usage.map((entry) => ({ ...entry, id: `${entry.workflowVersionId}` }))).map(({ id: _id, ...rest }) => rest);
-}
-
-async function findEnvironmentWorkflowUsage(environmentId: string): Promise<
-  Array<{
-    workflowId: string;
-    workflowName: string;
-    workflowVersionId: string;
-    version: number;
-    status: string;
-  }>
-> {
-  const versions = await prisma.workflowVersion.findMany({
-    include: { workflow: true },
-    orderBy: [{ createdAt: "desc" }]
-  });
-  const usage = versions
-    .filter((version) => environmentIdUsedInNodes(version.nodesJson, environmentId))
-    .map((version) => ({
-      workflowId: version.workflowId,
-      workflowName: version.workflow.name,
-      workflowVersionId: version.id,
-      version: version.version,
-      status: version.status
-    }));
-  return uniqueById(usage.map((entry) => ({ ...entry, id: `${entry.workflowVersionId}` }))).map(({ id: _id, ...rest }) => rest);
-}
-
-async function loadIntegrationWithAccess(integrationId: string, requester: string, admin: boolean) {
-  const integration = await prisma.integrationProfile.findUnique({
-    where: { id: integrationId },
-    include: { shares: true }
-  });
-  if (!integration) return { integration: null, owner: false, shared: false, allowed: false };
-  const owner = integration.ownerId === requester;
-  const shared = integration.shares.some((entry) => entry.sharedWithUserId === requester);
-  const allowed = admin || owner || shared;
-  return { integration, owner, shared, allowed };
-}
-
-async function loadEnvironmentWithAccess(environmentId: string, requester: string, admin: boolean) {
-  const environment = await prisma.userEnvironment.findUnique({
-    where: { id: environmentId },
-    include: { shares: true }
-  });
-  if (!environment) return { environment: null, owner: false, shared: false, allowed: false };
-  const owner = environment.ownerId === requester;
-  const shared = environment.shares.some((entry) => entry.sharedWithUserId === requester);
-  const allowed = admin || owner || shared;
-  return { environment, owner, shared, allowed };
-}
-
-async function loadNodeTemplateWithAccess(templateId: string, requester: string, admin: boolean) {
-  const template = await prisma.nodeTemplate.findUnique({
-    where: { id: templateId },
-    include: { shares: true }
-  });
-  if (!template) return { template: null, owner: false, shared: false, allowed: false };
-  const owner = template.ownerId === requester;
-  const shared = template.shares.some((entry) => entry.sharedWithUserId === requester);
-  const allowed = admin || owner || shared;
-  return { template, owner, shared, allowed };
-}
-
-function toIntegrationResponse(
-  integration: {
-    id: string;
-    name: string;
-    ownerId: string;
-    executionType: string;
-    authType: string;
-    lifecycleState: string;
-    baseConfigJson: unknown;
-    credentialJson: unknown;
-    isActive: boolean;
-    createdAt: Date;
-    updatedAt: Date;
-    shares?: Array<{ sharedWithUserId: string }>;
-  },
-  requester: string,
-  admin: boolean
-): Record<string, unknown> {
-  const access = admin ? "ADMIN" : integration.ownerId === requester ? "OWNER" : "SHARED";
-  return {
-    ...integration,
-    baseConfigJson: integration.baseConfigJson ?? {},
-    credentialJson: integration.credentialJson ?? {},
-    access,
-    sharedWithUsers: (integration.shares ?? []).map((entry) => entry.sharedWithUserId)
-  };
-}
-
-function toEnvironmentResponse(
-  environment: {
-    id: string;
-    name: string;
-    ownerId: string;
-    variablesJson: unknown;
-    isDefault: boolean;
-    createdAt: Date;
-    updatedAt: Date;
-    shares?: Array<{ sharedWithUserId: string }>;
-  },
-  requester: string,
-  admin: boolean
-): Record<string, unknown> {
-  const access = admin ? "ADMIN" : environment.ownerId === requester ? "OWNER" : "SHARED";
-  return {
-    ...environment,
-    variablesJson: environment.variablesJson ?? {},
-    access,
-    sharedWithUsers: (environment.shares ?? []).map((entry) => entry.sharedWithUserId)
-  };
-}
-
-async function listNodeTemplates(requester: string, admin: boolean, scope: "owned" | "shared" | "all", limit: number): Promise<NodeTemplateSummary[]> {
-  if (scope === "shared") {
-    const shared = await prisma.nodeTemplateShare.findMany({
-      where: { sharedWithUserId: requester },
-      include: { template: { include: { shares: true } } },
-      orderBy: [{ createdAt: "desc" }],
-      take: limit
-    });
-    return shared.map((entry) => mapNodeTemplateSummary(entry.template, requester, admin));
-  }
-
-  if (scope === "all") {
-    const [owned, shared] = await Promise.all([
-      prisma.nodeTemplate.findMany({
-        where: { ownerId: requester },
-        include: { shares: true },
-        orderBy: [{ updatedAt: "desc" }],
-        take: limit
-      }),
-      prisma.nodeTemplateShare.findMany({
-        where: { sharedWithUserId: requester },
-        include: { template: { include: { shares: true } } },
-        orderBy: [{ createdAt: "desc" }],
-        take: limit
+      body: JSON.stringify({
+        kbId,
+        syncJobId: syncJob.id,
+        sourceUrl: kb.sourceUrl,
+        sourceBranch: kb.sourceBranch,
+        sourcePath: kb.sourcePath,
+        sourceType: kb.sourceType,
+        difyDatasetId,
+        difyApiUrl: kb.difyAppUrl,
+        difyApiKey,
+        sourceToken:
+          String(effectiveSourceSecrets.github_token ?? effectiveSourceSecrets.gitlab_token ?? effectiveSourceSecrets.gdrive_token ?? "").trim() || undefined,
+        sourceRefreshToken: String(effectiveSourceSecrets.gdrive_refresh ?? "").trim() || undefined,
+        progressCallbackToken: config.n8nWebhookToken || undefined,
+        progressCallbackUrl
       })
-    ]);
-    return uniqueById([...owned, ...shared.map((entry) => entry.template)]).slice(0, limit).map((entry) => mapNodeTemplateSummary(entry, requester, admin));
-  }
-
-  const owned = await prisma.nodeTemplate.findMany({
-    where: { ownerId: requester },
-    include: { shares: true },
-    orderBy: [{ updatedAt: "desc" }],
-    take: limit
-  });
-  return owned.map((entry) => mapNodeTemplateSummary(entry, requester, admin));
-}
-
-async function startPublishAuditWorker(): Promise<{ connection: ChannelModel; channel: Channel } | undefined> {
-  try {
-    const connection = (await connectAmqp(tlsRuntime, amqp.connect, config.rabbitmqUrl)) as ChannelModel;
-    const channel = await connection.createChannel();
-    await channel.assertExchange("platform.events", "topic", { durable: true });
-    await channel.assertQueue(WORKFLOW_PUBLISH_AUDIT_QUEUE, { durable: true });
-    await channel.bindQueue(WORKFLOW_PUBLISH_AUDIT_QUEUE, "platform.events", PlatformEvents.workflowPublished);
-    await channel.consume(
-      WORKFLOW_PUBLISH_AUDIT_QUEUE,
-      async (message: ConsumeMessage | null) => {
-        if (!message) return;
-        try {
-          const decoded = tryParseJson(message.content.toString("utf8")) as
-            | {
-                event?: string;
-                timestamp?: string;
-                payload?: {
-                  workflowId?: string;
-                  workflowVersionId?: string;
-                  version?: number;
-                  correlationId?: string;
-                };
-              }
-            | undefined;
-
-          if (!decoded?.payload?.workflowId || !decoded.payload.workflowVersionId || typeof decoded.payload.version !== "number") {
-            channel.ack(message);
-            return;
-          }
-
-          await prisma.workflowPublishAudit.upsert({
-            where: { workflowVersionId: decoded.payload.workflowVersionId },
-            create: {
-              workflowId: decoded.payload.workflowId,
-              workflowVersionId: decoded.payload.workflowVersionId,
-              version: decoded.payload.version,
-              correlationId: decoded.payload.correlationId,
-              eventTimestamp: decoded.timestamp ? new Date(decoded.timestamp) : undefined,
-              status: "PROCESSED",
-              processedAt: new Date()
-            },
-            update: {
-              correlationId: decoded.payload.correlationId,
-              eventTimestamp: decoded.timestamp ? new Date(decoded.timestamp) : undefined,
-              status: "PROCESSED",
-              errorMessage: null,
-              processedAt: new Date()
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          const details = (await response.text().catch(() => "")).trim();
+          await (prisma as any).ragKbSyncJob.update({
+            where: { id: syncJob.id },
+            data: {
+              status: "failed",
+              errorMessage: details ? `n8n webhook returned ${response.status}: ${details}` : `n8n webhook returned ${response.status}`,
+              completedAt: new Date()
             }
-          });
-          channel.ack(message);
-        } catch (error) {
-          console.warn("[workflow-service] publish-audit worker failed", error instanceof Error ? error.message : String(error));
-          channel.nack(message, false, true);
+          }).catch(() => undefined);
+          return;
         }
-      },
-      { noAck: false }
-    );
-    return { connection, channel };
-  } catch (error) {
-    console.warn("[workflow-service] publish-audit worker disabled", error instanceof Error ? error.message : String(error));
-    return undefined;
+        // Capture n8n execution ID from webhook response (n8n returns executionId in body)
+        try {
+          const responseBody = await response.json() as Record<string, unknown>;
+          const executionId = String(responseBody.executionId ?? responseBody.id ?? "").trim();
+          if (executionId) {
+            await (prisma as any).ragKbSyncJob.update({
+              where: { id: syncJob.id },
+              data: { n8nExecutionId: executionId }
+            }).catch(() => undefined);
+          }
+        } catch {
+          // Response body may not have executionId — not critical
+        }
+      })
+      .catch(() => {
+        (prisma as any).ragKbSyncJob.update({
+          where: { id: syncJob.id },
+          data: { status: "failed", errorMessage: "n8n webhook unreachable", completedAt: new Date() }
+        }).catch(() => undefined);
+      });
+  } else {
+    // No n8n workflow configured — mark as pending for manual processing
+    await (prisma as any).ragKbSyncJob.update({
+      where: { id: syncJob.id },
+      data: { status: "pending", errorMessage: "No n8n workflow configured for this knowledge base" }
+    });
   }
+
+  return syncJob.id;
 }
 
 app.get("/health", async () => ({ ok: true, service: config.serviceName }));
@@ -877,879 +1388,748 @@ app.get("/security/tls", async (request, reply) => {
   return tlsRuntime.getStatus();
 });
 
-type WorkflowSummaryResponse = {
-  id: string;
-  name: string;
-  description: string | null;
-  version: number | null;
-  state: "DRAFT" | "PUBLISHED" | "NONE";
-  status: "ACTIVE" | "INACTIVE";
-  selectedVersionId: string | null;
-  updatedAt: string;
-};
+// ─── Knowledge Base API Routes ────────────────────────────────────────────────
 
-function normalizeIncomingFlow(flowDefinition: WorkflowFlowDefinition | undefined): WorkflowFlowDefinition {
-  return normalizeWorkflowFlow(flowDefinition);
-}
-
-async function ensureFlowIsValid(flowDefinition: WorkflowFlowDefinition): Promise<{ valid: boolean; errors: string[] }> {
-  return validateCanonicalFlow(flowDefinition);
-}
-
-function summarizeWorkflowVersion(version: {
-  id: string;
-  version: number;
-  status: string;
-  isActive: boolean;
-  createdAt: Date;
-}): {
-  id: string;
-  version: number;
-  state: "DRAFT" | "PUBLISHED";
-  status: "ACTIVE" | "INACTIVE";
-  createdAt: string;
-} {
-  return {
-    id: version.id,
-    version: version.version,
-    state: version.status === "PUBLISHED" ? "PUBLISHED" : "DRAFT",
-    status: version.isActive ? "ACTIVE" : "INACTIVE",
-    createdAt: version.createdAt.toISOString()
-  };
-}
-
-async function buildWorkflowSummaryList(): Promise<WorkflowSummaryResponse[]> {
-  const workflows = await prisma.workflow.findMany({
+app.get("/rag/integrations", async (request) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const ownedKbs = await prisma.ragKnowledgeBase.findMany({
+    where: { ownerId: userId },
     include: {
-      versions: {
-        orderBy: [{ version: "desc" }]
+      config: true,
+      syncJobs: {
+        orderBy: { createdAt: "desc" },
+        take: 1
       }
     },
-    orderBy: { updatedAt: "desc" }
+    orderBy: { createdAt: "desc" }
   });
+  return Promise.all(ownedKbs.map((kb) => buildIntegrationResponse(kb, userId)));
+});
 
-  return workflows.map((workflow) => {
-    const draftVersion = workflow.versions.find((entry) => entry.status === "DRAFT");
-    const activePublished = workflow.versions.find((entry) => entry.status === "PUBLISHED" && entry.isActive);
-    const latestVersion = workflow.versions[0];
-    const selectedVersion = draftVersion ?? activePublished ?? latestVersion ?? null;
-    return {
-      id: workflow.id,
-      name: workflow.name,
-      description: workflow.description ?? null,
-      version: selectedVersion?.version ?? null,
-      state: selectedVersion ? (selectedVersion.status === "PUBLISHED" ? "PUBLISHED" : "DRAFT") : "NONE",
-      status: activePublished ? "ACTIVE" : "INACTIVE",
-      selectedVersionId: selectedVersion?.id ?? null,
-      updatedAt: workflow.updatedAt.toISOString()
-    };
-  });
-}
-
-function buildPlannerPreview(existingFlow: WorkflowFlowDefinition | undefined, proposedFlow: WorkflowFlowDefinition) {
-  const previousNodes = new Map((existingFlow?.nodes ?? []).map((node) => [node.id, node]));
-  const nextNodes = new Map(proposedFlow.nodes.map((node) => [node.id, node]));
-  const previousEdges = new Map((existingFlow?.edges ?? []).map((edge) => [edge.id, edge]));
-  const nextEdges = new Map(proposedFlow.edges.map((edge) => [edge.id, edge]));
-
-  const nodesAdded = proposedFlow.nodes.filter((node) => !previousNodes.has(node.id)).map((node) => node.label);
-  const nodesRemoved = (existingFlow?.nodes ?? []).filter((node) => !nextNodes.has(node.id)).map((node) => node.label);
-  const nodesChanged = proposedFlow.nodes
-    .filter((node) => previousNodes.has(node.id))
-    .filter((node) => JSON.stringify(previousNodes.get(node.id)) !== JSON.stringify(node))
-    .map((node) => node.label);
-  const edgesAdded = proposedFlow.edges.filter((edge) => !previousEdges.has(edge.id)).length;
-  const edgesRemoved = (existingFlow?.edges ?? []).filter((edge) => !nextEdges.has(edge.id)).length;
-  const approvalsChanged = proposedFlow.nodes
-    .filter((node) => {
-      const previous = previousNodes.get(node.id);
-      if (!previous) return node.config.approvalMode !== "NONE";
-      return (
-        previous.config.approvalMode !== node.config.approvalMode ||
-        previous.config.autoDecision !== node.config.autoDecision ||
-        previous.config.approvalTimeoutSec !== node.config.approvalTimeoutSec
-      );
-    })
-    .map((node) => node.label);
-
-  return {
-    summary: `Planner proposed ${nodesAdded.length} new nodes, ${nodesChanged.length} node updates, and ${edgesAdded} added edges.`,
-    changePreview: {
-      nodesAdded,
-      nodesRemoved,
-      nodesChanged,
-      edgesAdded,
-      edgesRemoved,
-      approvalsChanged
-    }
+app.post("/rag/integrations", async (request, reply) => {
+  const headers = request.headers as Record<string, unknown>;
+  const userId = requesterUserId(headers);
+  const body = (request.body ?? {}) as {
+    name?: string;
+    description?: string;
+    sourceType?: string;
+    sourceUrl?: string;
+    sourceBranch?: string;
+    sourcePath?: string;
+    syncSchedule?: string;
+    setDefault?: boolean;
+    credentials?: Record<string, unknown>;
+    responseStyle?: string;
+    toneInstructions?: string;
+    restrictionRules?: string;
   };
-}
 
-app.post("/workflows", async (request, reply) => {
-  const body = request.body as { name: string; description?: string; flowDefinition?: WorkflowFlowDefinition };
-  let normalizedFlow: WorkflowFlowDefinition;
+  const name = nonEmptyString(body.name);
+  const sourceUrl = nonEmptyString(body.sourceUrl);
+  const sourceType = normalizeSourceType(nonEmptyString(body.sourceType) ?? "github", sourceUrl);
+  if (!name) return reply.code(400).send({ error: "INTEGRATION_NAME_REQUIRED" });
+  if (!sourceUrl) return reply.code(400).send({ error: "INTEGRATION_SOURCE_URL_REQUIRED" });
+
+  const sourceSecrets = buildSourceSecretPayload(sourceType, body.credentials);
+  const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
+
   try {
-    normalizedFlow = normalizeIncomingFlow(body.flowDefinition);
+    const kb = await (prisma as any).ragKnowledgeBase.create({
+      data: {
+        name,
+        description: body.description ?? null,
+        sourceType,
+        sourceUrl,
+        sourceBranch: body.sourceBranch ?? null,
+        sourcePath: body.sourcePath ?? null,
+        syncSchedule: body.syncSchedule ?? null,
+        difyAppUrl: defaults.difyAppUrl,
+        scope: "user",
+        ownerId: userId,
+        isDefault: false,
+        createdById: userId
+      },
+      include: {
+        config: true,
+        syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
+      }
+    });
+
+    if (Object.keys(sourceSecrets).length > 0) {
+      await writeVaultKv(userSourceSecretPath(userId, kb.id), sourceSecrets);
+    }
+
+    await writeVaultKv(`platform/global/dify/${kb.id}`, {
+      ...(defaults.defaultApiKey ? { api_key: defaults.defaultApiKey } : {}),
+      n8n_workflow_id: defaults.workflowId
+    });
+
+    if (body.responseStyle || body.toneInstructions || body.restrictionRules) {
+      await (prisma as any).ragKnowledgeBaseConfig.create({
+        data: {
+          knowledgeBaseId: kb.id,
+          responseStyle: body.responseStyle ?? null,
+          toneInstructions: body.toneInstructions ?? null,
+          restrictionRules: body.restrictionRules ?? null
+        }
+      });
+    }
+
+    const existingDefault = await readUserRagConfig(userId);
+    if (body.setDefault || !nonEmptyString(existingDefault.default_kb_id)) {
+      await setUserDefaultKnowledgeBase(userId, kb.id);
+    }
+
+    try {
+      await ensureDifyKnowledgeBaseProvisioned(kb.id);
+    } catch (error) {
+      await (prisma as any).ragKbSyncJob.create({
+        data: {
+          knowledgeBaseId: kb.id,
+          trigger: "provision",
+          triggeredById: userId,
+          status: "failed",
+          startedAt: new Date(),
+          completedAt: new Date(),
+          errorMessage: `Dify provisioning failed: ${error instanceof Error ? error.message : String(error)}`
+        }
+      });
+    }
+
+    const reloaded = await (prisma as any).ragKnowledgeBase.findUnique({
+      where: { id: kb.id },
+      include: {
+        config: true,
+        syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
+      }
+    });
+    return reply.code(201).send(await buildIntegrationResponse(reloaded, userId));
   } catch (error) {
-    return reply.code(400).send({
-      error: "INVALID_WORKFLOW_FLOW",
-      details: error instanceof Error ? error.message : "Invalid canonical flow payload"
+    return reply.code(500).send({
+      error: "INTEGRATION_CREATE_FAILED",
+      details: error instanceof Error ? error.message : String(error)
     });
   }
-
-  const validation = await ensureFlowIsValid(normalizedFlow);
-  if (!validation.valid) {
-    return reply.code(400).send({
-      error: "INVALID_WORKFLOW_FLOW",
-      errors: validation.errors
-    });
-  }
-
-  const workflow = await prisma.workflow.create({
-    data: {
-      name: body.name,
-      description: body.description
-    }
-  });
-
-  const version = await prisma.workflowVersion.create({
-    data: {
-      workflowId: workflow.id,
-      version: 1,
-      status: "DRAFT",
-      isActive: false,
-      nodesJson: JSON.parse(JSON.stringify(normalizedFlow))
-    }
-  });
-
-  await prisma.workflow.update({
-    where: { id: workflow.id },
-    data: { latestVersionId: version.id }
-  });
-
-  reply.code(201).send({ workflow, version: summarizeWorkflowVersion(version) });
 });
 
-app.get("/workflows", async () => buildWorkflowSummaryList());
-
-app.get("/workflows/:id", async (request, reply) => {
+app.patch("/rag/integrations/:id", async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  const workflow = await prisma.workflow.findUnique({
-    where: { id },
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const body = (request.body ?? {}) as {
+    name?: string;
+    description?: string;
+    sourceUrl?: string;
+    sourceBranch?: string;
+    sourcePath?: string;
+    syncSchedule?: string;
+    setDefault?: boolean;
+    credentials?: Record<string, unknown>;
+    responseStyle?: string;
+    toneInstructions?: string;
+    restrictionRules?: string;
+  };
+
+  const existingKb = await (prisma as any).ragKnowledgeBase.findFirst({
+    where: { id, ownerId: userId },
     include: {
-      versions: {
-        orderBy: [{ version: "desc" }]
-      }
+      config: true,
+      syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
     }
   });
-  if (!workflow) {
-    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  }
+  if (!existingKb) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
 
-  const versions = workflow.versions.map((version) => ({
-    ...summarizeWorkflowVersion(version),
-    nodesJson: version.nodesJson
-  }));
-
-  return {
-    workflow: {
-      id: workflow.id,
-      name: workflow.name,
-      description: workflow.description ?? null,
-      latestVersionId: workflow.latestVersionId ?? null,
-      updatedAt: workflow.updatedAt.toISOString()
-    },
-    versions
-  };
-});
-
-app.get("/workflows/:id/versions/:versionId", async (request, reply) => {
-  const params = request.params as { id: string; versionId: string };
-  const version = await prisma.workflowVersion.findFirst({
-    where: {
-      id: params.versionId,
-      workflowId: params.id
-    }
-  });
-  if (!version) {
-    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
-  }
-  return {
-    version: {
-      ...summarizeWorkflowVersion(version),
-      nodesJson: version.nodesJson
-    }
-  };
-});
-
-app.patch("/workflows/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { name?: string; description?: string | null };
   try {
-    const workflow = await prisma.workflow.update({
+    const updatedKb = await (prisma as any).ragKnowledgeBase.update({
       where: { id },
       data: {
-        name: body.name,
-        description: body.description ?? null
+        ...(body.name !== undefined ? { name: body.name } : {}),
+        ...(body.description !== undefined ? { description: body.description || null } : {}),
+        ...(body.sourceUrl !== undefined ? { sourceUrl: body.sourceUrl } : {}),
+        ...(body.sourceBranch !== undefined ? { sourceBranch: body.sourceBranch || null } : {}),
+        ...(body.sourcePath !== undefined ? { sourcePath: body.sourcePath || null } : {}),
+        ...(body.syncSchedule !== undefined ? { syncSchedule: body.syncSchedule || null } : {})
+      },
+      include: {
+        config: true,
+        syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
       }
     });
-    return { workflow };
-  } catch {
-    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  }
-});
 
-app.post("/workflows/:id/draft", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { sourceVersionId?: string };
-  const workflow = await prisma.workflow.findUnique({ where: { id } });
-  if (!workflow) {
-    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  }
+    if (body.credentials) {
+      const mergedSecrets = {
+        ...(await readVaultKv(userSourceSecretPath(userId, id)))
+      } as Record<string, unknown>;
+      const allowedMappings: Array<[string, string]> = [
+        ["githubToken", "github_token"],
+        ["gitlabToken", "gitlab_token"],
+        ["googleDriveAccessToken", "gdrive_token"],
+        ["googleDriveRefreshToken", "gdrive_refresh"]
+      ];
+      for (const [bodyKey, vaultKey] of allowedMappings) {
+        if (!(bodyKey in body.credentials)) continue;
+        const nextValue = normalizeAccessToken(body.credentials[bodyKey]);
+        if (nextValue) {
+          mergedSecrets[vaultKey] = nextValue;
+        } else {
+          delete mergedSecrets[vaultKey];
+        }
+      }
+      const normalizedType = normalizeSourceType(String(updatedKb.sourceType ?? ""), String(updatedKb.sourceUrl ?? ""));
+      const hasSourceTokenUpdate =
+        ("githubToken" in body.credentials && normalizedType === "github") ||
+        ("gitlabToken" in body.credentials && normalizedType === "gitlab");
+      if (hasSourceTokenUpdate) {
+        try {
+          await preflightSourceDocumentCount(
+            {
+              sourceType: String(updatedKb.sourceType ?? ""),
+              sourceUrl: String(updatedKb.sourceUrl ?? ""),
+              sourceBranch: String(updatedKb.sourceBranch ?? ""),
+              sourcePath: String(updatedKb.sourcePath ?? "")
+            },
+            mergedSecrets
+          );
+        } catch (error) {
+          return reply.code(400).send({
+            error: "SOURCE_TOKEN_VALIDATION_FAILED",
+            details: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+      if (Object.keys(mergedSecrets).length > 0) {
+        await writeVaultKv(userSourceSecretPath(userId, id), mergedSecrets);
+      } else {
+        await deleteVaultSecret(userSourceSecretPath(userId, id));
+      }
+    }
 
-  const existingDraft = await prisma.workflowVersion.findFirst({
-    where: { workflowId: id, status: "DRAFT" },
-    orderBy: { version: "desc" }
-  });
+    if (body.responseStyle !== undefined || body.toneInstructions !== undefined || body.restrictionRules !== undefined) {
+      await (prisma as any).ragKnowledgeBaseConfig.upsert({
+        where: { knowledgeBaseId: id },
+        create: {
+          knowledgeBaseId: id,
+          responseStyle: body.responseStyle ?? null,
+          toneInstructions: body.toneInstructions ?? null,
+          restrictionRules: body.restrictionRules ?? null
+        },
+        update: {
+          ...(body.responseStyle !== undefined ? { responseStyle: body.responseStyle || null } : {}),
+          ...(body.toneInstructions !== undefined ? { toneInstructions: body.toneInstructions || null } : {}),
+          ...(body.restrictionRules !== undefined ? { restrictionRules: body.restrictionRules || null } : {})
+        }
+      });
+    }
 
-  if (existingDraft) {
-    await prisma.workflow.update({
+    if (body.setDefault) {
+      await setUserDefaultKnowledgeBase(userId, id);
+    }
+
+    const reloaded = await (prisma as any).ragKnowledgeBase.findUnique({
       where: { id },
-      data: { latestVersionId: existingDraft.id }
+      include: {
+        config: true,
+        syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
+      }
     });
-    return { version: { ...summarizeWorkflowVersion(existingDraft), nodesJson: existingDraft.nodesJson } };
-  }
-
-  const sourceVersion =
-    (body.sourceVersionId
-      ? await prisma.workflowVersion.findFirst({
-          where: { id: body.sourceVersionId, workflowId: id }
-        })
-      : undefined) ??
-    (await prisma.workflowVersion.findFirst({
-      where: { workflowId: id, isActive: true },
-      orderBy: { version: "desc" }
-    })) ??
-    (await prisma.workflowVersion.findFirst({
-      where: { workflowId: id },
-      orderBy: { version: "desc" }
-    }));
-
-  if (!sourceVersion) {
-    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
-  }
-
-  const latestVersion = await prisma.workflowVersion.findFirst({
-    where: { workflowId: id },
-    orderBy: { version: "desc" }
-  });
-
-  const version = await prisma.workflowVersion.create({
-    data: {
-      workflowId: id,
-      version: (latestVersion?.version ?? 0) + 1,
-      status: "DRAFT",
-      isActive: false,
-      nodesJson: JSON.parse(JSON.stringify(sourceVersion.nodesJson ?? {}))
-    }
-  });
-
-  await prisma.workflow.update({
-    where: { id },
-    data: { latestVersionId: version.id }
-  });
-
-  return { version: { ...summarizeWorkflowVersion(version), nodesJson: version.nodesJson } };
-});
-
-app.put("/workflows/:id/versions/:versionId/draft", async (request, reply) => {
-  const params = request.params as { id: string; versionId: string };
-  const body = (request.body ?? {}) as { name?: string; description?: string | null; flowDefinition?: WorkflowFlowDefinition };
-  let normalizedFlow: WorkflowFlowDefinition;
-  try {
-    normalizedFlow = normalizeIncomingFlow(body.flowDefinition);
+    return await buildIntegrationResponse(reloaded, userId);
   } catch (error) {
-    return reply.code(400).send({
-      error: "INVALID_WORKFLOW_FLOW",
-      details: error instanceof Error ? error.message : "Invalid canonical flow payload"
+    return reply.code(500).send({
+      error: "INTEGRATION_UPDATE_FAILED",
+      details: error instanceof Error ? error.message : String(error)
     });
   }
-  const validation = await ensureFlowIsValid(normalizedFlow);
-  if (!validation.valid) {
-    return reply.code(400).send({ error: "INVALID_WORKFLOW_FLOW", errors: validation.errors });
-  }
-
-  const version = await prisma.workflowVersion.findFirst({
-    where: { id: params.versionId, workflowId: params.id }
-  });
-  if (!version) {
-    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
-  }
-  if (version.status !== "DRAFT") {
-    return reply.code(400).send({ error: "ONLY_DRAFT_VERSION_EDITABLE" });
-  }
-
-  const updatedVersion = await prisma.workflowVersion.update({
-    where: { id: version.id },
-    data: {
-      nodesJson: JSON.parse(JSON.stringify(normalizedFlow))
-    }
-  });
-
-  const workflow = await prisma.workflow.update({
-    where: { id: params.id },
-    data: {
-      name: body.name,
-      description: body.description ?? undefined,
-      latestVersionId: updatedVersion.id
-    }
-  });
-
-  return {
-    workflow,
-    version: {
-      ...summarizeWorkflowVersion(updatedVersion),
-      nodesJson: updatedVersion.nodesJson
-    }
-  };
 });
 
-app.post("/workflows/:id/copy", async (request, reply) => {
+app.post("/rag/integrations/:id/set-default", async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { versionId?: string; name?: string; description?: string };
-  const source = await prisma.workflow.findUnique({
-    where: { id },
-    include: { versions: { orderBy: { version: "desc" } } }
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const kb = await (prisma as any).ragKnowledgeBase.findFirst({
+    where: { id, ownerId: userId }
   });
-  if (!source) {
-    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  }
-  const sourceVersion =
-    source.versions.find((entry) => entry.id === body.versionId) ??
-    source.versions.find((entry) => entry.isActive) ??
-    source.versions[0];
-  if (!sourceVersion) {
-    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
-  }
-
-  const workflow = await prisma.workflow.create({
-    data: {
-      name: body.name?.trim() || `${source.name} Copy`,
-      description: body.description ?? source.description
-    }
-  });
-  const version = await prisma.workflowVersion.create({
-    data: {
-      workflowId: workflow.id,
-      version: 1,
-      status: "DRAFT",
-      isActive: false,
-      nodesJson: JSON.parse(JSON.stringify(sourceVersion.nodesJson ?? {}))
-    }
-  });
-  await prisma.workflow.update({
-    where: { id: workflow.id },
-    data: { latestVersionId: version.id }
-  });
-  return {
-    workflow,
-    version: {
-      ...summarizeWorkflowVersion(version),
-      nodesJson: version.nodesJson
-    }
-  };
+  if (!kb) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
+  await setUserDefaultKnowledgeBase(userId, id);
+  return { defaultKnowledgeBaseId: id };
 });
 
-app.delete("/workflows/:id", async (request, reply) => {
+app.delete("/rag/integrations/:id", async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  const workflow = await prisma.workflow.findUnique({
-    where: { id },
-    include: { versions: { select: { id: true } } }
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const kb = await (prisma as any).ragKnowledgeBase.findFirst({
+    where: { id, ownerId: userId }
   });
-  if (!workflow) {
-    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  }
-  const versionIds = workflow.versions.map((entry) => entry.id);
-  const orderCount = await prisma.order.count({
-    where: { workflowVersionId: { in: versionIds.length > 0 ? versionIds : ["__none__"] } }
-  });
-  if (orderCount > 0) {
-    return reply.code(409).send({ error: "WORKFLOW_DELETE_BLOCKED_IN_USE", orderCount });
-  }
-  await prisma.workflow.delete({ where: { id } });
-  return { deleted: true, workflowId: id };
-});
+  if (!kb) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
 
-app.post("/workflows/:id/versions/:versionId/publish", async (request, reply) => {
-  const params = request.params as { id: string; versionId: string };
-  const correlationId = String(request.headers["x-correlation-id"] ?? createCorrelationId("workflow-publish"));
-  const version = await prisma.workflowVersion.findFirst({
-    where: { id: params.versionId, workflowId: params.id }
-  });
-  if (!version) {
-    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
-  }
-
-  let canonicalFlow: WorkflowFlowDefinition;
   try {
-    canonicalFlow = normalizeWorkflowFlow(version.nodesJson);
-  } catch (error) {
-    return reply.code(400).send({
-      error: "WORKFLOW_PUBLISH_VALIDATION_FAILED",
-      errors: [error instanceof Error ? error.message : "Invalid canonical flow payload"]
+    await deleteDifyKnowledgeBaseResources(kb);
+    await (prisma as any).ragKnowledgeBase.delete({ where: { id } });
+    await deleteVaultSecret(userSourceSecretPath(userId, id));
+    await deleteVaultSecret(`platform/global/dify/${id}`);
+    await clearUserDefaultKnowledgeBaseIfMatches(userId, id);
+
+    const nextKb = await (prisma as any).ragKnowledgeBase.findFirst({
+      where: { ownerId: userId },
+      orderBy: { createdAt: "desc" }
     });
-  }
-  const validation = await validateCanonicalFlow(canonicalFlow);
-  if (!validation.valid) {
-    return reply.code(400).send({
-      error: "WORKFLOW_PUBLISH_VALIDATION_FAILED",
-      errors: validation.errors
-    });
-  }
-
-  const activePublishedCount = await prisma.workflowVersion.count({
-    where: {
-      workflowId: params.id,
-      status: "PUBLISHED",
-      isActive: true
-    }
-  });
-
-  const published = await prisma.workflowVersion.update({
-    where: { id: version.id },
-    data: {
-      status: "PUBLISHED",
-      isActive: activePublishedCount === 0
-    }
-  });
-  await prisma.workflow.update({
-    where: { id: params.id },
-    data: { latestVersionId: published.id }
-  });
-
-  await eventPublisher.publish(PlatformEvents.workflowPublished, {
-    workflowId: params.id,
-    workflowVersionId: published.id,
-    version: published.version,
-    status: published.status,
-    correlationId
-  });
-
-  return { event: PlatformEvents.workflowPublished, version: summarizeWorkflowVersion(published), correlationId };
-});
-
-app.post("/workflows/:id/publish", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const workflow = await prisma.workflow.findUnique({ where: { id } });
-  if (!workflow) {
-    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  }
-  const latest = await prisma.workflowVersion.findFirst({
-    where: { workflowId: id, status: "DRAFT" },
-    orderBy: { version: "desc" }
-  });
-  if (!latest) {
-    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
-  }
-  const correlationId = String(request.headers["x-correlation-id"] ?? createCorrelationId("workflow-publish"));
-
-  let canonicalFlow: WorkflowFlowDefinition;
-  try {
-    canonicalFlow = normalizeWorkflowFlow(latest.nodesJson);
-  } catch (error) {
-    return reply.code(400).send({
-      error: "WORKFLOW_PUBLISH_VALIDATION_FAILED",
-      errors: [error instanceof Error ? error.message : "Invalid canonical flow payload"]
-    });
-  }
-  const validation = await validateCanonicalFlow(canonicalFlow);
-  if (!validation.valid) {
-    return reply.code(400).send({
-      error: "WORKFLOW_PUBLISH_VALIDATION_FAILED",
-      errors: validation.errors
-    });
-  }
-
-  const activePublishedCount = await prisma.workflowVersion.count({
-    where: {
-      workflowId: id,
-      status: "PUBLISHED",
-      isActive: true
-    }
-  });
-
-  const published = await prisma.workflowVersion.update({
-    where: { id: latest.id },
-    data: {
-      status: "PUBLISHED",
-      isActive: activePublishedCount === 0
-    }
-  });
-  await prisma.workflow.update({
-    where: { id },
-    data: { latestVersionId: published.id }
-  });
-
-  await eventPublisher.publish(PlatformEvents.workflowPublished, {
-    workflowId: id,
-    workflowVersionId: published.id,
-    version: published.version,
-    status: published.status,
-    correlationId
-  });
-
-  return { event: PlatformEvents.workflowPublished, version: summarizeWorkflowVersion(published), correlationId };
-});
-
-app.post("/workflows/:id/versions/:versionId/activate", async (request, reply) => {
-  const params = request.params as { id: string; versionId: string };
-  const version = await prisma.workflowVersion.findFirst({
-    where: { id: params.versionId, workflowId: params.id }
-  });
-  if (!version) {
-    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
-  }
-  if (version.status !== "PUBLISHED") {
-    return reply.code(400).send({ error: "ONLY_PUBLISHED_VERSION_CAN_BE_ACTIVE" });
-  }
-
-  await prisma.$transaction([
-    prisma.workflowVersion.updateMany({
-      where: { workflowId: params.id },
-      data: { isActive: false }
-    }),
-    prisma.workflowVersion.update({
-      where: { id: version.id },
-      data: { isActive: true }
-    }),
-    prisma.workflow.update({
-      where: { id: params.id },
-      data: { latestVersionId: version.id }
-    })
-  ]);
-
-  const activated = await prisma.workflowVersion.findUnique({ where: { id: version.id } });
-  return { version: activated ? summarizeWorkflowVersion(activated) : null };
-});
-
-app.post("/workflows/import", async (request, reply) => {
-  const body = (request.body ?? {}) as { name?: string; description?: string; flowDefinition?: WorkflowFlowDefinition };
-  const name = String(body.name ?? "").trim();
-  if (!name) {
-    return reply.code(400).send({ error: "WORKFLOW_NAME_REQUIRED" });
-  }
-  let normalizedFlow: WorkflowFlowDefinition;
-  try {
-    normalizedFlow = normalizeIncomingFlow(body.flowDefinition);
-  } catch (error) {
-    return reply.code(400).send({ error: "INVALID_WORKFLOW_FLOW", details: error instanceof Error ? error.message : String(error) });
-  }
-  const validation = await ensureFlowIsValid(normalizedFlow);
-  if (!validation.valid) {
-    return reply.code(400).send({ error: "INVALID_WORKFLOW_FLOW", errors: validation.errors });
-  }
-  const workflow = await prisma.workflow.create({
-    data: { name, description: String(body.description ?? "").trim() || null }
-  });
-  const version = await prisma.workflowVersion.create({
-    data: {
-      workflowId: workflow.id,
-      version: 1,
-      status: "DRAFT",
-      isActive: false,
-      nodesJson: toJsonObject(normalizedFlow)
-    }
-  });
-  await prisma.workflow.update({
-    where: { id: workflow.id },
-    data: { latestVersionId: version.id }
-  });
-  return reply.code(201).send({ workflow, version: summarizeWorkflowVersion(version) });
-});
-
-app.get("/workflows/:id/export", async (request, reply) => {
-  const params = request.params as { id: string };
-  const query = request.query as { versionId?: string };
-  const details = await prisma.workflow.findUnique({
-    where: { id: params.id },
-    include: {
-      versions: {
-        orderBy: [{ version: "desc" }]
+    if (nextKb) {
+      const config = await readUserRagConfig(userId);
+      if (!nonEmptyString(config.default_kb_id)) {
+        await setUserDefaultKnowledgeBase(userId, nextKb.id);
       }
     }
-  });
-  if (!details) {
-    return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  }
-  const selected =
-    details.versions.find((version) => version.id === String(query.versionId ?? "").trim()) ??
-    details.versions.find((version) => version.isActive) ??
-    details.versions[0];
-  if (!selected) {
-    return reply.code(404).send({ error: "WORKFLOW_VERSION_NOT_FOUND" });
-  }
-  let flowDefinition: WorkflowFlowDefinition;
-  try {
-    flowDefinition = normalizeIncomingFlow(selected.nodesJson as unknown as WorkflowFlowDefinition);
+
+    return { deleted: true, id, difyCleanup: true };
   } catch (error) {
-    return reply.code(400).send({ error: "INVALID_WORKFLOW_FLOW", details: error instanceof Error ? error.message : String(error) });
+    return reply.code(500).send({
+      error: "INTEGRATION_DELETE_FAILED",
+      details: error instanceof Error ? error.message : String(error)
+    });
   }
-  const payload: WorkflowExportPayload = {
-    workflow: {
-      id: details.id,
-      name: details.name,
-      description: details.description
-    },
-    version: {
-      id: selected.id,
-      version: selected.version,
-      state: selected.status === "PUBLISHED" ? "PUBLISHED" : "DRAFT",
-      status: selected.isActive ? "ACTIVE" : "INACTIVE"
-    },
-    flowDefinition
-  };
-  return payload;
 });
+
+// List knowledge bases visible to the requesting user
+app.get("/rag/knowledge-bases", async (request) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const privileged = isAdminOrUserAdmin(request.headers as Record<string, unknown>);
+  return getVisibleKnowledgeBases(userId, privileged);
+});
+
+// Create a new knowledge base (admin/useradmin only). Dify app/dataset/API-key
+// provisioning is automatic and secrets are stored in Vault, never in the DB.
+app.post("/rag/knowledge-bases", async (request, reply) => {
+  const headers = request.headers as Record<string, unknown>;
+  if (!isAdminOrUserAdmin(headers)) return reply.code(403).send({ error: "FORBIDDEN" });
+  const userId = requesterUserId(headers);
+  const body = (request.body ?? {}) as {
+    name?: string;
+    description?: string;
+    sourceType?: string;
+    sourceUrl?: string;
+    sourceBranch?: string;
+    sourcePath?: string;
+    syncSchedule?: string;
+    difyAppUrl?: string;
+    difyApiKey?: string;
+    n8nWorkflowId?: string;
+    isDefault?: boolean;
+    scope?: string;
+    responseStyle?: string;
+    toneInstructions?: string;
+    restrictionRules?: string;
+    systemPromptBase?: string;
+    llmModel?: string;
+    temperature?: number;
+    topK?: number;
+  };
+  const name = String(body.name ?? "").trim();
+  const sourceUrl = String(body.sourceUrl ?? "").trim();
+  const sourceType = normalizeSourceType(String(body.sourceType ?? "github").trim(), sourceUrl);
+  const difyApiKey = String(body.difyApiKey ?? "").trim();
+  if (!name) return reply.code(400).send({ error: "KB_NAME_REQUIRED" });
+  if (!sourceUrl) return reply.code(400).send({ error: "KB_SOURCE_URL_REQUIRED" });
+
+  try {
+    const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
+    // 1. Create the DB record (no API key stored here)
+    const kb = await (prisma as any).$transaction(async (tx: typeof prisma) => {
+      if (body.isDefault) {
+        await (tx as any).ragKnowledgeBase.updateMany({
+          where: { isDefault: true },
+          data: { isDefault: false }
+        });
+      }
+
+      return (tx as any).ragKnowledgeBase.create({
+        data: {
+          name,
+          description: body.description ?? null,
+          sourceType,
+          sourceUrl,
+          sourceBranch: body.sourceBranch ?? null,
+          sourcePath: body.sourcePath ?? null,
+          syncSchedule: body.syncSchedule ?? null,
+          difyAppUrl: body.difyAppUrl ?? defaults.difyAppUrl,
+          scope: body.scope ?? "global",
+          ownerId: body.scope === "user" ? userId : null,
+          isDefault: body.isDefault ?? false,
+          createdById: userId
+        }
+      });
+    });
+
+    // 2. Store workflow metadata and optional legacy Dify key in Vault.
+    await writeVaultKv(`platform/global/dify/${kb.id}`, {
+      ...(difyApiKey ? { api_key: difyApiKey } : {}),
+      n8n_workflow_id: String(body.n8nWorkflowId ?? defaults.workflowId).trim()
+    });
+
+    // 3. Create default config if any config fields provided
+    if (body.systemPromptBase || body.llmModel || body.responseStyle || body.toneInstructions) {
+      await (prisma as any).ragKnowledgeBaseConfig.create({
+        data: {
+          knowledgeBaseId: kb.id,
+          systemPromptBase: body.systemPromptBase ?? null,
+          llmModel: body.llmModel ?? null,
+          temperature: body.temperature ?? null,
+          topK: body.topK ?? null,
+          responseStyle: body.responseStyle ?? null,
+          toneInstructions: body.toneInstructions ?? null,
+          restrictionRules: body.restrictionRules ?? null
+        }
+      });
+    }
+
+    try {
+      await ensureDifyKnowledgeBaseProvisioned(kb.id);
+    } catch (error) {
+      await (prisma as any).ragKbSyncJob.create({
+        data: {
+          knowledgeBaseId: kb.id,
+          trigger: "provision",
+          triggeredById: userId,
+          status: "failed",
+          startedAt: new Date(),
+          completedAt: new Date(),
+          errorMessage: `Dify provisioning failed: ${error instanceof Error ? error.message : String(error)}`
+        }
+      });
+    }
+
+    const reloaded = await (prisma as any).ragKnowledgeBase.findUnique({
+      where: { id: kb.id },
+      include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 } }
+    });
+    return reply.code(201).send(await buildIntegrationResponse(reloaded, userId));
+  } catch (error) {
+    return reply.code(500).send({ error: "KB_CREATE_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Get a single knowledge base
+app.get("/rag/knowledge-bases/:id", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const privileged = isAdminOrUserAdmin(request.headers as Record<string, unknown>);
+  const kb = await (prisma as any).ragKnowledgeBase.findFirst({
+    where: privileged ? { id } : { id, OR: [{ scope: "global" }, { ownerId: userId }] },
+    include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 5 } }
+  });
+  if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+  return kb;
+});
+
+// Update KB config (tone, style, restrictions) — available to all users for their own KB
+app.patch("/rag/knowledge-bases/:id/config", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  try {
+    const updated = await (prisma as any).ragKnowledgeBaseConfig.upsert({
+      where: { knowledgeBaseId: id },
+      create: { knowledgeBaseId: id, ...body },
+      update: body
+    });
+    return updated;
+  } catch (error) {
+    return reply.code(400).send({ error: "KB_CONFIG_UPDATE_FAILED", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Delete a knowledge base (admin/useradmin only) — also removes Vault secrets
+app.delete("/rag/knowledge-bases/:id", async (request, reply) => {
+  const headers = request.headers as Record<string, unknown>;
+  if (!isAdminOrUserAdmin(headers)) return reply.code(403).send({ error: "FORBIDDEN" });
+  const id = (request.params as { id: string }).id;
+  try {
+    const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id } });
+    if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+    await deleteDifyKnowledgeBaseResources(kb);
+    await (prisma as any).ragKnowledgeBase.delete({ where: { id } });
+    // Remove Vault secret for this KB
+    await vaultCall("DELETE", `${VAULT_KV_MOUNT}/metadata/platform/global/dify/${id}`).catch(() => undefined);
+    return { deleted: true, id, difyCleanup: true };
+  } catch (error) {
+    return reply.code(500).send({
+      error: "KNOWLEDGE_BASE_DELETE_FAILED",
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+// Set a KB as the platform default (admin only)
+app.post("/rag/knowledge-bases/:id/set-default", async (request, reply) => {
+  const headers = request.headers as Record<string, unknown>;
+  if (!isAdmin(headers)) return reply.code(403).send({ error: "FORBIDDEN_ADMIN_ONLY" });
+  const id = (request.params as { id: string }).id;
+  await (prisma as any).$transaction([
+    (prisma as any).ragKnowledgeBase.updateMany({ where: { isDefault: true }, data: { isDefault: false } }),
+    (prisma as any).ragKnowledgeBase.update({ where: { id }, data: { isDefault: true } })
+  ]);
+  return { defaultKnowledgeBaseId: id };
+});
+
+// Trigger a manual sync for a knowledge base
+app.post("/rag/knowledge-bases/:id/sync", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  try {
+    const syncJobId = await triggerKbSync(id, userId, "manual");
+    return reply.code(202).send({ accepted: true, syncJobId, knowledgeBaseId: id });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg === "KNOWLEDGE_BASE_NOT_FOUND") return reply.code(404).send({ error: msg });
+    return reply.code(500).send({ error: "SYNC_TRIGGER_FAILED", details: msg });
+  }
+});
+
+// Get latest sync status for a knowledge base (polled by UI for progress bar)
+app.get("/rag/knowledge-bases/:id/sync-status", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const latestJob = await (prisma as any).ragKbSyncJob.findFirst({
+    where: { knowledgeBaseId: id },
+    orderBy: { createdAt: "desc" }
+  });
+  if (!latestJob) return { status: "never_synced", knowledgeBaseId: id };
+  return latestJob;
+});
+
+// Get sync history for a knowledge base
+app.get("/rag/knowledge-bases/:id/sync-history", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const query = request.query as { limit?: string };
+  const limit = Math.min(Number(query.limit ?? "20"), 100);
+  const jobs = await (prisma as any).ragKbSyncJob.findMany({
+    where: { knowledgeBaseId: id },
+    orderBy: { createdAt: "desc" },
+    take: limit
+  });
+  return { knowledgeBaseId: id, jobs };
+});
+
+app.post("/rag/knowledge-bases/:id/sync-cancel", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const latestJob = await (prisma as any).ragKbSyncJob.findFirst({
+    where: {
+      knowledgeBaseId: id,
+      status: { in: ["pending", "running"] }
+    },
+    orderBy: { createdAt: "desc" }
+  });
+  if (!latestJob) return reply.code(404).send({ error: "SYNC_JOB_NOT_FOUND" });
+
+  // Mark job as cancelled in DB first — n8n progress callbacks will see this and stop
+  await (prisma as any).ragKbSyncJob.update({
+    where: { id: latestJob.id },
+    data: {
+      status: "cancelled",
+      errorMessage: "Sync cancelled by user",
+      completedAt: new Date()
+    }
+  });
+
+  // Stop the running n8n execution via n8n REST API if we have the execution ID and API key
+  const n8nExecutionId = String(latestJob.n8nExecutionId ?? "").trim();
+  const n8nApiKey = config.n8nApiKey;
+  if (n8nExecutionId && n8nApiKey) {
+    // n8n REST API: DELETE /api/v1/executions/{id} stops/deletes a running execution
+    void fetch(`${config.n8nApiBaseUrl}/api/v1/executions/${n8nExecutionId}`, {
+      method: "DELETE",
+      headers: {
+        "X-N8N-API-KEY": n8nApiKey
+      }
+    }).catch((error) => {
+      console.warn(`[workflow-service] n8n execution stop failed for ${n8nExecutionId}:`, error instanceof Error ? error.message : String(error));
+    });
+  }
+
+  return { cancelled: true, syncJobId: latestJob.id, knowledgeBaseId: id };
+});
+
+// n8n progress callback — called by n8n sync workflows to report progress
+// This is an internal endpoint; n8n calls it during sync execution
+app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  void id;
+  const body = (request.body ?? {}) as {
+    syncJobId?: string;
+    status?: string;
+    filesProcessed?: number;
+    filesTotal?: number;
+    chunksProcessed?: number;
+    errorMessage?: string;
+    step?: {
+      task: string;
+      stepName: string;
+      status: string;
+      startedAt?: string;
+      completedAt?: string;
+      message?: string;
+      errorMessage?: string;
+    };
+    logMessage?: string;
+    logSeverity?: string;
+  };
+  if (!body.syncJobId) return reply.code(400).send({ error: "SYNC_JOB_ID_REQUIRED" });
+  try {
+    const existingJob = await (prisma as any).ragKbSyncJob.findUnique({
+      where: { id: body.syncJobId }
+    });
+    if (!existingJob) return reply.code(404).send({ error: "SYNC_JOB_NOT_FOUND" });
+    if (String(existingJob.status ?? "") === "cancelled") {
+      return { updated: false, ignored: "SYNC_CANCELLED" };
+    }
+    if (String(existingJob.status ?? "") === "completed" && body.status !== "completed") {
+      return { updated: false, ignored: "SYNC_ALREADY_COMPLETED" };
+    }
+    const isCompleted = body.status === "completed" || body.status === "failed";
+    await (prisma as any).ragKbSyncJob.update({
+      where: { id: body.syncJobId },
+      data: {
+        status: body.status ?? "running",
+        filesProcessed: body.filesProcessed ?? undefined,
+        filesTotal: body.filesTotal ?? undefined,
+        chunksProcessed: body.chunksProcessed ?? undefined,
+        errorMessage: body.errorMessage ?? null,
+        ...(isCompleted ? { completedAt: new Date() } : {})
+      }
+    });
+
+    // Upsert step into stepsJson
+    if (body.step) {
+      const existing = Array.isArray(existingJob.stepsJson)
+        ? (existingJob.stepsJson as Record<string, unknown>[])
+        : [];
+      const idx = existing.findIndex((s) => s["stepName"] === body.step!.stepName);
+      if (idx >= 0) existing[idx] = { ...existing[idx], ...body.step };
+      else existing.push({ ...body.step });
+      await (prisma as any).ragKbSyncJob.update({
+        where: { id: body.syncJobId },
+        data: { stepsJson: existing }
+      });
+    }
+
+    // Forward log to logging-service (fire-and-forget)
+    if (body.logMessage) {
+      tlsFetch(tlsRuntime, new URL("/logs/ingest", config.loggingServiceUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          severity: body.logSeverity ?? "INFO",
+          source: "n8n-rag-sync",
+          message: body.logMessage,
+          syncJobId: body.syncJobId,
+          stepName: body.step?.stepName ?? null,
+          payload: { filesProcessed: body.filesProcessed, filesTotal: body.filesTotal }
+        })
+      }).catch(() => {});
+    }
+
+    return { updated: true };
+  } catch (error) {
+    return reply.code(404).send({ error: "SYNC_JOB_NOT_FOUND" });
+  }
+});
+
+// Channel deployments (Phase 2 stubs — ready for n8n channel integration)
+app.get("/rag/channels", async (request) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  return (prisma as any).ragChannelDeployment.findMany({
+    where: { ownerId: userId },
+    orderBy: { createdAt: "desc" }
+  });
+});
+
+app.post("/rag/channels", async (request, reply) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const body = (request.body ?? {}) as {
+    knowledgeBaseId?: string;
+    channelType?: string;
+    channelName?: string;
+  };
+  if (!body.knowledgeBaseId || !body.channelType || !body.channelName) {
+    return reply.code(400).send({ error: "CHANNEL_FIELDS_REQUIRED" });
+  }
+  const deployment = await (prisma as any).ragChannelDeployment.create({
+    data: {
+      knowledgeBaseId: body.knowledgeBaseId,
+      channelType: body.channelType,
+      channelName: body.channelName,
+      ownerId: userId,
+      status: "pending"
+    }
+  });
+  return reply.code(201).send(deployment);
+});
+
+app.delete("/rag/channels/:id", async (request, reply) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+  const deleted = await (prisma as any).ragChannelDeployment.deleteMany({
+    where: { id, ownerId: userId }
+  });
+  if (deleted.count === 0) return reply.code(404).send({ error: "CHANNEL_NOT_FOUND" });
+  return { deleted: true };
+});
+
+// ─── RAG Discussion Routes ─────────────────────────────────────────────────────
 
 app.get("/rag/discussions", async (request) => {
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  return listRagDiscussionSummaries(requester);
+  return listRagDiscussionSummaries(requesterUserId(request.headers as Record<string, unknown>));
 });
 
 app.post("/rag/discussions", async (request, reply) => {
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const thread = await createRagDiscussion(requester);
-  return reply.code(201).send(thread);
+  const { knowledgeBaseId } = (request.body ?? {}) as { knowledgeBaseId?: string };
+  try {
+    const headers = request.headers as Record<string, unknown>;
+    const thread = await createRagDiscussion(
+      requesterUserId(headers),
+      headers,
+      knowledgeBaseId
+    );
+    return reply.code(201).send(thread);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "RAG_DISCUSSION_CREATE_FAILED";
+    return reply.code(400).send({ error: message });
+  }
 });
 
 app.get("/rag/discussions/:id", async (request, reply) => {
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const threadId = String((request.params as { id: string }).id ?? "").trim();
-  const thread = await getRagDiscussionThread(threadId, requester);
-  if (!thread) {
-    return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
-  }
+  const thread = await getRagDiscussionThread(
+    (request.params as { id: string }).id,
+    requesterUserId(request.headers as Record<string, unknown>)
+  );
+  if (!thread) return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
   return thread;
 });
 
 app.post("/rag/discussions/:id/messages", async (request, reply) => {
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const threadId = String((request.params as { id: string }).id ?? "").trim();
-  const body = (request.body ?? {}) as { content?: string };
-  const content = normalizeRagMessageContent(body.content);
-  if (!content) {
-    return reply.code(400).send({ error: "RAG_MESSAGE_CONTENT_REQUIRED" });
-  }
+  const threadId = (request.params as { id: string }).id;
+  const { content } = (request.body ?? {}) as { content?: string };
   try {
-    const response = await appendRagDiscussionMessage(threadId, requester, content);
-    if (!response) {
-      return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
-    }
+    const response = await appendRagDiscussionMessage(
+      threadId,
+      requesterUserId(request.headers as Record<string, unknown>),
+      String(content ?? "")
+    );
+    if (!response) return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
     return response;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message === "RAG_MESSAGE_CONTENT_REQUIRED") {
-      return reply.code(400).send({ error: message });
-    }
-    return reply.code(502).send({
-      error: "RAG_FLOWISE_REQUEST_FAILED",
-      details: message
+    return reply.code(400).send({
+      error: error instanceof Error ? error.message : "RAG_DISCUSSION_SEND_FAILED"
     });
   }
 });
 
 app.delete("/rag/discussions/:id", async (request, reply) => {
   const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const threadId = String((request.params as { id: string }).id ?? "").trim();
+  const id = (request.params as { id: string }).id;
   const deleted = await prisma.ragDiscussionThread.deleteMany({
     where: {
-      id: threadId,
+      id,
       ownerId: requester
     }
   });
-  if (deleted.count === 0) {
-    return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
-  }
+  if (deleted.count === 0) return reply.code(404).send({ error: "RAG_DISCUSSION_NOT_FOUND" });
   return { deleted: true };
-});
-
-app.post("/planner/draft", async (request, reply) => {
-  const headers = request.headers as Record<string, unknown>;
-  const auth = requireAdmin(headers);
-  if (!auth.allowed) {
-    return reply.code(403).send(auth.error);
-  }
-  const body = (request.body ?? {}) as { prompt?: string; existingFlowDefinition?: WorkflowFlowDefinition };
-  const prompt = String(body.prompt ?? "").trim();
-  if (!prompt) {
-    return reply.code(400).send({ error: "PLANNER_PROMPT_REQUIRED" });
-  }
-  try {
-    const planner = await requestPlannerDraft(prompt, body.existingFlowDefinition);
-    const validation = await validateCanonicalFlow(planner.flowDefinition);
-    if (!validation.valid) {
-      return reply.code(400).send({
-        error: "PLANNER_FLOW_INVALID",
-        errors: validation.errors
-      });
-    }
-    const preview = buildPlannerPreview(body.existingFlowDefinition, planner.flowDefinition);
-    return {
-      flowDefinition: planner.flowDefinition,
-      summary: preview.summary,
-      changePreview: preview.changePreview,
-      diagnostics: {
-        planner: planner.diagnostics,
-        validated: true,
-        errors: [],
-        degraded: false
-      }
-    };
-  } catch (error) {
-    const flowDefinition = fallbackPlannerDraft(prompt, body.existingFlowDefinition);
-    const validation = await validateCanonicalFlow(flowDefinition);
-    if (!validation.valid) {
-      return reply.code(502).send({
-        error: "PLANNER_UNAVAILABLE",
-        details: error instanceof Error ? error.message : "Planner request failed",
-        validationErrors: validation.errors
-      });
-    }
-    const preview = buildPlannerPreview(body.existingFlowDefinition, flowDefinition);
-    return reply.code(200).send({
-      flowDefinition,
-      summary: preview.summary,
-      changePreview: preview.changePreview,
-      diagnostics: {
-        planner: {
-          attempts: 0,
-          plannerStatus: 0,
-          latencyMs: 0
-        },
-        validated: true,
-        errors: [],
-        degraded: true,
-        fallbackReason: error instanceof Error ? error.message : "Planner request failed"
-      }
-    });
-  }
-});
-
-app.post("/admin/reset/workflows-orders/preview", async (request, reply) => {
-  const auth = requireAdmin(request.headers as Record<string, unknown>);
-  if (!auth.allowed) return reply.code(403).send(auth.error);
-
-  const workflows = await prisma.workflow.findMany({ select: { id: true } });
-  const workflowIds = workflows.map((entry) => entry.id);
-  const versions = await prisma.workflowVersion.findMany({
-    where: { workflowId: { in: workflowIds.length > 0 ? workflowIds : ["__none__"] } },
-    select: { id: true }
-  });
-  const orders = await prisma.order.findMany({
-    where: { workflowVersionId: { in: versions.length > 0 ? versions.map((entry) => entry.id) : ["__none__"] } },
-    select: { id: true }
-  });
-  const orderCount = await prisma.order.count({
-    where: { workflowVersionId: { in: versions.length > 0 ? versions.map((entry) => entry.id) : ["__none__"] } }
-  });
-  const logCount = await prisma.executionLog.count({
-    where: {
-      orderId: { in: orders.length > 0 ? orders.map((entry) => entry.id) : ["__none__"] }
-    }
-  });
-  return {
-    scope: "workflows-orders",
-    dryRun: true,
-    resetInProgress,
-    counts: {
-      workflows: workflowIds.length,
-      workflowVersions: versions.length,
-      orders: orderCount,
-      logs: logCount
-    },
-    timestamp: new Date().toISOString()
-  };
-});
-
-app.post("/admin/reset/workflows-orders/execute", async (request, reply) => {
-  const auth = requireAdmin(request.headers as Record<string, unknown>);
-  if (!auth.allowed) return reply.code(403).send(auth.error);
-  if (resetInProgress) {
-    return reply.code(409).send({ error: "RESET_ALREADY_IN_PROGRESS" });
-  }
-
-  const body = (request.body ?? {}) as { dryRun?: boolean; confirmText?: string };
-  if (body.dryRun === true) {
-    return reply.code(400).send({ error: "USE_PREVIEW_ENDPOINT_FOR_DRY_RUN" });
-  }
-  if (String(body.confirmText ?? "") !== RESET_CONFIRM_TEXT) {
-    return reply.code(400).send({ error: "RESET_CONFIRMATION_REQUIRED", expected: RESET_CONFIRM_TEXT });
-  }
-
-  resetInProgress = true;
-  const startedAt = new Date();
-  const correlationId = String(request.headers["x-correlation-id"] ?? createCorrelationId("workflow-order-reset"));
-  try {
-    const workflows = await prisma.workflow.findMany({ select: { id: true } });
-    const workflowIds = workflows.map((entry) => entry.id);
-    const versions = await prisma.workflowVersion.findMany({
-      where: { workflowId: { in: workflowIds.length > 0 ? workflowIds : ["__none__"] } },
-      select: { id: true }
-    });
-    const versionIds = versions.map((entry) => entry.id);
-    const orders = await prisma.order.findMany({
-      where: { workflowVersionId: { in: versionIds.length > 0 ? versionIds : ["__none__"] } },
-      select: { id: true }
-    });
-    const orderIds = orders.map((entry) => entry.id);
-
-    const result = await prisma.$transaction(async (tx) => {
-      const deletedLogs = await tx.executionLog.deleteMany({
-        where: {
-          orderId: { in: orderIds.length > 0 ? orderIds : ["__none__"] }
-        }
-      });
-      const deletedAudits = await tx.workflowPublishAudit.deleteMany({
-        where: { workflowId: { in: workflowIds.length > 0 ? workflowIds : ["__none__"] } }
-      });
-      const deletedOrders = await tx.order.deleteMany({
-        where: { id: { in: orderIds.length > 0 ? orderIds : ["__none__"] } }
-      });
-      const deletedVersions = await tx.workflowVersion.deleteMany({
-        where: { id: { in: versionIds.length > 0 ? versionIds : ["__none__"] } }
-      });
-      const deletedWorkflows = await tx.workflow.deleteMany({
-        where: { id: { in: workflowIds.length > 0 ? workflowIds : ["__none__"] } }
-      });
-      return {
-        logs: deletedLogs.count,
-        publishAudits: deletedAudits.count,
-        orders: deletedOrders.count,
-        workflowVersions: deletedVersions.count,
-        workflows: deletedWorkflows.count
-      };
-    });
-
-    return {
-      scope: "workflows-orders",
-      dryRun: false,
-      correlationId,
-      startedAt: startedAt.toISOString(),
-      finishedAt: new Date().toISOString(),
-      counts: result
-    };
-  } finally {
-    resetInProgress = false;
-  }
-});
-
-app.get("/workflows/:id/publish-audits", async (request) => {
-  const id = (request.params as { id: string }).id;
-  return prisma.workflowPublishAudit.findMany({
-    where: { workflowId: id },
-    orderBy: { createdAt: "desc" },
-    take: 100
-  });
 });
 
 app.get("/admin/secrets", async (request, reply) => {
@@ -1770,8 +2150,6 @@ app.get("/admin/secrets", async (request, reply) => {
     const metadataPayload = metadataResponse.ok
       ? ((await metadataResponse.json()) as { data?: { current_version?: number; updated_time?: string } })
       : {};
-    const updatedAt = metadataPayload.data?.updated_time;
-    const version = metadataPayload.data?.current_version ?? 0;
     return {
       scope: String(query.scope ?? "global").trim().toLowerCase(),
       username: query.username ?? null,
@@ -1780,8 +2158,8 @@ app.get("/admin/secrets", async (request, reply) => {
       secrets: Object.keys(dataPayload).map((key) => ({
         key,
         value: "***",
-        version,
-        updatedAt: updatedAt ?? null
+        version: metadataPayload.data?.current_version ?? 0,
+        updatedAt: metadataPayload.data?.updated_time ?? null
       }))
     };
   } catch (error) {
@@ -1797,75 +2175,6 @@ app.get("/admin/secrets/catalog", async (request, reply) => {
   try {
     const [globalPaths, userPaths] = await Promise.all([listVaultLeafPaths("platform/global"), listVaultLeafPaths("platform/users")]);
     const paths = [...new Set([...globalPaths, ...userPaths])].sort().slice(0, limit);
-    const integrationMap = new Map(
-      (
-        await prisma.integrationProfile.findMany({
-          select: { id: true, name: true, ownerId: true }
-        })
-      ).map((entry) => [entry.id, entry])
-    );
-    const environmentMap = new Map(
-      (
-        await prisma.userEnvironment.findMany({
-          select: { id: true, name: true, ownerId: true }
-        })
-      ).map((entry) => [entry.id, entry])
-    );
-
-    function enrichPathMeta(path: string): {
-      purpose: string;
-      ownerId: string | null;
-      resourceType: string;
-      resourceId: string | null;
-      resourceName: string | null;
-      workflowCount: number | null;
-    } {
-      const integrationMatch = path.match(/^platform\/users\/([^/]+)\/integration\/([^/]+)$/);
-      if (integrationMatch) {
-        const [, ownerId, integrationId] = integrationMatch;
-        const integration = integrationMap.get(integrationId);
-        return {
-          purpose: "Integration Credential",
-          ownerId,
-          resourceType: "integration",
-          resourceId: integrationId,
-          resourceName: integration?.name ?? null,
-          workflowCount: null
-        };
-      }
-      const environmentMatch = path.match(/^platform\/users\/([^/]+)\/environment\/([^/]+)$/);
-      if (environmentMatch) {
-        const [, ownerId, environmentId] = environmentMatch;
-        const environment = environmentMap.get(environmentId);
-        return {
-          purpose: "Environment Secret Backup",
-          ownerId,
-          resourceType: "environment",
-          resourceId: environmentId,
-          resourceName: environment?.name ?? null,
-          workflowCount: null
-        };
-      }
-      if (path.startsWith("platform/global/")) {
-        return {
-          purpose: "Global Shared Secret",
-          ownerId: null,
-          resourceType: "global",
-          resourceId: null,
-          resourceName: null,
-          workflowCount: null
-        };
-      }
-      return {
-        purpose: "Platform Secret",
-        ownerId: null,
-        resourceType: "other",
-        resourceId: null,
-        resourceName: null,
-        workflowCount: null
-      };
-    }
-
     const items: Array<{
       path: string;
       key: string;
@@ -1877,17 +2186,12 @@ app.get("/admin/secrets/catalog", async (request, reply) => {
       resourceType: string;
       resourceId: string | null;
       resourceName: string | null;
-      workflowCount: number | null;
     }> = [];
+
     for (const path of paths) {
       const [data, metadata] = await Promise.all([readVaultKv(path), readVaultKvMetadata(path)]);
-      const meta = enrichPathMeta(path);
-      let workflowCount = meta.workflowCount;
-      if (meta.resourceType === "integration" && meta.resourceId) {
-        workflowCount = (await findIntegrationWorkflowUsage(meta.resourceId)).length;
-      } else if (meta.resourceType === "environment" && meta.resourceId) {
-        workflowCount = (await findEnvironmentWorkflowUsage(meta.resourceId)).length;
-      }
+      const userMatch = path.match(/^platform\/users\/([^/]+)\//);
+      const isGlobal = path.startsWith("platform/global/");
       for (const key of Object.keys(data).sort()) {
         items.push({
           path,
@@ -1895,12 +2199,11 @@ app.get("/admin/secrets/catalog", async (request, reply) => {
           value: "***",
           version: metadata.version,
           updatedAt: metadata.updatedAt,
-          purpose: meta.purpose,
-          ownerId: meta.ownerId,
-          resourceType: meta.resourceType,
-          resourceId: meta.resourceId,
-          resourceName: meta.resourceName,
-          workflowCount
+          purpose: isGlobal ? "Global platform secret" : "User platform secret",
+          ownerId: userMatch?.[1] ?? null,
+          resourceType: isGlobal ? "global" : "user",
+          resourceId: null,
+          resourceName: null
         });
       }
     }
@@ -1920,11 +2223,10 @@ app.post("/admin/secrets/by-path", async (request, reply) => {
   const body = (request.body ?? {}) as { path?: string; key?: string; value?: unknown };
   const path = sanitizeLogicalPath(String(body.path ?? ""));
   const key = String(body.key ?? "").trim();
-  const value = String(body.value ?? "");
   if (!key) return reply.code(400).send({ error: "SECRET_KEY_REQUIRED" });
   try {
     const data = await readVaultKv(path);
-    data[key] = value;
+    data[key] = String(body.value ?? "");
     await writeVaultKv(path, data);
     return reply.code(201).send({ path, key, value: "***", updatedAt: new Date().toISOString() });
   } catch (error) {
@@ -1938,14 +2240,11 @@ app.patch("/admin/secrets/by-path", async (request, reply) => {
   const body = (request.body ?? {}) as { path?: string; key?: string; value?: unknown };
   const path = sanitizeLogicalPath(String(body.path ?? ""));
   const key = String(body.key ?? "").trim();
-  const value = String(body.value ?? "");
   if (!key) return reply.code(400).send({ error: "SECRET_KEY_REQUIRED" });
   try {
     const data = await readVaultKv(path);
-    if (!(key in data)) {
-      return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
-    }
-    data[key] = value;
+    if (!(key in data)) return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
+    data[key] = String(body.value ?? "");
     await writeVaultKv(path, data);
     return { path, key, value: "***", updatedAt: new Date().toISOString() };
   } catch (error) {
@@ -1962,15 +2261,11 @@ app.delete("/admin/secrets/by-path", async (request, reply) => {
   try {
     if (!key) {
       const response = await vaultCall("DELETE", secretMetadataPath(path));
-      if (!response.ok && response.status !== 404) {
-        return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: path });
-      }
+      if (!response.ok && response.status !== 404) return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: path });
       return { deleted: true, path };
     }
     const data = await readVaultKv(path);
-    if (!(key in data)) {
-      return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
-    }
+    if (!(key in data)) return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
     delete data[key];
     await writeVaultKv(path, data);
     return { deleted: true, path, key };
@@ -1985,7 +2280,6 @@ app.post("/admin/secrets", async (request, reply) => {
   const body = (request.body ?? {}) as { scope?: string; username?: string; group?: string; key?: string; value?: unknown };
   const key = String(body.key ?? "").trim();
   if (!key) return reply.code(400).send({ error: "SECRET_KEY_REQUIRED" });
-  const value = String(body.value ?? "");
   try {
     const logicalPath = secretLogicalPath({
       scope: String(body.scope ?? "global").trim().toLowerCase(),
@@ -1993,17 +2287,9 @@ app.post("/admin/secrets", async (request, reply) => {
       group: body.group
     });
     const existing = await readVaultKv(logicalPath);
-    existing[key] = value;
+    existing[key] = String(body.value ?? "");
     await writeVaultKv(logicalPath, existing);
-    return reply.code(201).send({
-      scope: String(body.scope ?? "global").trim().toLowerCase(),
-      username: body.username ?? null,
-      group: body.group ?? "default",
-      path: logicalPath,
-      key,
-      value: "***",
-      updatedAt: new Date().toISOString()
-    });
+    return reply.code(201).send({ path: logicalPath, key, value: "***", updatedAt: new Date().toISOString() });
   } catch (error) {
     return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: error instanceof Error ? error.message : String(error) });
   }
@@ -2015,7 +2301,6 @@ app.patch("/admin/secrets", async (request, reply) => {
   const body = (request.body ?? {}) as { scope?: string; username?: string; group?: string; key?: string; value?: unknown };
   const key = String(body.key ?? "").trim();
   if (!key) return reply.code(400).send({ error: "SECRET_KEY_REQUIRED" });
-  const value = String(body.value ?? "");
   try {
     const logicalPath = secretLogicalPath({
       scope: String(body.scope ?? "global").trim().toLowerCase(),
@@ -2023,20 +2308,10 @@ app.patch("/admin/secrets", async (request, reply) => {
       group: body.group
     });
     const existing = await readVaultKv(logicalPath);
-    if (!(key in existing)) {
-      return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
-    }
-    existing[key] = value;
+    if (!(key in existing)) return reply.code(404).send({ error: "VAULT_SECRET_NOT_FOUND", details: key });
+    existing[key] = String(body.value ?? "");
     await writeVaultKv(logicalPath, existing);
-    return {
-      scope: String(body.scope ?? "global").trim().toLowerCase(),
-      username: body.username ?? null,
-      group: body.group ?? "default",
-      path: logicalPath,
-      key,
-      value: "***",
-      updatedAt: new Date().toISOString()
-    };
+    return { path: logicalPath, key, value: "***", updatedAt: new Date().toISOString() };
   } catch (error) {
     return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: error instanceof Error ? error.message : String(error) });
   }
@@ -2055,9 +2330,7 @@ app.delete("/admin/secrets", async (request, reply) => {
     const key = String(body.key ?? "").trim();
     if (!key) {
       const response = await vaultCall("DELETE", secretMetadataPath(logicalPath));
-      if (!response.ok && response.status !== 404) {
-        return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: logicalPath });
-      }
+      if (!response.ok && response.status !== 404) return reply.code(400).send({ error: "VAULT_WRITE_FAILED", details: logicalPath });
       return { deleted: true, path: logicalPath };
     }
     const existing = await readVaultKv(logicalPath);
@@ -2070,1100 +2343,166 @@ app.delete("/admin/secrets", async (request, reply) => {
   }
 });
 
-app.get("/admin/secrets/usage", async (request, reply) => {
-  const auth = requireAdmin(request.headers as Record<string, unknown>);
-  if (!auth.allowed) return reply.code(403).send(auth.error);
-  const query = request.query as { ref?: string };
-  const ref = String(query.ref ?? "").trim();
-  if (!ref) return reply.code(400).send({ error: "SECRET_REF_REQUIRED" });
-  const [integrations, environments, versions] = await Promise.all([
-    prisma.integrationProfile.findMany({ select: { id: true, name: true, ownerId: true, credentialJson: true } }),
-    prisma.userEnvironment.findMany({ select: { id: true, name: true, ownerId: true, variablesJson: true } }),
-    prisma.workflowVersion.findMany({ select: { id: true, workflowId: true, version: true, nodesJson: true } })
-  ]);
-  const inIntegrations = integrations.filter((entry) => JSON.stringify(entry.credentialJson ?? {}).includes(ref));
-  const inEnvironments = environments.filter((entry) => JSON.stringify(entry.variablesJson ?? {}).includes(ref));
-  const inWorkflows = versions.filter((entry) => JSON.stringify(entry.nodesJson ?? {}).includes(ref));
-  return {
-    ref,
-    usage: {
-      integrations: inIntegrations.map((entry) => ({ id: entry.id, name: entry.name, ownerId: entry.ownerId })),
-      environments: inEnvironments.map((entry) => ({ id: entry.id, name: entry.name, ownerId: entry.ownerId })),
-      workflows: inWorkflows.map((entry) => ({ id: entry.id, workflowId: entry.workflowId, version: entry.version }))
-    }
-  };
-});
-
 app.post("/admin/secrets/migrate", async (request, reply) => {
   const auth = requireAdmin(request.headers as Record<string, unknown>);
   if (!auth.allowed) return reply.code(403).send(auth.error);
-  const migrationId = `mig_${Date.now()}`;
-  const report: {
-    migrationId: string;
-    converted: number;
-    skipped: number;
-    failed: number;
-    rollbackMap: Array<{ entityType: string; entityId: string; path: string; vaultRef: string; backupRef: string }>;
-    errors: Array<{ entityType: string; entityId: string; path: string; error: string }>;
-  } = { migrationId, converted: 0, skipped: 0, failed: 0, rollbackMap: [], errors: [] };
-
-  function pathKey(path: string[]): string {
-    return path.join("_").replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
-  }
-
-  async function migrateObjectSecrets(input: {
-    entityType: "integration" | "environment";
-    entityId: string;
-    ownerId: string;
-    object: Record<string, unknown>;
-    disallowSensitive: boolean;
-  }): Promise<Record<string, unknown>> {
-    const clone = JSON.parse(JSON.stringify(input.object)) as Record<string, unknown>;
-    async function visit(node: unknown, path: string[]): Promise<void> {
-      if (!node || typeof node !== "object") return;
-      for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-        const nextPath = [...path, key];
-        if (value && typeof value === "object") {
-          await visit(value, nextPath);
-          continue;
-        }
-        if (!SENSITIVE_KEY_PATTERN.test(key)) continue;
-        if (typeof value !== "string" || value.length === 0) {
-          report.skipped += 1;
-          continue;
-        }
-        if (value.startsWith("vault:")) {
-          report.skipped += 1;
-          continue;
-        }
-        if (value.startsWith("env:")) {
-          report.failed += 1;
-          report.errors.push({
-            entityType: input.entityType,
-            entityId: input.entityId,
-            path: nextPath.join("."),
-            error: "ENV_SECRET_REF_BLOCKED"
-          });
-          continue;
-        }
-        if (input.disallowSensitive) {
-          report.failed += 1;
-          report.errors.push({
-            entityType: input.entityType,
-            entityId: input.entityId,
-            path: nextPath.join("."),
-            error: "PLAINTEXT_SECRET_BLOCKED"
-          });
-          continue;
-        }
-        const targetLogicalPath = `platform/users/${input.ownerId}/${input.entityType}/${input.entityId}`;
-        const backupLogicalPath = `platform/global/migration-backup/${migrationId}/${input.entityType}/${input.entityId}`;
-        const keyName = pathKey(nextPath);
-        const target = await readVaultKv(targetLogicalPath);
-        target[keyName] = value;
-        await writeVaultKv(targetLogicalPath, target);
-        const backup = await readVaultKv(backupLogicalPath);
-        backup[keyName] = value;
-        await writeVaultKv(backupLogicalPath, backup);
-        (node as Record<string, unknown>)[key] = `vault:${secretDataPath(targetLogicalPath)}#${keyName}`;
-        report.converted += 1;
-        report.rollbackMap.push({
-          entityType: input.entityType,
-          entityId: input.entityId,
-          path: nextPath.join("."),
-          vaultRef: `vault:${secretDataPath(targetLogicalPath)}#${keyName}`,
-          backupRef: `vault:${secretDataPath(backupLogicalPath)}#${keyName}`
-        });
-      }
-    }
-    await visit(clone, []);
-    return clone;
-  }
-
-  const [integrations, environments] = await Promise.all([
-    prisma.integrationProfile.findMany({ select: { id: true, ownerId: true, credentialJson: true } }),
-    prisma.userEnvironment.findMany({ select: { id: true, ownerId: true, variablesJson: true } })
-  ]);
-
-  for (const integration of integrations) {
-    try {
-      const next = await migrateObjectSecrets({
-        entityType: "integration",
-        entityId: integration.id,
-        ownerId: integration.ownerId,
-        object: toJsonObject(integration.credentialJson),
-        disallowSensitive: false
-      });
-      await prisma.integrationProfile.update({
-        where: { id: integration.id },
-        data: { credentialJson: next as any }
-      });
-    } catch (error) {
-      report.failed += 1;
-      report.errors.push({
-        entityType: "integration",
-        entityId: integration.id,
-        path: "credentialJson",
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
-
-  for (const environment of environments) {
-    try {
-      await migrateObjectSecrets({
-        entityType: "environment",
-        entityId: environment.id,
-        ownerId: environment.ownerId,
-        object: toJsonObject(environment.variablesJson),
-        disallowSensitive: true
-      });
-    } catch (error) {
-      report.failed += 1;
-      report.errors.push({
-        entityType: "environment",
-        entityId: environment.id,
-        path: "variablesJson",
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
-
-  return report;
-});
-
-app.post("/node-templates/import", async (request, reply) => {
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const definition = normalizeNodeTemplateDefinition(request.body);
-  const created = await prisma.nodeTemplate.create({
-    data: {
-      ownerId: requester,
-      name: definition.name,
-      description: definition.description,
-      category: definition.category,
-      tagsJson: definition.tags ?? [],
-      nodeType: definition.config.nodeType,
-      configJson: toJsonObject(definition.config),
-      metadataJson: toJsonObject(definition.metadata ?? {})
-    },
-    include: { shares: true }
+  return reply.code(202).send({
+    migrationId: `noop_${Date.now()}`,
+    converted: 0,
+    skipped: 0,
+    failed: 0,
+    rollbackMap: [],
+    errors: [],
+    message: "No migration targets remain after workflow/execution feature removal."
   });
-  return reply.code(201).send(mapNodeTemplateRecord(created, requester, admin));
 });
 
-app.post("/node-templates", async (request, reply) => {
-  const body = (request.body ?? {}) as Record<string, unknown>;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const definition = normalizeNodeTemplateDefinition(body);
-  const created = await prisma.nodeTemplate.create({
-    data: {
-      ownerId: requester,
-      name: definition.name,
-      description: definition.description,
-      category: definition.category,
-      tagsJson: definition.tags ?? [],
-      nodeType: definition.config.nodeType,
-      configJson: toJsonObject(definition.config),
-      metadataJson: toJsonObject(definition.metadata ?? {})
-    },
-    include: { shares: true }
-  });
-  return reply.code(201).send(mapNodeTemplateRecord(created, requester, admin));
-});
+// ─── Internal OAuth token endpoints (called by api-gateway only) ─────────────
 
-app.get("/node-templates", async (request) => {
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const query = request.query as { scope?: string; limit?: string };
-  const scope = parseScope(query.scope);
-  const limit = Math.min(Math.max(Number(query.limit ?? 100) || 100, 1), 500);
-  return listNodeTemplates(requester, admin, scope, limit);
-});
+const INTERNAL_OAUTH_SECRET = String(process.env.PLATFORM_OAUTH_SECRET ?? "").trim();
 
-app.get("/node-templates/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadNodeTemplateWithAccess(id, requester, admin);
-  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_ACCESS" });
-  return mapNodeTemplateRecord(access.template, requester, admin);
-});
-
-app.patch("/node-templates/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadNodeTemplateWithAccess(id, requester, admin);
-  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_MUTATION" });
-
-  const currentDefinition = normalizeNodeTemplateDefinition({
-    name: access.template.name,
-    description: access.template.description ?? undefined,
-    category: access.template.category ?? undefined,
-    tags: access.template.tagsJson,
-    config: access.template.configJson,
-    metadata: access.template.metadataJson
-  });
-  const body = (request.body ?? {}) as Record<string, unknown>;
-  const nextDefinition = normalizeNodeTemplateDefinition({
-    name: body.name ?? currentDefinition.name,
-    description: body.description ?? currentDefinition.description,
-    category: body.category ?? currentDefinition.category,
-    tags: body.tags ?? currentDefinition.tags,
-    config: body.config ?? currentDefinition.config,
-    metadata: body.metadata ?? currentDefinition.metadata
-  });
-
-  const updated = await prisma.nodeTemplate.update({
-    where: { id },
-    data: {
-      name: nextDefinition.name,
-      description: nextDefinition.description,
-      category: nextDefinition.category,
-      tagsJson: nextDefinition.tags ?? [],
-      nodeType: nextDefinition.config.nodeType,
-      configJson: toJsonObject(nextDefinition.config),
-      metadataJson: toJsonObject(nextDefinition.metadata ?? {})
-    },
-    include: { shares: true }
-  });
-  return mapNodeTemplateRecord(updated, requester, admin);
-});
-
-app.delete("/node-templates/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadNodeTemplateWithAccess(id, requester, admin);
-  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_MUTATION" });
-  await prisma.nodeTemplate.delete({ where: { id } });
-  return { deleted: true, templateId: id };
-});
-
-app.post("/node-templates/:id/duplicate", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadNodeTemplateWithAccess(id, requester, admin);
-  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_ACCESS" });
-  const body = (request.body ?? {}) as { name?: string };
-  const name = String(body.name ?? `${access.template.name} Copy`).trim();
-  if (!name) return reply.code(400).send({ error: "NODE_TEMPLATE_NAME_REQUIRED" });
-  const copy = await prisma.nodeTemplate.create({
-    data: {
-      ownerId: requester,
-      name,
-      description: access.template.description,
-      category: access.template.category,
-      tagsJson: access.template.tagsJson ?? [],
-      nodeType: access.template.nodeType,
-      configJson: toJsonObject(access.template.configJson),
-      metadataJson: toJsonObject(access.template.metadataJson ?? {})
-    },
-    include: { shares: true }
-  });
-  return reply.code(201).send(mapNodeTemplateRecord(copy, requester, admin));
-});
-
-app.get("/node-templates/:id/shares", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadNodeTemplateWithAccess(id, requester, admin);
-  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_ACCESS" });
-  return access.template.shares.map((entry) => ({
-    username: entry.sharedWithUserId,
-    createdBy: entry.createdBy,
-    createdAt: entry.createdAt
-  }));
-});
-
-app.post("/node-templates/:id/share", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { username?: string };
-  const username = String(body.username ?? "").trim();
-  if (!username) return reply.code(400).send({ error: "SHARE_USERNAME_REQUIRED" });
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadNodeTemplateWithAccess(id, requester, admin);
-  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_SHARE" });
-  if (username === access.template.ownerId) return reply.code(400).send({ error: "OWNER_ALREADY_HAS_ACCESS" });
-  await prisma.nodeTemplateShare.upsert({
-    where: { templateId_sharedWithUserId: { templateId: id, sharedWithUserId: username } },
-    create: {
-      templateId: id,
-      sharedWithUserId: username,
-      createdBy: requester
-    },
-    update: {}
-  });
-  const updated = await prisma.nodeTemplate.findUnique({
-    where: { id },
-    include: { shares: true }
-  });
-  return mapNodeTemplateRecord(updated!, requester, admin);
-});
-
-app.delete("/node-templates/:id/share/:username", async (request, reply) => {
-  const params = request.params as { id: string; username: string };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadNodeTemplateWithAccess(params.id, requester, admin);
-  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_SHARE" });
-  await prisma.nodeTemplateShare.deleteMany({
-    where: {
-      templateId: params.id,
-      sharedWithUserId: params.username
-    }
-  });
-  const updated = await prisma.nodeTemplate.findUnique({
-    where: { id: params.id },
-    include: { shares: true }
-  });
-  return mapNodeTemplateRecord(updated!, requester, admin);
-});
-
-app.get("/node-templates/:id/export", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadNodeTemplateWithAccess(id, requester, admin);
-  if (!access.template) return reply.code(404).send({ error: "NODE_TEMPLATE_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_NODE_TEMPLATE_ACCESS" });
-  const record = mapNodeTemplateRecord(access.template, requester, admin);
-  return {
-    schemaVersion: "v1",
-    name: record.name,
-    description: record.description,
-    category: record.category,
-    tags: record.tags,
-    config: record.config,
-    metadata: record.metadata ?? {}
-  };
-});
-
-app.post("/integrations", async (request, reply) => {
-  const body = (request.body ?? {}) as {
-    name?: string;
-    ownerId?: string;
-    executionType?: ExecutionType;
-    authType?: IntegrationAuthType;
-    baseConfig?: Record<string, unknown>;
-    credentials?: Record<string, unknown>;
-  };
-  const name = String(body.name ?? "").trim();
-  if (!name) {
-    return reply.code(400).send({ error: "INTEGRATION_NAME_REQUIRED" });
-  }
-
-  const executionType = normalizeExecutionType(body.executionType);
-  if (!executionType) {
-    return reply.code(400).send({ error: "INTEGRATION_EXECUTION_TYPE_INVALID" });
-  }
-
-  const authType = normalizeAuthType(body.authType ?? "API_KEY");
-  if (!authType) {
-    return reply.code(400).send({ error: "INTEGRATION_AUTH_TYPE_INVALID" });
-  }
-  const credentialObject = toJsonObject(body.credentials);
-  const credentialIssues = validateSecretFields(credentialObject, {
-    pathPrefix: "integration.credentials",
-    allowSensitiveKeys: true,
-    requireVaultRefForSensitive: true
-  });
-  if (credentialIssues.length > 0) {
-    return reply.code(400).send({ error: credentialIssues[0].code, details: credentialIssues[0].message, issues: credentialIssues });
-  }
-  const refs = [...collectAllVaultRefs(credentialObject)];
-  for (const ref of refs) {
-    const exists = await vaultRefExists(ref);
-    if (!exists) {
-      return reply.code(400).send({ error: "VAULT_SECRET_NOT_FOUND", details: ref });
-    }
-  }
-
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const ownerId = String(body.ownerId ?? requester).trim() || requester;
-  if (ownerId !== requester && !isAdmin(request.headers as Record<string, unknown>)) {
-    return reply.code(403).send({ error: "FORBIDDEN_OWNER_OVERRIDE" });
-  }
-
-  const integration = await prisma.integrationProfile.create({
-    data: {
-      name,
-      ownerId,
-      executionType,
-      authType,
-      lifecycleState: "ACTIVE",
-      isActive: true,
-      baseConfigJson: toJsonObject(body.baseConfig),
-      credentialJson: credentialObject
-    },
-    include: { shares: true }
-  });
-
-  return reply.code(201).send(toIntegrationResponse(integration, requester, isAdmin(request.headers as Record<string, unknown>)));
-});
-
-app.get("/integrations", async (request) => {
-  const query = request.query as { ownerId?: string; includeAll?: string; limit?: string; scope?: string };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const includeAll = query.includeAll === "true";
-  const requestedOwner = String(query.ownerId ?? "").trim();
-  const ownerId = admin ? requestedOwner || requester : requester;
-  const scope = parseScope(query.scope);
-  const limit = Math.min(Math.max(Number(query.limit ?? 100) || 100, 1), 500);
-
-  if (includeAll && admin) {
-    const all = await prisma.integrationProfile.findMany({
-      include: { shares: true },
-      orderBy: [{ updatedAt: "desc" }],
-      take: limit
-    });
-    return all.map((integration) => toIntegrationResponse(integration, requester, admin));
-  }
-
-  if (scope === "shared") {
-    const shared = await prisma.integrationShare.findMany({
-      where: { sharedWithUserId: requester },
-      include: { integration: { include: { shares: true } } },
-      orderBy: [{ createdAt: "desc" }],
-      take: limit
-    });
-    return shared.map((entry) => toIntegrationResponse(entry.integration, requester, admin));
-  }
-
-  if (scope === "all") {
-    const [owned, shared] = await Promise.all([
-      prisma.integrationProfile.findMany({
-        where: { ownerId },
-        include: { shares: true },
-        orderBy: [{ updatedAt: "desc" }],
-        take: limit
-      }),
-      prisma.integrationShare.findMany({
-        where: { sharedWithUserId: requester },
-        include: { integration: { include: { shares: true } } },
-        orderBy: [{ createdAt: "desc" }],
-        take: limit
-      })
-    ]);
-    const merged = uniqueById([...owned, ...shared.map((entry) => entry.integration)]).slice(0, limit);
-    return merged.map((integration) => toIntegrationResponse(integration, requester, admin));
-  }
-
-  const owned = await prisma.integrationProfile.findMany({
-    where: { ownerId },
-    include: { shares: true },
-    orderBy: [{ updatedAt: "desc" }],
-    take: limit
-  });
-  return owned.map((integration) => toIntegrationResponse(integration, requester, admin));
-});
-
-app.get("/integrations/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) {
-    return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  }
-  if (!access.allowed) {
-    return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_ACCESS" });
-  }
-  return toIntegrationResponse(access.integration, requester, admin);
-});
-
-app.patch("/integrations/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as {
-    name?: string;
-    executionType?: ExecutionType;
-    authType?: IntegrationAuthType;
-    baseConfig?: Record<string, unknown>;
-    credentials?: Record<string, unknown>;
-  };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_MUTATION" });
-
-  const data: Record<string, unknown> = {};
-  if (body.name !== undefined) {
-    const name = String(body.name).trim();
-    if (!name) return reply.code(400).send({ error: "INTEGRATION_NAME_REQUIRED" });
-    data.name = name;
-  }
-  if (body.executionType !== undefined) {
-    const executionType = normalizeExecutionType(body.executionType);
-    if (!executionType) return reply.code(400).send({ error: "INTEGRATION_EXECUTION_TYPE_INVALID" });
-    data.executionType = executionType;
-  }
-  if (body.authType !== undefined) {
-    const authType = normalizeAuthType(body.authType);
-    if (!authType) return reply.code(400).send({ error: "INTEGRATION_AUTH_TYPE_INVALID" });
-    data.authType = authType;
-  }
-  if (body.baseConfig !== undefined) data.baseConfigJson = toJsonObject(body.baseConfig);
-  if (body.credentials !== undefined) {
-    const credentialObject = toJsonObject(body.credentials);
-    const credentialIssues = validateSecretFields(credentialObject, {
-      pathPrefix: "integration.credentials",
-      allowSensitiveKeys: true,
-      requireVaultRefForSensitive: true
-    });
-    if (credentialIssues.length > 0) {
-      return reply.code(400).send({ error: credentialIssues[0].code, details: credentialIssues[0].message, issues: credentialIssues });
-    }
-    const refs = [...collectAllVaultRefs(credentialObject)];
-    for (const ref of refs) {
-      const exists = await vaultRefExists(ref);
-      if (!exists) {
-        return reply.code(400).send({ error: "VAULT_SECRET_NOT_FOUND", details: ref });
-      }
-    }
-    data.credentialJson = credentialObject;
-  }
-
-  const updated = await prisma.integrationProfile.update({
-    where: { id },
-    data,
-    include: { shares: true }
-  });
-  return toIntegrationResponse(updated, requester, admin);
-});
-
-app.get("/integrations/:id/shares", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_ACCESS" });
-  return access.integration.shares.map((entry) => ({
-    username: entry.sharedWithUserId,
-    createdBy: entry.createdBy,
-    createdAt: entry.createdAt
-  }));
-});
-
-app.post("/integrations/:id/share", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { username?: string };
-  const username = String(body.username ?? "").trim();
-  if (!username) {
-    return reply.code(400).send({ error: "SHARE_USERNAME_REQUIRED" });
-  }
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_SHARE" });
-  if (username === access.integration.ownerId) {
-    return reply.code(400).send({ error: "OWNER_ALREADY_HAS_ACCESS" });
-  }
-  await prisma.integrationShare.upsert({
-    where: { integrationId_sharedWithUserId: { integrationId: id, sharedWithUserId: username } },
-    create: {
-      integrationId: id,
-      sharedWithUserId: username,
-      createdBy: requester
-    },
-    update: {}
-  });
-  const updated = await prisma.integrationProfile.findUnique({
-    where: { id },
-    include: { shares: true }
-  });
-  return toIntegrationResponse(updated!, requester, admin);
-});
-
-app.delete("/integrations/:id/share/:username", async (request, reply) => {
-  const params = request.params as { id: string; username: string };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(params.id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_SHARE" });
-  await prisma.integrationShare.deleteMany({
-    where: {
-      integrationId: params.id,
-      sharedWithUserId: params.username
-    }
-  });
-  const updated = await prisma.integrationProfile.findUnique({
-    where: { id: params.id },
-    include: { shares: true }
-  });
-  return toIntegrationResponse(updated!, requester, admin);
-});
-
-app.post("/integrations/:id/duplicate", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { name?: string };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_ACCESS" });
-  const name = String(body.name ?? `${access.integration.name} Copy`).trim();
-  if (!name) return reply.code(400).send({ error: "INTEGRATION_NAME_REQUIRED" });
-  const copy = await prisma.integrationProfile.create({
-    data: {
-      name,
-      ownerId: requester,
-      executionType: access.integration.executionType,
-      authType: access.integration.authType,
-      lifecycleState: "ACTIVE",
-      isActive: true,
-      baseConfigJson: toJsonObject(access.integration.baseConfigJson),
-      credentialJson: toJsonObject(access.integration.credentialJson)
-    },
-    include: { shares: true }
-  });
-  return reply.code(201).send(toIntegrationResponse(copy, requester, admin));
-});
-
-app.get("/integrations/:id/usage", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_ACCESS" });
-  const workflows = await findIntegrationWorkflowUsage(id);
-  return { integrationId: id, inUse: workflows.length > 0, workflows };
-});
-
-app.post("/integrations/:id/activate", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_LCM" });
-  const updated = await prisma.integrationProfile.update({
-    where: { id },
-    data: { lifecycleState: "ACTIVE", isActive: true },
-    include: { shares: true }
-  });
-  return toIntegrationResponse(updated, requester, admin);
-});
-
-app.post("/integrations/:id/deactivate", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_LCM" });
-  const workflows = await findIntegrationWorkflowUsage(id);
-  if (workflows.length > 0) {
-    return reply.code(409).send({
-      error: "INTEGRATION_IN_USE",
-      warning: "This integration is currently referenced by workflows and cannot be deactivated.",
-      workflows
-    });
-  }
-  const updated = await prisma.integrationProfile.update({
-    where: { id },
-    data: { lifecycleState: "INACTIVE", isActive: false },
-    include: { shares: true }
-  });
-  return toIntegrationResponse(updated, requester, admin);
-});
-
-app.delete("/integrations/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_LCM" });
-  const workflows = await findIntegrationWorkflowUsage(id);
-  if (workflows.length > 0) {
-    return reply.code(409).send({
-      error: "INTEGRATION_IN_USE",
-      warning: "This integration is currently referenced by workflows and cannot be terminated.",
-      workflows
-    });
-  }
-  await prisma.integrationProfile.delete({ where: { id } });
-  return { deleted: true, integrationId: id };
-});
-
-app.post("/integrations/:id/test", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as {
-    commandRef?: string;
-    timeoutMs?: number;
-    input?: Record<string, unknown>;
-    environmentId?: string;
-  };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadIntegrationWithAccess(id, requester, admin);
-  if (!access.integration) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_INTEGRATION_ACCESS" });
-  if (!access.integration.isActive) {
-    return reply.code(400).send({ error: "INTEGRATION_NOT_ACTIVE" });
-  }
-
-  let environmentVariables: Record<string, unknown> = {};
-  if (body.environmentId) {
-    const envAccess = await loadEnvironmentWithAccess(body.environmentId, requester, admin);
-    if (!envAccess.environment) return reply.code(404).send({ error: "ENVIRONMENT_NOT_FOUND" });
-    if (!envAccess.allowed) return reply.code(403).send({ error: "FORBIDDEN_ENVIRONMENT_ACCESS" });
-    environmentVariables = toJsonObject(envAccess.environment.variablesJson);
-  }
-
-  const baseConfig = toJsonObject(access.integration.baseConfigJson);
-  const credentials = toJsonObject(access.integration.credentialJson);
-  const commandRef =
-    String(body.commandRef ?? "").trim() ||
-    String(baseConfig.healthPath ?? "").trim() ||
-    String(baseConfig.path ?? "").trim() ||
-    String(baseConfig.url ?? "").trim() ||
-    String(baseConfig.baseUrl ?? "").trim();
-  if (!commandRef) {
-    return reply.code(400).send({ error: "INTEGRATION_TEST_COMMAND_REQUIRED" });
-  }
-
+function verifyInternalSecret(request: any): boolean {
+  if (!INTERNAL_OAUTH_SECRET) return false;
+  const provided = String(request.headers["x-internal-secret"] ?? "").trim();
+  if (!provided || provided.length !== INTERNAL_OAUTH_SECRET.length) return false;
   try {
-    const upstream = await tlsFetch(tlsRuntime, new URL("/integrations/execute", config.integrationServiceUrl), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        executionType: access.integration.executionType,
-        commandRef,
-        timeoutMs: body.timeoutMs,
-        input: {
-          ...(toJsonObject(body.input) ?? {}),
-          env: environmentVariables,
-          integrationConfig: {
-            ...baseConfig,
-            authType: access.integration.authType
-          },
-          integrationCredentials: credentials
-        }
-      })
-    });
-    const raw = await upstream.text();
-    const payload = raw.length > 0 ? JSON.parse(raw) : {};
-    const ok = upstream.ok && String(payload.status ?? "") === "SUCCESS";
-    return {
-      ok,
-      integrationId: id,
-      testedAt: new Date().toISOString(),
-      result: payload
-    };
-  } catch (error) {
-    return reply.code(502).send({
-      error: "INTEGRATION_TEST_FAILED",
-      details: error instanceof Error ? error.message : "Unknown integration test failure"
-    });
+    return timingSafeEqual(Buffer.from(provided), Buffer.from(INTERNAL_OAUTH_SECRET));
+  } catch {
+    return false;
   }
-});
-
-app.post("/environments", async (request, reply) => {
-  const body = (request.body ?? {}) as {
-    name?: string;
-    ownerId?: string;
-    variables?: Record<string, unknown>;
-    isDefault?: boolean;
-  };
-  const name = String(body.name ?? "").trim();
-  if (!name) {
-    return reply.code(400).send({ error: "ENVIRONMENT_NAME_REQUIRED" });
-  }
-
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const ownerId = String(body.ownerId ?? requester).trim() || requester;
-  if (ownerId !== requester && !isAdmin(request.headers as Record<string, unknown>)) {
-    return reply.code(403).send({ error: "FORBIDDEN_OWNER_OVERRIDE" });
-  }
-
-  if (body.isDefault) {
-    await prisma.userEnvironment.updateMany({
-      where: { ownerId },
-      data: { isDefault: false }
-    });
-  }
-  const variablesObject = toJsonObject(body.variables);
-  const variableIssues = validateSecretFields(variablesObject, {
-    pathPrefix: "environment.variables",
-    allowSensitiveKeys: false,
-    requireVaultRefForSensitive: false
-  });
-  if (variableIssues.length > 0) {
-    return reply.code(400).send({ error: variableIssues[0].code, details: variableIssues[0].message, issues: variableIssues });
-  }
-
-  const environment = await prisma.userEnvironment.create({
-    data: {
-      name,
-      ownerId,
-      variablesJson: variablesObject,
-      isDefault: Boolean(body.isDefault)
-    },
-    include: { shares: true }
-  });
-
-  return reply.code(201).send(toEnvironmentResponse(environment, requester, isAdmin(request.headers as Record<string, unknown>)));
-});
-
-app.get("/environments", async (request) => {
-  const query = request.query as { ownerId?: string; includeAll?: string; limit?: string; scope?: string };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const includeAll = query.includeAll === "true";
-  const requestedOwner = String(query.ownerId ?? "").trim();
-  const ownerId = admin ? requestedOwner || requester : requester;
-  const scope = parseScope(query.scope);
-  const limit = Math.min(Math.max(Number(query.limit ?? 100) || 100, 1), 500);
-
-  if (includeAll && admin) {
-    const all = await prisma.userEnvironment.findMany({
-      include: { shares: true },
-      orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }],
-      take: limit
-    });
-    return all.map((entry) => toEnvironmentResponse(entry, requester, admin));
-  }
-
-  if (scope === "shared") {
-    const shared = await prisma.environmentShare.findMany({
-      where: { sharedWithUserId: requester },
-      include: { environment: { include: { shares: true } } },
-      orderBy: [{ createdAt: "desc" }],
-      take: limit
-    });
-    return shared.map((entry) => toEnvironmentResponse(entry.environment, requester, admin));
-  }
-
-  if (scope === "all") {
-    const [owned, shared] = await Promise.all([
-      prisma.userEnvironment.findMany({
-        where: { ownerId },
-        include: { shares: true },
-        orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }],
-        take: limit
-      }),
-      prisma.environmentShare.findMany({
-        where: { sharedWithUserId: requester },
-        include: { environment: { include: { shares: true } } },
-        orderBy: [{ createdAt: "desc" }],
-        take: limit
-      })
-    ]);
-    const merged = uniqueById([...owned, ...shared.map((entry) => entry.environment)]).slice(0, limit);
-    return merged.map((entry) => toEnvironmentResponse(entry, requester, admin));
-  }
-
-  const owned = await prisma.userEnvironment.findMany({
-    where: { ownerId },
-    include: { shares: true },
-    orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }],
-    take: limit
-  });
-  return owned.map((entry) => toEnvironmentResponse(entry, requester, admin));
-});
-
-app.get("/environments/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadEnvironmentWithAccess(id, requester, admin);
-  if (!access.environment) return reply.code(404).send({ error: "ENVIRONMENT_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_ENVIRONMENT_ACCESS" });
-  return toEnvironmentResponse(access.environment, requester, admin);
-});
-
-app.patch("/environments/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as {
-    name?: string;
-    variables?: Record<string, unknown>;
-    isDefault?: boolean;
-  };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadEnvironmentWithAccess(id, requester, admin);
-  if (!access.environment) return reply.code(404).send({ error: "ENVIRONMENT_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_ENVIRONMENT_MUTATION" });
-
-  if (body.isDefault) {
-    await prisma.userEnvironment.updateMany({
-      where: { ownerId: access.environment.ownerId },
-      data: { isDefault: false }
-    });
-  }
-
-  const data: Record<string, unknown> = {};
-  if (body.name !== undefined) {
-    const name = String(body.name).trim();
-    if (!name) return reply.code(400).send({ error: "ENVIRONMENT_NAME_REQUIRED" });
-    data.name = name;
-  }
-  if (body.variables !== undefined) {
-    const variablesObject = toJsonObject(body.variables);
-    const variableIssues = validateSecretFields(variablesObject, {
-      pathPrefix: "environment.variables",
-      allowSensitiveKeys: false,
-      requireVaultRefForSensitive: false
-    });
-    if (variableIssues.length > 0) {
-      return reply.code(400).send({ error: variableIssues[0].code, details: variableIssues[0].message, issues: variableIssues });
-    }
-    data.variablesJson = variablesObject;
-  }
-  if (body.isDefault !== undefined) data.isDefault = Boolean(body.isDefault);
-
-  const updated = await prisma.userEnvironment.update({
-    where: { id },
-    data,
-    include: { shares: true }
-  });
-  return toEnvironmentResponse(updated, requester, admin);
-});
-
-app.get("/environments/:id/shares", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadEnvironmentWithAccess(id, requester, admin);
-  if (!access.environment) return reply.code(404).send({ error: "ENVIRONMENT_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_ENVIRONMENT_ACCESS" });
-  return access.environment.shares.map((entry) => ({
-    username: entry.sharedWithUserId,
-    createdBy: entry.createdBy,
-    createdAt: entry.createdAt
-  }));
-});
-
-app.post("/environments/:id/share", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { username?: string };
-  const username = String(body.username ?? "").trim();
-  if (!username) return reply.code(400).send({ error: "SHARE_USERNAME_REQUIRED" });
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadEnvironmentWithAccess(id, requester, admin);
-  if (!access.environment) return reply.code(404).send({ error: "ENVIRONMENT_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_ENVIRONMENT_SHARE" });
-  if (username === access.environment.ownerId) return reply.code(400).send({ error: "OWNER_ALREADY_HAS_ACCESS" });
-  await prisma.environmentShare.upsert({
-    where: { environmentId_sharedWithUserId: { environmentId: id, sharedWithUserId: username } },
-    create: {
-      environmentId: id,
-      sharedWithUserId: username,
-      createdBy: requester
-    },
-    update: {}
-  });
-  const updated = await prisma.userEnvironment.findUnique({
-    where: { id },
-    include: { shares: true }
-  });
-  return toEnvironmentResponse(updated!, requester, admin);
-});
-
-app.delete("/environments/:id/share/:username", async (request, reply) => {
-  const params = request.params as { id: string; username: string };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadEnvironmentWithAccess(params.id, requester, admin);
-  if (!access.environment) return reply.code(404).send({ error: "ENVIRONMENT_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_ENVIRONMENT_SHARE" });
-  await prisma.environmentShare.deleteMany({
-    where: {
-      environmentId: params.id,
-      sharedWithUserId: params.username
-    }
-  });
-  const updated = await prisma.userEnvironment.findUnique({
-    where: { id: params.id },
-    include: { shares: true }
-  });
-  return toEnvironmentResponse(updated!, requester, admin);
-});
-
-app.post("/environments/:id/duplicate", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { name?: string };
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadEnvironmentWithAccess(id, requester, admin);
-  if (!access.environment) return reply.code(404).send({ error: "ENVIRONMENT_NOT_FOUND" });
-  if (!access.allowed) return reply.code(403).send({ error: "FORBIDDEN_ENVIRONMENT_ACCESS" });
-  const name = String(body.name ?? `${access.environment.name} Copy`).trim();
-  if (!name) return reply.code(400).send({ error: "ENVIRONMENT_NAME_REQUIRED" });
-  const copy = await prisma.userEnvironment.create({
-    data: {
-      name,
-      ownerId: requester,
-      variablesJson: toJsonObject(access.environment.variablesJson),
-      isDefault: false
-    },
-    include: { shares: true }
-  });
-  return reply.code(201).send(toEnvironmentResponse(copy, requester, admin));
-});
-
-app.delete("/environments/:id", async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  const requester = requesterUserId(request.headers as Record<string, unknown>);
-  const admin = isAdmin(request.headers as Record<string, unknown>);
-  const access = await loadEnvironmentWithAccess(id, requester, admin);
-  if (!access.environment) return reply.code(404).send({ error: "ENVIRONMENT_NOT_FOUND" });
-  if (!access.owner && !admin) return reply.code(403).send({ error: "FORBIDDEN_ENVIRONMENT_MUTATION" });
-  const workflows = await findEnvironmentWorkflowUsage(id);
-  if (workflows.length > 0) {
-    return reply.code(409).send({
-      error: "ENVIRONMENT_IN_USE",
-      warning: "This environment is currently referenced by workflows and cannot be deleted.",
-      workflows
-    });
-  }
-  await prisma.userEnvironment.delete({ where: { id } });
-  return { deleted: true, environmentId: id };
-});
-
-let worker: { connection: ChannelModel; channel: Channel } | undefined;
-
-app.addHook("onClose", async () => {
-  await tlsRuntime.close();
-  if (worker) {
-    await worker.channel.close().catch(() => undefined);
-    await worker.connection.close().catch(() => undefined);
-  }
-  await eventPublisher.close();
-});
-
-async function start(): Promise<void> {
-  await enforceStrictSecretPolicy();
-  await app.listen({ port: config.port, host: "0.0.0.0" });
-  tlsRuntime.onReload((error) => {
-    if (error) return;
-    tlsRuntime.applyServerSecureContext(app.server);
-  });
-  tlsRuntime.startWatching();
-  worker = await startPublishAuditWorker();
 }
 
-start().catch((error) => {
+// POST /internal/oauth-token/:kbId — store OAuth tokens in Vault
+app.post("/internal/oauth-token/:kbId", async (request, reply) => {
+  if (!verifyInternalSecret(request)) return reply.code(401).send({ error: "UNAUTHORIZED" });
+  const { kbId } = request.params as { kbId: string };
+  const { userId, provider, accessToken, refreshToken, tokenExpiry } = request.body as {
+    userId: string;
+    provider: string;
+    accessToken: string;
+    refreshToken?: string;
+    tokenExpiry?: string;
+  };
+  if (!userId || !provider || !accessToken) return reply.code(400).send({ error: "MISSING_FIELDS" });
+
+  const kb = await prisma.ragKnowledgeBase.findUnique({ where: { id: kbId } }).catch(() => null);
+  if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+
+  const ownerId = String(kb.ownerId ?? userId).trim() || userId;
+  const vaultPath = userSourceSecretPath(ownerId, kbId);
+  const existing = await readVaultKv(vaultPath);
+
+  const updated: Record<string, string> = {
+    ...Object.fromEntries(Object.entries(existing).map(([k, v]) => [k, String(v)])),
+    auth_method: "oauth"
+  };
+
+  if (provider === "github") {
+    updated.github_token = accessToken;
+  } else if (provider === "gitlab") {
+    updated.gitlab_token = accessToken;
+    if (refreshToken) updated.gitlab_refresh = refreshToken;
+    if (tokenExpiry) updated.token_expiry = tokenExpiry;
+  } else if (provider === "google") {
+    updated.gdrive_token = accessToken;
+    if (refreshToken) updated.gdrive_refresh = refreshToken;
+    if (tokenExpiry) updated.token_expiry = tokenExpiry;
+  } else {
+    return reply.code(400).send({ error: "UNKNOWN_PROVIDER" });
+  }
+
+  await writeVaultKv(vaultPath, updated);
+  logInfo("OAuth token stored", { service: "workflow-service", kbId, provider, userId: ownerId });
+  return reply.code(200).send({ ok: true });
+});
+
+// DELETE /internal/oauth-token/:kbId — disconnect OAuth, revert auth_method to "pat"
+app.delete("/internal/oauth-token/:kbId", async (request, reply) => {
+  if (!verifyInternalSecret(request)) return reply.code(401).send({ error: "UNAUTHORIZED" });
+  const { kbId } = request.params as { kbId: string };
+  const { userId, provider } = request.body as { userId: string; provider: string };
+  if (!userId || !provider) return reply.code(400).send({ error: "MISSING_FIELDS" });
+
+  const kb = await prisma.ragKnowledgeBase.findUnique({ where: { id: kbId } }).catch(() => null);
+  if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+
+  const ownerId = String(kb.ownerId ?? userId).trim() || userId;
+  const vaultPath = userSourceSecretPath(ownerId, kbId);
+  const existing = await readVaultKv(vaultPath);
+
+  const updated: Record<string, string> = {
+    ...Object.fromEntries(Object.entries(existing).map(([k, v]) => [k, String(v)])),
+    auth_method: "pat"
+  };
+
+  // Remove OAuth-specific token fields for this provider
+  if (provider === "github") {
+    delete updated.github_token;
+  } else if (provider === "gitlab") {
+    delete updated.gitlab_token;
+    delete updated.gitlab_refresh;
+    delete updated.token_expiry;
+  } else if (provider === "google") {
+    delete updated.gdrive_token;
+    delete updated.gdrive_refresh;
+    delete updated.token_expiry;
+  }
+
+  await writeVaultKv(vaultPath, updated);
+  logInfo("OAuth token disconnected", { service: "workflow-service", kbId, provider, userId: ownerId });
+  return reply.code(200).send({ ok: true });
+});
+
+// GET /internal/oauth-credentials/:provider — returns client_id + client_secret from Vault
+// GET /internal/oauth-credentials/:provider?kbId=xxx&userId=yyy
+// Reads per-integration Vault path. Falls back to env vars if not set.
+app.get("/internal/oauth-credentials/:provider", async (request, reply) => {
+  if (!verifyInternalSecret(request)) return reply.code(401).send({ error: "UNAUTHORIZED" });
+  const { provider } = request.params as { provider: string };
+  const { kbId, userId } = request.query as { kbId?: string; userId?: string };
+  const allowed = ["github", "gitlab", "google"];
+  if (!allowed.includes(provider)) return reply.code(400).send({ error: "UNKNOWN_PROVIDER" });
+
+  // Read per-integration credentials from Vault
+  let clientId = "";
+  let clientSecret = "";
+  if (kbId && userId) {
+    const perIntegrationSecrets = await readVaultKv(userSourceSecretPath(userId, kbId));
+    clientId = String(perIntegrationSecrets.oauth_client_id ?? "").trim();
+    clientSecret = String(perIntegrationSecrets.oauth_client_secret ?? "").trim();
+  }
+
+  // Fall back to env vars if not configured per-integration
+  if (!clientId) {
+    const envKey = provider.toUpperCase();
+    clientId = String(process.env[`${envKey}_CLIENT_ID`] ?? "").trim();
+    clientSecret = clientSecret || String(process.env[`${envKey}_CLIENT_SECRET`] ?? "").trim();
+  }
+
+  if (!clientId) return reply.code(404).send({ error: "OAUTH_NOT_CONFIGURED" });
+  return reply.send({ clientId, clientSecret });
+});
+
+// PATCH /rag/integrations/:id/oauth-app-credentials — save OAuth App Client ID + Secret per-integration
+app.patch("/rag/integrations/:id/oauth-app-credentials", async (request, reply) => {
+  const { id: kbId } = request.params as { id: string };
+  const { clientId, clientSecret } = (request.body ?? {}) as { clientId?: string; clientSecret?: string };
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  if (!userId || userId === "unknown") return reply.code(401).send({ error: "UNAUTHORIZED" });
+  if (!clientId?.trim() && !clientSecret?.trim()) return reply.code(400).send({ error: "MISSING_CREDENTIALS" });
+
+  const path = userSourceSecretPath(userId, kbId);
+  const existing = await readVaultKv(path);
+  const update: Record<string, unknown> = { ...existing };
+  if (clientId?.trim()) update.oauth_client_id = clientId.trim();
+  if (clientSecret?.trim()) update.oauth_client_secret = clientSecret.trim();
+  await writeVaultKv(path, update);
+  return reply.send({ ok: true });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.listen({ host: "0.0.0.0", port: config.port }).catch((error) => {
   process.stderr.write(`[workflow-service] failed to start: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);
 });

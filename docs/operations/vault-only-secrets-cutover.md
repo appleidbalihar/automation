@@ -8,8 +8,7 @@
 ## Admin operations
 - Use web `Secrets` page (platform-admin only) to:
   - create/update/delete secrets (masked output only)
-  - trace secret usage
-  - run one-time plaintext migration
+  - run one-time plaintext migration placeholder if needed
 
 ## Required env defaults
 - `VAULT_STRICT_SECRETS=true`
@@ -22,7 +21,5 @@
 
 ## Cutover checklist
 1. Start stack and ensure Vault bootstrap completed.
-2. Run migration (`POST /admin/secrets/migrate`) if legacy plaintext remains.
+2. Run migration (`POST /admin/secrets/migrate`) only if legacy plaintext cleanup is still required.
 3. Validate no blocked plaintext via workflow-service startup success.
-4. Validate integration execution resolves `vault:` references successfully.
-

@@ -1,9 +1,9 @@
-import Fastify from "fastify";
-import amqp from "amqplib";
-import type { Channel, ChannelModel, ConsumeMessage } from "amqplib";
 import { loadConfig } from "@platform/config";
 import { prisma } from "@platform/db";
 import { connectAmqp, createTlsRuntime } from "@platform/tls-runtime";
+import type { Channel, ChannelModel, ConsumeMessage } from "amqplib";
+import amqp from "amqplib";
+import Fastify from "fastify";
 
 const config = loadConfig("logging-service", 4005);
 const tlsRuntime = createTlsRuntime({
@@ -22,6 +22,54 @@ const tlsRuntime = createTlsRuntime({
 const app = Fastify({ logger: false, https: tlsRuntime.getServerOptions() } as any);
 const PLATFORM_EVENTS_EXCHANGE = "platform.events";
 const LOGGING_EVENTS_QUEUE = "logging-service.events.v1";
+
+// ─── OpenSearch client (direct HTTP, no extra SDK needed) ─────────────────────
+// Uses the OPENSEARCH_URL from config which includes credentials.
+// Falls back gracefully — if OpenSearch is unavailable logs still go to Postgres.
+
+function todayIndex(): string {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `platform-logs-${y}.${m}.${day}`;
+}
+
+/**
+ * Ships a log document to OpenSearch.
+ * Index pattern: platform-logs-YYYY.MM.DD
+ * Silently ignored on error — OpenSearch availability is not required for platform ops.
+ */
+async function shipToOpenSearch(doc: Record<string, unknown>): Promise<void> {
+  const baseUrl = config.opensearchUrl.replace(/\/+$/, "");
+  const index = todayIndex();
+  try {
+    const parsed = new URL(baseUrl);
+    const username = parsed.username;
+    const password = parsed.password;
+    parsed.username = "";
+    parsed.password = "";
+    const headers: Record<string, string> = {
+      "content-type": "application/json"
+    };
+    if (username || password) {
+      headers.authorization = `Basic ${Buffer.from(`${decodeURIComponent(username)}:${decodeURIComponent(password)}`).toString("base64")}`;
+    }
+    const response = await fetch(`${parsed.toString().replace(/\/+$/, "")}/${index}/_doc`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(doc)
+    });
+    // 201 = created, 200 = ok. Non-2xx is silently swallowed.
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      console.warn(`[logging-service] OpenSearch ingest ${response.status}: ${text.slice(0, 200)}`);
+    }
+  } catch (error) {
+    // OpenSearch unavailable — continue without interrupting platform logs
+    console.warn("[logging-service] OpenSearch unavailable:", error instanceof Error ? error.message : String(error));
+  }
+}
 
 const SENSITIVE_KEYWORDS = ["password", "token", "secret", "key", "credential"];
 
@@ -48,15 +96,6 @@ function mask(payload: unknown): unknown {
   return copy;
 }
 
-async function resolveOrderIdFromCorrelationId(correlationId?: string): Promise<string | undefined> {
-  if (!correlationId) return undefined;
-  const order = await prisma.order.findUnique({
-    where: { correlationId },
-    select: { id: true }
-  });
-  return order?.id;
-}
-
 function tryParseJson(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -69,57 +108,36 @@ function eventSeverity(event: string): string {
   return event.toLowerCase().includes("failed") ? "ERROR" : "INFO";
 }
 
-function getOrderIdFromPayload(payload: Record<string, unknown>): string | undefined {
-  const directOrderId = payload.orderId;
-  if (typeof directOrderId === "string") {
-    return directOrderId;
-  }
-  const nestedOrder = payload.order;
-  if (nestedOrder && typeof nestedOrder === "object") {
-    const nestedOrderId = (nestedOrder as Record<string, unknown>).id;
-    if (typeof nestedOrderId === "string") {
-      return nestedOrderId;
-    }
-  }
-  return undefined;
-}
-
 async function storeEventBusLog(parsed: {
   event: string;
   timestamp?: string;
   payload?: Record<string, unknown>;
 }): Promise<void> {
   const payload = parsed.payload ?? {};
-  const orderId = getOrderIdFromPayload(payload);
-  if (!orderId) {
-    return;
-  }
-  const nodeId = typeof payload.nodeId === "string" ? payload.nodeId : undefined;
-  const stepId = typeof payload.stepId === "string" ? payload.stepId : undefined;
-  const executionId = typeof payload.correlationId === "string" ? payload.correlationId : undefined;
-  const workflowId = typeof payload.workflowId === "string" ? payload.workflowId : undefined;
-  const workflowVersionId = typeof payload.workflowVersionId === "string" ? payload.workflowVersionId : undefined;
-  const taskId =
-    typeof payload.taskId === "string" ? payload.taskId : typeof payload.stepId === "string" ? payload.stepId : undefined;
-  const initiatedBy = typeof payload.initiatedBy === "string" ? payload.initiatedBy : undefined;
-  const durationMs = typeof payload.durationMs === "number" ? payload.durationMs : undefined;
-  await prisma.executionLog.create({
-    data: {
-      orderId,
-      executionId,
-      workflowId,
-      workflowVersionId,
-      nodeId,
-      stepId,
-      taskId,
-      initiatedBy,
+  const source = typeof payload.service === "string" ? payload.service : "event-bus";
+  const createdAt = parsed.timestamp ? new Date(parsed.timestamp) : new Date();
+
+  // Dual-write: Postgres (existing) + OpenSearch (new)
+  await Promise.all([
+    prisma.platformLog.create({
+      data: {
+        severity: eventSeverity(parsed.event),
+        source,
+        message: `Event received: ${parsed.event}`,
+        maskedPayload: mask(payload) as object,
+        createdAt
+      }
+    }),
+    shipToOpenSearch({
+      "@timestamp": createdAt.toISOString(),
       severity: eventSeverity(parsed.event),
-      source: "event-bus",
-      maskedPayload: mask(payload) as object,
+      source,
       message: `Event received: ${parsed.event}`,
-      durationMs,
-      createdAt: parsed.timestamp ? new Date(parsed.timestamp) : undefined
-    }
+      payload: mask(payload),
+      event: parsed.event
+    })
+  ]).catch((error) => {
+    console.warn("[logging-service] storeEventBusLog error:", error instanceof Error ? error.message : String(error));
   });
 }
 
@@ -170,77 +188,79 @@ app.get("/security/tls", async (request, reply) => {
   return tlsRuntime.getStatus();
 });
 
+/**
+ * Ingest a single log entry.
+ * Dual-writes to Postgres (for platform log explorer) and OpenSearch (for RAG sync log queries).
+ * Accepts optional fields: syncJobId, stepName — used to tag RAG sync workflow logs.
+ */
 app.post("/logs/ingest", async (request, reply) => {
   const body = request.body as {
-    orderId: string;
-    executionId?: string;
-    workflowId?: string;
-    workflowVersionId?: string;
-    nodeId?: string;
-    stepId?: string;
-    taskId?: string;
-    initiatedBy?: string;
     severity: string;
     source: string;
     payload?: Record<string, unknown>;
     message: string;
     correlationId?: string;
     durationMs?: number;
+    // RAG sync specific — tag logs for filtered retrieval
+    syncJobId?: string;
+    stepName?: string;
   };
 
-  const resolvedOrderId = body.orderId || (await resolveOrderIdFromCorrelationId(body.correlationId));
-  if (!resolvedOrderId) {
-    return reply.code(400).send({
-      error: "ORDER_REFERENCE_REQUIRED",
-      message: "Provide orderId or a valid correlationId"
-    });
-  }
+  const now = new Date();
+  const maskedPayload = {
+    ...(mask(body.payload) as Record<string, unknown> | null ?? {}),
+    ...(body.syncJobId ? { syncJobId: body.syncJobId } : {}),
+    ...(body.stepName ? { stepName: body.stepName } : {})
+  };
 
-  const log = await prisma.executionLog.create({
+  // Build the OpenSearch document with all available tags
+  const osDoc: Record<string, unknown> = {
+    "@timestamp": now.toISOString(),
+    severity: body.severity,
+    source: body.source,
+    message: body.message,
+    correlationId: body.correlationId ?? null,
+    durationMs: body.durationMs ?? null,
+    payload: mask(body.payload) ?? null,
+    // RAG sync tags
+    syncJobId: body.syncJobId ?? null,
+    stepName: body.stepName ?? null
+  };
+
+  // Postgres log entry (existing schema)
+  const log = await prisma.platformLog.create({
     data: {
-      orderId: resolvedOrderId,
-      executionId: body.executionId ?? body.correlationId,
-      workflowId: body.workflowId,
-      workflowVersionId: body.workflowVersionId,
-      nodeId: body.nodeId,
-      stepId: body.stepId,
-      taskId: body.taskId ?? body.stepId,
-      initiatedBy: body.initiatedBy,
       severity: body.severity,
       source: body.source,
-      maskedPayload: mask(body.payload) as object,
+      maskedPayload,
       message: body.message,
+      correlationId: body.correlationId ?? body.syncJobId,
       durationMs: body.durationMs
     }
   });
+
+  // Ship to OpenSearch (non-blocking — failure doesn't fail the ingest)
+  void shipToOpenSearch(osDoc);
+
   return reply.code(201).send(log);
 });
 
 app.get("/logs", async (request) => {
   const query = request.query as {
-    orderId?: string;
-    correlationId?: string;
     severity?: string;
     source?: string;
-    nodeId?: string;
-    stepId?: string;
+    correlationId?: string;
     messageContains?: string;
     from?: string;
     to?: string;
     limit?: string;
   };
-  const orderId = query.orderId || (await resolveOrderIdFromCorrelationId(query.correlationId));
-  if (query.correlationId && !orderId) {
-    return [];
-  }
   const limit = Math.min(Math.max(Number(query.limit ?? "200"), 1), 500);
 
   const where = {
-    orderId,
     severity: query.severity,
     source: query.source,
-    nodeId: query.nodeId,
-    stepId: query.stepId,
+    correlationId: query.correlationId,
     ...(query.messageContains ? { message: { contains: query.messageContains, mode: "insensitive" as const } } : {}),
     ...((query.from || query.to)
       ? {
@@ -252,80 +272,127 @@ app.get("/logs", async (request) => {
       : {})
   };
 
-  return prisma.executionLog.findMany({
+  return prisma.platformLog.findMany({
     where,
     orderBy: { createdAt: "desc" },
     take: limit
   });
 });
 
-app.get("/logs/timeline", async (request, reply) => {
-  const query = request.query as { orderId?: string; correlationId?: string };
-  const orderId = query.orderId || (await resolveOrderIdFromCorrelationId(query.correlationId));
-  if (!orderId) {
-    return reply.code(400).send({
-      error: "ORDER_REFERENCE_REQUIRED",
-      message: "Provide orderId or a valid correlationId"
-    });
+app.get("/logs/timeline", async (request) => {
+  const query = request.query as { correlationId?: string; from?: string; to?: string; limit?: string };
+  const limit = Math.min(Math.max(Number(query.limit ?? "200"), 1), 500);
+
+  const logs = await prisma.platformLog.findMany({
+    where: {
+      correlationId: query.correlationId,
+      ...((query.from || query.to)
+        ? {
+            createdAt: {
+              ...(query.from ? { gte: new Date(query.from) } : {}),
+              ...(query.to ? { lte: new Date(query.to) } : {})
+            }
+          }
+        : {})
+    },
+    orderBy: { createdAt: "asc" },
+    take: limit
+  });
+
+  const events = logs.map((item) => ({
+    type: "PLATFORM_LOG" as const,
+    timestamp: item.createdAt,
+    data: {
+      severity: item.severity,
+      source: item.source,
+      message: item.message,
+      durationMs: item.durationMs,
+      correlationId: item.correlationId,
+      payload: item.maskedPayload
+    }
+  }));
+
+  return { events };
+});
+
+/**
+ * Query OpenSearch for RAG sync workflow logs filtered by syncJobId.
+ * Returns logs tagged with a specific sync job, optionally filtered by step name.
+ * Used by the frontend Sync Process Monitor log drawer.
+ */
+app.get("/logs/sync-job", async (request, reply) => {
+  const query = request.query as {
+    syncJobId?: string;
+    stepName?: string;
+    limit?: string;
+  };
+  const syncJobId = String(query.syncJobId ?? "").trim();
+  if (!syncJobId) {
+    return reply.code(400).send({ error: "SYNC_JOB_ID_REQUIRED" });
+  }
+  const limit = Math.min(Math.max(Number(query.limit ?? "100"), 1), 500);
+
+  // Query OpenSearch
+  const baseUrl = config.opensearchUrl.replace(/\/+$/, "");
+  const mustClauses: Record<string, unknown>[] = [
+    { term: { syncJobId } }
+  ];
+  if (query.stepName) {
+    mustClauses.push({ term: { stepName: query.stepName } });
   }
 
-  const [transitions, stepExecutions, logs] = await Promise.all([
-    prisma.statusTransition.findMany({
-      where: { orderId },
-      orderBy: { createdAt: "asc" }
-    }),
-    prisma.stepExecution.findMany({
-      where: { orderId },
-      orderBy: { startedAt: "asc" }
-    }),
-    prisma.executionLog.findMany({
-      where: { orderId },
-      orderBy: { createdAt: "asc" }
-    })
-  ]);
-
-  const events = [
-    ...transitions.map((item) => ({
-      type: "STATUS_TRANSITION" as const,
-      timestamp: item.createdAt,
-      data: {
-        from: item.from,
-        to: item.to,
-        reason: item.reason
-      }
-    })),
-    ...stepExecutions.map((item) => ({
-      type: "STEP_EXECUTION" as const,
-      timestamp: item.startedAt,
-      data: {
-        nodeId: item.nodeId,
-        stepId: item.stepId,
-        status: item.status,
-        retryCount: item.retryCount,
-        durationMs: item.durationMs,
-        errorSource: item.errorSource,
-        errorMessage: item.errorMessage
-      }
-    })),
-    ...logs.map((item) => ({
-      type: "EXECUTION_LOG" as const,
-      timestamp: item.createdAt,
-      data: {
-        severity: item.severity,
-        source: item.source,
-        nodeId: item.nodeId,
-        stepId: item.stepId,
-        message: item.message,
-        durationMs: item.durationMs,
-        payload: item.maskedPayload
-      }
-    }))
-  ].sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
-
-  return {
-    orderId,
-    events
+  const osQuery = {
+    size: limit,
+    sort: [{ "@timestamp": { order: "asc" } }],
+    query: {
+      bool: { must: mustClauses }
+    }
   };
+
+  try {
+    const response = await fetch(`${baseUrl}/platform-logs-*/_search`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(osQuery)
+    });
+
+    if (!response.ok) {
+      // Fall back to Postgres query on OpenSearch failure
+      const pgLogs = await prisma.platformLog.findMany({
+        where: { correlationId: syncJobId },
+        orderBy: { createdAt: "asc" },
+        take: limit
+      });
+      const filtered = query.stepName
+        ? pgLogs.filter((log) => {
+            const payload = (log.maskedPayload ?? {}) as Record<string, unknown>;
+            return String(payload.stepName ?? "") === query.stepName;
+          })
+        : pgLogs;
+      return { source: "postgres", logs: filtered };
+    }
+
+    const result = await response.json() as { hits?: { hits?: Array<{ _source: Record<string, unknown> }> } };
+    const hits = result.hits?.hits ?? [];
+    return {
+      source: "opensearch",
+      logs: hits.map((hit) => hit._source)
+    };
+  } catch (error) {
+    // OpenSearch unavailable — fall back to Postgres
+    const pgLogs = await prisma.platformLog.findMany({
+      where: { correlationId: syncJobId },
+      orderBy: { createdAt: "asc" },
+      take: limit
+    });
+    const filtered = query.stepName
+      ? pgLogs.filter((log) => {
+          const payload = (log.maskedPayload ?? {}) as Record<string, unknown>;
+          return String(payload.stepName ?? "") === query.stepName;
+        })
+      : pgLogs;
+    return { source: "postgres", logs: filtered };
+  }
 });
 
 let eventConsumer: { connection: ChannelModel; channel: Channel } | undefined;

@@ -1,19 +1,17 @@
 # Operations Guide: Platform Overview
 
 ## What the platform does
-- Build workflows visually.
-- Run orders against target nodes.
-- Skip already configured items.
-- Retry, continue, or roll back based on configured policy.
-- Review status timelines and masked logs.
+- Answer operations questions through Operations AI.
+- Review masked operational logs.
+- Manage platform secrets, users, and security health.
 
-## Failure handling
-- The system keeps execution checkpoints after successful steps.
-- If execution stops unexpectedly, the platform resumes from the last saved checkpoint instead of restarting from the beginning.
-- Operators can inspect failure reasons and choose retry or rollback where allowed.
+## Day-to-day operations
+- Use `Operations AI` for documentation-backed support questions.
+- Use `Logs` for operational investigation.
+- Use admin pages for secrets, users, and certificate/security management.
 
 ## Access model
 - `admin`: full administration
-- `operator`: execute and monitor orders
-- `approver`: approve gated nodes
+- `operator`: use supported operational tools
+- `approver`: access read-oriented platform pages and Operations AI
 - `viewer`: read-only access

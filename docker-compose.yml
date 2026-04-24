@@ -9,20 +9,16 @@ x-shared-env: &shared-env
   KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-automation-web}
   KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-replace-me}
   WORKFLOW_SERVICE_URL: https://workflow-service:4001
-  ORDER_SERVICE_URL: https://order-service:4002
-  EXECUTION_ENGINE_SERVICE_URL: https://execution-engine:4003
-  INTEGRATION_SERVICE_URL: https://integration-service:4004
   LOGGING_SERVICE_URL: https://logging-service:4005
-  TEMPORAL_ADDRESS: temporal:7233
-  TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
-  TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-automation-task-queue}
-  FLOWISE_PLANNER_URL: ${FLOWISE_PLANNER_URL:-http://flowise:3000/api/v1/prediction/default}
   FLOWISE_OPERATIONS_CHAT_URL: ${FLOWISE_OPERATIONS_CHAT_URL:-http://flowise:3000/api/v1/prediction/4b37e62c-da5c-43e5-ba10-8a1cfc9d06f1}
   FLOWISE_API_KEY: ${FLOWISE_API_KEY:-}
-  INTEGRATION_REST_URL_ALLOWLIST: ${INTEGRATION_REST_URL_ALLOWLIST:-^https?://|^http://localhost:}
-  INTEGRATION_SCRIPT_ALLOWLIST: ${INTEGRATION_SCRIPT_ALLOWLIST:-.*}
-  INTEGRATION_SSH_ALLOWLIST: ${INTEGRATION_SSH_ALLOWLIST:-.*}
-  INTEGRATION_NETCONF_ALLOWLIST: ${INTEGRATION_NETCONF_ALLOWLIST:-.*}
+  # Dify — internal base URL only; API keys are stored in Vault, never in env
+  DIFY_API_BASE_URL: ${DIFY_API_BASE_URL:-http://dify-api:5001}
+  # n8n — internal base URL only; credentials are stored in Vault, never in env
+  N8N_API_BASE_URL: ${N8N_API_BASE_URL:-http://n8n:5678}
+  N8N_WEBHOOK_TOKEN: ${N8N_WEBHOOK_TOKEN:-}
+  N8N_API_KEY: ${N8N_API_KEY:-}
+  RAG_SYNC_PROGRESS_CALLBACK_BASE_URL: ${RAG_SYNC_PROGRESS_CALLBACK_BASE_URL:-https://api-gateway:4000}
   VAULT_ADDR: http://vault:8200
   VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
   VAULT_STRICT_SECRETS: ${VAULT_STRICT_SECRETS:-true}
@@ -42,7 +38,7 @@ x-backend-build: &backend-build
 
 x-vault-agent: &vault-agent
   image: hashicorp/vault:1.17
-  command: ["sh", "/vault/scripts/agent-entrypoint.sh"]
+  entrypoint: ["sh", "/vault/scripts/agent-entrypoint.sh"]
   environment:
     VAULT_ADDR: http://vault:8200
     CERT_TTL: ${TLS_CERT_TTL:-8760h}
@@ -50,8 +46,8 @@ x-vault-agent: &vault-agent
     - ./infra/vault:/vault/scripts:ro
     - vault_data:/vault/file:ro
   depends_on:
-    vault-bootstrap:
-      condition: service_completed_successfully
+    vault:
+      condition: service_started
   restart: unless-stopped
 
 services:
@@ -225,41 +221,6 @@ services:
       - vault_data:/vault/file:ro
       - tls_keycloak:/tls
 
-  temporal-postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: temporal
-      POSTGRES_PASSWORD: temporal
-      POSTGRES_DB: temporal
-    volumes:
-      - temporal_pg_data:/var/lib/postgresql/data
-
-  temporal:
-    image: temporalio/auto-setup:1.26.2
-    environment:
-      DB: postgres12
-      DB_PORT: 5432
-      POSTGRES_USER: temporal
-      POSTGRES_PWD: temporal
-      POSTGRES_SEEDS: temporal-postgres
-      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/development-sql.yaml
-    depends_on:
-      temporal-postgres:
-        condition: service_started
-    volumes:
-      - ./infra/temporal/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
-
-  temporal-ui:
-    image: temporalio/ui:2.30.3
-    environment:
-      TEMPORAL_ADDRESS: temporal:7233
-      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
-    depends_on:
-      temporal:
-        condition: service_started
-    ports:
-      - "8088:8080"
-
   flowise:
     image: flowiseai/flowise:2.2.3
     environment:
@@ -295,19 +256,21 @@ services:
 
   vault-bootstrap:
     image: hashicorp/vault:1.17
-    command: ["sh", "/vault/scripts/bootstrap-pki.sh"]
+    entrypoint: ["sh", "/vault/scripts/bootstrap-pki.sh"]
     environment:
       VAULT_ADDR: http://vault:8200
       VAULT_INIT_FILE: /vault/file/vault-init.json
       APPROLE_DIR: /vault/file/approle
       PKI_LEAF_TTL: ${PKI_LEAF_TTL:-8760h}
+      VAULT_WATCH_MODE: "true"
+      VAULT_WATCH_INTERVAL_SECONDS: 15
     volumes:
       - ./infra/vault:/vault/scripts:ro
       - vault_data:/vault/file
     depends_on:
       vault:
         condition: service_started
-    restart: "no"
+    restart: unless-stopped
 
   db-migrate:
     build:
@@ -344,6 +307,7 @@ services:
       PORT: 4001
       SERVICE_NAME: workflow-service
       VAULT_ADDR: http://workflow-service-vault-agent:8200
+      PLATFORM_OAUTH_SECRET: ${PLATFORM_OAUTH_SECRET:-change-me-in-production}
     volumes:
       - tls_workflow_service:/tls:ro
     depends_on:
@@ -354,97 +318,6 @@ services:
       flowise:
         condition: service_started
       workflow-service-vault-agent:
-        condition: service_started
-    restart: unless-stopped
-
-  order-service-vault-agent:
-    <<: *vault-agent
-    environment:
-      VAULT_ADDR: http://vault:8200
-      SERVICE_NAME: order-service
-      CERT_COMMON_NAME: order-service
-      CERT_ALT_NAMES: order-service,localhost
-    volumes:
-      - ./infra/vault:/vault/scripts:ro
-      - vault_data:/vault/file:ro
-      - tls_order_service:/tls
-
-  order-service:
-    image: 09_automationplatform-service-base
-    build: *backend-build
-    environment:
-      <<: *shared-env
-      PORT: 4002
-      SERVICE_NAME: order-service
-    volumes:
-      - tls_order_service:/tls:ro
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-      rabbitmq:
-        condition: service_started
-      temporal:
-        condition: service_started
-      order-service-vault-agent:
-        condition: service_started
-    restart: unless-stopped
-
-  execution-engine-vault-agent:
-    <<: *vault-agent
-    environment:
-      VAULT_ADDR: http://vault:8200
-      SERVICE_NAME: execution-engine
-      CERT_COMMON_NAME: execution-engine
-      CERT_ALT_NAMES: execution-engine,localhost
-    volumes:
-      - ./infra/vault:/vault/scripts:ro
-      - vault_data:/vault/file:ro
-      - tls_execution_engine:/tls
-
-  execution-engine:
-    image: 09_automationplatform-service-base
-    build: *backend-build
-    environment:
-      <<: *shared-env
-      PORT: 4003
-      SERVICE_NAME: execution-engine
-    volumes:
-      - tls_execution_engine:/tls:ro
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-      execution-engine-vault-agent:
-        condition: service_started
-    restart: unless-stopped
-
-  integration-service-vault-agent:
-    <<: *vault-agent
-    environment:
-      VAULT_ADDR: http://vault:8200
-      SERVICE_NAME: integration-service
-      CERT_COMMON_NAME: integration-service
-      CERT_ALT_NAMES: integration-service,localhost
-    volumes:
-      - ./infra/vault:/vault/scripts:ro
-      - vault_data:/vault/file:ro
-      - tls_integration_service:/tls
-
-  integration-service:
-    image: 09_automationplatform-service-base
-    build: *backend-build
-    environment:
-      <<: *shared-env
-      PORT: 4004
-      SERVICE_NAME: integration-service
-      VAULT_ADDR: http://integration-service-vault-agent:8200
-    volumes:
-      - tls_integration_service:/tls:ro
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-      vault:
-        condition: service_started
-      integration-service-vault-agent:
         condition: service_started
     restart: unless-stopped
 
@@ -497,13 +370,20 @@ services:
       <<: *shared-env
       PORT: 4000
       SERVICE_NAME: api-gateway
+      PLATFORM_OAUTH_SECRET: ${PLATFORM_OAUTH_SECRET:-change-me-in-production}
+      OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/ap}
+      OAUTH_POST_CONNECT_REDIRECT: ${OAUTH_POST_CONNECT_REDIRECT:-https://dev.eclassmanager.com/integrations}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITLAB_CLIENT_ID: ${GITLAB_CLIENT_ID:-}
+      GITLAB_CLIENT_SECRET: ${GITLAB_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
     volumes:
       - tls_api_gateway:/tls:ro
       - rotation_control:/rotation-control
     depends_on:
       workflow-service:
-        condition: service_started
-      order-service:
         condition: service_started
       logging-service:
         condition: service_started
@@ -519,6 +399,8 @@ services:
       dockerfile: infra/docker/Dockerfile.web
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${WEB_NEXT_PUBLIC_API_BASE_URL:-}
+      NEXT_PUBLIC_PLATFORM_URL: ${PLATFORM_URL:-https://dev.eclassmanager.com}
+      NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/ap}
       WEB_INTERNAL_API_BASE_URL: ${WEB_INTERNAL_API_BASE_URL:-https://api-gateway:4000}
       PORT: 3000
       KEYCLOAK_URL: ${WEB_KEYCLOAK_URL:-https://keycloak:8443}
@@ -586,22 +468,301 @@ services:
       TLS_ROOT: /tls
       ROTATION_REQUESTS_FILE: /rotation-control/requests.jsonl
       ROTATION_ENABLE_FALLBACK: ${ROTATION_ENABLE_FALLBACK:-false}
-      TARGET_CONTAINERS: ${ROTATION_TARGET_CONTAINERS:-postgres rabbitmq redis keycloak minio opensearch}
+      TARGET_CONTAINERS: ${ROTATION_TARGET_CONTAINERS:-postgres rabbitmq redis keycloak minio opensearch dify-api n8n}
       RESTART_WINDOW_SECONDS: ${RESTART_WINDOW_SECONDS:-1800}
     volumes:
       - ./infra/vault:/vault/scripts:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - tls_api_gateway:/tls/api-gateway:ro
       - tls_workflow_service:/tls/workflow-service:ro
-      - tls_order_service:/tls/order-service:ro
-      - tls_execution_engine:/tls/execution-engine:ro
-      - tls_integration_service:/tls/integration-service:ro
       - tls_logging_service:/tls/logging-service:ro
+      - tls_dify_api:/tls/dify-api:ro
+      - tls_n8n:/tls/n8n:ro
       - rotation_control:/rotation-control
     depends_on:
-      vault-bootstrap:
-        condition: service_completed_successfully
+      vault:
+        condition: service_started
     restart: unless-stopped
+
+  # ─── Dify RAG Stack ────────────────────────────────────────────────────────
+  # Dify provides the multi-tenant RAG engine. Each knowledge base maps to one
+  # Dify app. API keys are stored in Vault — never in env vars.
+  # TLS certs are auto-issued and renewed by the dify-api-vault-agent sidecar.
+
+  dify-db:
+    # Internal Postgres for Dify's own state — isolated from the platform DB.
+    # Not exposed to host network. Credentials come from Vault via dify-api startup.
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: dify
+      POSTGRES_PASSWORD: ${DIFY_DB_PASSWORD:-dify}
+      POSTGRES_DB: dify
+    volumes:
+      - dify_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dify -d dify"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 180s
+    restart: unless-stopped
+
+  dify-redis:
+    # Internal Redis for Dify's celery task queue — isolated from platform Redis.
+    image: redis:6-alpine
+    command: ["redis-server", "--requirepass", "${DIFY_REDIS_PASSWORD:-dify-redis}"]
+    volumes:
+      - dify_redis_data:/data
+    restart: unless-stopped
+
+  dify-api-vault-agent:
+    # Issues and auto-renews TLS cert for dify-api + dify-worker.
+    # Both containers share the same tls_dify_api volume.
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: dify-api
+      CERT_COMMON_NAME: dify-api
+      CERT_ALT_NAMES: dify-api,dify-worker,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_dify_api:/tls
+
+  dify-migrate:
+    # One-shot Dify schema migration. API/worker wait for this so the console
+    # setup and provisioning APIs never start against an empty database.
+    image: langgenius/dify-api:0.6.16
+    restart: "no"
+    entrypoint: ["sh", "-lc"]
+    command: ["cd /app/api && .venv/bin/flask db upgrade"]
+    environment:
+      MODE: api
+      LOG_LEVEL: INFO
+      DB_USERNAME: dify
+      DB_PASSWORD: ${DIFY_DB_PASSWORD:-dify}
+      DB_HOST: dify-db
+      DB_PORT: 5432
+      DB_DATABASE: dify
+      REDIS_HOST: dify-redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD:-dify-redis}
+      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD:-dify-redis}@dify-redis:6379/1
+      SECRET_KEY: ${DIFY_SECRET_KEY:-change-me-seed-from-vault}
+      STORAGE_TYPE: local
+      STORAGE_LOCAL_PATH: /app/storage
+      NODE_EXTRA_CA_CERTS: /tls/ca.pem
+      DIFY_BASE_URL: http://dify-api:5001
+    volumes:
+      - tls_dify_api:/tls:ro
+      - dify_storage:/app/storage
+    depends_on:
+      dify-api-vault-agent:
+        condition: service_started
+      dify-db:
+        condition: service_healthy
+      dify-redis:
+        condition: service_started
+
+  dify-api:
+    # Dify API server — handles KB management, chat, and document indexing.
+    # SECRET_KEY is rendered from Vault by the agent; passed via file mount.
+    # No sensitive values in env — all in Vault.
+    image: langgenius/dify-api:0.6.16
+    restart: unless-stopped
+    environment:
+      MODE: api
+      LOG_LEVEL: INFO
+      # DB — internal Dify DB only
+      DB_USERNAME: dify
+      DB_PASSWORD: ${DIFY_DB_PASSWORD:-dify}
+      DB_HOST: dify-db
+      DB_PORT: 5432
+      DB_DATABASE: dify
+      # Redis — internal Dify Redis only
+      REDIS_HOST: dify-redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD:-dify-redis}
+      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD:-dify-redis}@dify-redis:6379/1
+      # Secret key for signing — loaded from Vault-rendered file at /tls/dify-secret-key
+      # Dify will use the SECRET_KEY env var; we set it from the file in startup.
+      SECRET_KEY: ${DIFY_SECRET_KEY:-change-me-seed-from-vault}
+      # Storage
+      STORAGE_TYPE: local
+      STORAGE_LOCAL_PATH: /app/storage
+      # Platform CA so Dify can call OpenAI-compatible endpoints that use our certs
+      NODE_EXTRA_CA_CERTS: /tls/ca.pem
+      # Vector store for KB chunk indexing
+      VECTOR_STORE: pgvector
+      PGVECTOR_HOST: postgres
+      PGVECTOR_PORT: 5432
+      PGVECTOR_USER: ${POSTGRES_USER:-platform}
+      PGVECTOR_PASSWORD: ${POSTGRES_PASSWORD:-platform}
+      PGVECTOR_DATABASE: ${POSTGRES_DB:-automation}
+      # Dify's own endpoint — used by worker to call back
+      DIFY_BASE_URL: http://dify-api:5001
+      # CORS — allow the Dify web UI (port 3002) to call this API across origins.
+      # CONSOLE_CORS_ALLOW_ORIGINS covers the /console/api/* routes (login, setup, etc.)
+      # WEB_API_CORS_ALLOW_ORIGINS covers the /api/* routes used by published apps.
+      CONSOLE_CORS_ALLOW_ORIGINS: ${DIFY_CORS_ALLOW_ORIGINS:-http://192.168.2.16:3002,http://localhost:3002}
+      WEB_API_CORS_ALLOW_ORIGINS: ${DIFY_CORS_ALLOW_ORIGINS:-http://192.168.2.16:3002,http://localhost:3002}
+    volumes:
+      - tls_dify_api:/tls:ro
+      - dify_storage:/app/storage
+    ports:
+      - "5001:5001"
+    depends_on:
+      dify-api-vault-agent:
+        condition: service_started
+      dify-migrate:
+        condition: service_completed_successfully
+      dify-db:
+        condition: service_healthy
+      dify-redis:
+        condition: service_started
+    # Exposed on the LAN so the Dify web console loaded in a browser can call the API.
+
+  dify-worker:
+    # Celery worker for async Dify tasks (document indexing, embeddings).
+    # Shares the same image and TLS volume as dify-api.
+    image: langgenius/dify-api:0.6.16
+    restart: unless-stopped
+    environment:
+      MODE: worker
+      LOG_LEVEL: INFO
+      DB_USERNAME: dify
+      DB_PASSWORD: ${DIFY_DB_PASSWORD:-dify}
+      DB_HOST: dify-db
+      DB_PORT: 5432
+      DB_DATABASE: dify
+      REDIS_HOST: dify-redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD:-dify-redis}
+      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD:-dify-redis}@dify-redis:6379/1
+      SECRET_KEY: ${DIFY_SECRET_KEY:-change-me-seed-from-vault}
+      STORAGE_TYPE: local
+      STORAGE_LOCAL_PATH: /app/storage
+      NODE_EXTRA_CA_CERTS: /tls/ca.pem
+      VECTOR_STORE: pgvector
+      PGVECTOR_HOST: postgres
+      PGVECTOR_PORT: 5432
+      PGVECTOR_USER: ${POSTGRES_USER:-platform}
+      PGVECTOR_PASSWORD: ${POSTGRES_PASSWORD:-platform}
+      PGVECTOR_DATABASE: ${POSTGRES_DB:-automation}
+      DIFY_BASE_URL: http://dify-api:5001
+    volumes:
+      - tls_dify_api:/tls:ro
+      - dify_storage:/app/storage
+    depends_on:
+      dify-api-vault-agent:
+        condition: service_started
+      dify-migrate:
+        condition: service_completed_successfully
+      dify-db:
+        condition: service_healthy
+      dify-redis:
+        condition: service_started
+
+  dify-sandbox:
+    # Isolated code execution sandbox for Dify's code node feature.
+    image: langgenius/dify-sandbox:0.2.10
+    restart: unless-stopped
+    environment:
+      API_KEY: ${DIFY_SANDBOX_API_KEY:-sandbox-default-key}
+      GIN_MODE: release
+      WORKER_TIMEOUT: 15
+
+  dify-web:
+    # Dify admin UI — exposed on host port 3002 for initial setup only.
+    # Once configured, admins manage KBs and apps through this UI or the platform API.
+    image: langgenius/dify-web:0.6.16
+    restart: unless-stopped
+    environment:
+      EDITION: SELF_HOSTED
+      CONSOLE_API_URL: ${DIFY_PUBLIC_API_URL:-http://192.168.2.16:5001}
+      APP_API_URL: ${DIFY_PUBLIC_API_URL:-http://192.168.2.16:5001}
+    ports:
+      - "3002:3000"
+    depends_on:
+      - dify-api
+
+  # ─── n8n Workflow Automation ────────────────────────────────────────────────
+  # n8n orchestrates document sync (GitHub/GitLab/Google Drive → Dify KB) and
+  # multi-channel delivery (Slack/Discord/Telegram → Dify → response).
+  # All credentials (source tokens, channel tokens) are stored in Vault.
+  # TLS certs are auto-issued and renewed by the n8n-vault-agent sidecar.
+
+  n8n-db:
+    # Internal Postgres for n8n's own state — isolated from platform DB.
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${N8N_DB_PASSWORD:-n8n}
+      POSTGRES_DB: n8n
+    volumes:
+      - n8n_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  n8n-vault-agent:
+    # Issues and auto-renews TLS cert for n8n.
+    <<: *vault-agent
+    environment:
+      VAULT_ADDR: http://vault:8200
+      SERVICE_NAME: n8n
+      CERT_COMMON_NAME: n8n
+      CERT_ALT_NAMES: n8n,localhost
+    volumes:
+      - ./infra/vault:/vault/scripts:ro
+      - vault_data:/vault/file:ro
+      - tls_n8n:/tls
+
+  n8n:
+    # n8n workflow automation engine.
+    # N8N_ENCRYPTION_KEY is set from DIFY_SECRET_KEY-equivalent Vault path.
+    # No sensitive credentials in env — workflows pull credentials from n8n's
+    # own encrypted credential store (key comes from Vault).
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD:-n8n}
+      # Encryption key for n8n credentials store — should be seeded from Vault.
+      # Run: infra/n8n/seed-vault-secrets.sh then set N8N_ENCRYPTION_KEY from Vault.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-change-me-seed-from-vault}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      # Sub-path prefix so n8n generates correct asset URLs when served at /n8n/
+      N8N_PATH: /n8n/
+      N8N_EDITOR_BASE_URL: https://dev.eclassmanager.com/n8n/
+      # Allow direct LAN access on http://192.168.2.16:5679 during local setup.
+      # Public/production access should still be routed through HTTPS.
+      N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE:-false}
+      # Public webhook base used for provider push events and externally reachable n8n webhooks.
+      WEBHOOK_URL: ${N8N_WEBHOOK_BASE_URL:-https://dev.eclassmanager.com/n8n/}
+      N8N_USER_MANAGEMENT_DISABLED: "true"
+      NODE_EXTRA_CA_CERTS: /tls/ca.pem
+    ports:
+      - "5679:5678"   # Admin UI on host:5679 for initial setup and template import
+    volumes:
+      - tls_n8n:/tls:ro
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      n8n-vault-agent:
+        condition: service_started
+      n8n-db:
+        condition: service_healthy
+
+  # Add n8n to workflow-service dependencies so sync APIs are available at start
+  # (workflow-service depends_on n8n is set on workflow-service service above)
 
 volumes:
   postgres_data:
@@ -610,9 +771,6 @@ volumes:
   vault_data:
   tls_api_gateway:
   tls_workflow_service:
-  tls_order_service:
-  tls_execution_engine:
-  tls_integration_service:
   tls_logging_service:
   rotation_control:
   tls_postgres:
@@ -622,5 +780,13 @@ volumes:
   tls_minio:
   tls_web:
   tls_web_ingress:
-  temporal_pg_data:
   flowise_data:
+  # Dify volumes
+  dify_db_data:
+  dify_redis_data:
+  dify_storage:
+  tls_dify_api:
+  # n8n volumes
+  n8n_db_data:
+  n8n_data:
+  tls_n8n:

@@ -140,7 +140,7 @@ export function LogsExplorer(): ReactElement {
         </div>
         <div className="builder-top-row">
           <label htmlFor="logs-source">Source</label>
-          <input id="logs-source" value={source} onChange={(event) => setSource(event.target.value)} placeholder="event-bus / integration-service / ..." />
+          <input id="logs-source" value={source} onChange={(event) => setSource(event.target.value)} placeholder="api-gateway / workflow-service / ..." />
           <span />
         </div>
         <div className="builder-top-row">

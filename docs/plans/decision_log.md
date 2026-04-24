@@ -21,3 +21,8 @@
 ## 2026-04-13
 - Hard-remove all AI assistant scope (`agent-service`, `rag-service`, `chat-service`, assistant UI/routes/contracts/schema/docs/tests).
 - AI capability is deferred and will be reintroduced later as a separate scoped initiative without compatibility shims.
+
+## 2026-04-18
+- Replace Flowise entirely with Dify and n8n orchestration. Dify manages KBs and LLM chats, while n8n manages workflow execution and webhook syncing.
+- Embed Vault Agent sidecars into Dify and n8n stack for secure secrets management instead of environment variables.
+- Update Operations AI Frontend to natively integrate with Dify knowledgebases, displaying sync progression and custom configurations.

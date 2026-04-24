@@ -7,241 +7,180 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Workflow {
-  id              String            @id @default(cuid())
-  name            String
-  description     String?
-  latestVersionId String?
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
-  versions        WorkflowVersion[]
-}
-
-model WorkflowVersion {
-  id         String   @id @default(cuid())
-  workflowId String
-  version    Int
-  status     String
-  isActive   Boolean  @default(false)
-  nodesJson  Json
-  createdAt  DateTime @default(now())
-  workflow   Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
-
-  @@unique([workflowId, version])
-}
-
-model Order {
-  id                String              @id @default(cuid())
-  workflowVersionId String
-  environmentId     String?
-  status            String
-  currentNodeOrder  Int                 @default(0)
-  currentStepIndex  Int                 @default(0)
-  failurePolicy     String
-  correlationId     String              @unique
-  lastError         String?
-  inputJson         Json
-  envSnapshotJson   Json?
-  initiatedBy       String
-  createdAt         DateTime            @default(now())
-  updatedAt         DateTime            @updatedAt
-  checkpoints       ExecutionCheckpoint[]
-  transitions       StatusTransition[]
-  stepExecutions    StepExecution[]
-  approvals         ApprovalDecision[]
-}
-
-model IntegrationProfile {
-  id             String   @id @default(cuid())
-  name           String
-  ownerId        String
-  executionType  String
-  authType       String   @default("API_KEY")
-  lifecycleState String   @default("ACTIVE")
-  baseConfigJson Json?
-  credentialJson Json?
-  isActive       Boolean  @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  shares         IntegrationShare[]
-
-  @@index([ownerId, updatedAt])
-}
-
-model UserEnvironment {
+model PlatformLog {
   id            String   @id @default(cuid())
-  name          String
-  ownerId       String
-  variablesJson Json
-  isDefault     Boolean  @default(false)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  shares        EnvironmentShare[]
-
-  @@index([ownerId, updatedAt])
-}
-
-model IntegrationShare {
-  id               String             @id @default(cuid())
-  integrationId    String
-  sharedWithUserId String
-  createdBy        String
-  createdAt        DateTime           @default(now())
-  integration      IntegrationProfile @relation(fields: [integrationId], references: [id], onDelete: Cascade)
-
-  @@unique([integrationId, sharedWithUserId])
-  @@index([sharedWithUserId, createdAt])
-}
-
-model EnvironmentShare {
-  id               String          @id @default(cuid())
-  environmentId    String
-  sharedWithUserId String
-  createdBy        String
-  createdAt        DateTime        @default(now())
-  environment      UserEnvironment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
-
-  @@unique([environmentId, sharedWithUserId])
-  @@index([sharedWithUserId, createdAt])
-}
-
-model ExecutionCheckpoint {
-  id         String   @id @default(cuid())
-  orderId    String
-  nodeOrder  Int
-  stepIndex  Int
-  createdAt  DateTime @default(now())
-  order      Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-}
-
-model StatusTransition {
-  id        String   @id @default(cuid())
-  orderId   String
-  from      String
-  to        String
-  reason    String?
-  createdAt DateTime @default(now())
-  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-}
-
-model StepExecution {
-  id              String   @id @default(cuid())
-  orderId         String
-  nodeId          String
-  stepId          String
-  status          String
-  retryCount      Int
-  durationMs      Int
-  errorSource     String?
-  errorMessage    String?
-  requestPayload  Json?
-  responsePayload Json?
-  startedAt       DateTime
-  finishedAt      DateTime
-  order           Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-}
-
-model ExecutionLog {
-  id            String   @id @default(cuid())
-  orderId       String
-  executionId   String?
-  workflowId    String?
-  workflowVersionId String?
-  nodeId        String?
-  stepId        String?
-  taskId        String?
-  initiatedBy   String?
   severity      String
   source        String
-  maskedPayload Json?
   message       String
+  maskedPayload Json?
+  correlationId String?
   durationMs    Int?
   createdAt     DateTime @default(now())
 
-  @@index([orderId, createdAt])
-  @@index([executionId, createdAt])
-  @@index([workflowId, workflowVersionId, createdAt])
+  @@index([source, createdAt])
+  @@index([correlationId])
+  @@index([severity, createdAt])
 }
 
-model WorkflowPublishAudit {
-  id                String   @id @default(cuid())
-  workflowId        String
-  workflowVersionId String   @unique
-  version           Int
-  correlationId     String?
-  eventTimestamp    DateTime?
-  status            String
-  errorMessage      String?
-  processedAt       DateTime?
-  createdAt         DateTime @default(now())
+// ─── RAG Knowledge Base ──────────────────────────────────────────────────────
+// Represents a user-configured knowledge source. Each KB maps to one Dify App.
+// The Dify API key is stored in Vault at:
+//   secret/data/platform/global/dify/{id}  →  api_key
+// Source credentials (GitHub token, GitLab token, Google Drive OAuth) are stored
+// in Vault at:
+//   secret/data/platform/users/{ownerId}/sources/{id}
+model RagKnowledgeBase {
+  id            String   @id @default(cuid())
+  name          String
+  description   String?
+
+  // Document source configuration (non-secret — credentials go in Vault)
+  sourceType    String   // "github" | "gitlab" | "googledrive" | "web" | "upload"
+  sourceUrl     String   // Repo URL, Drive folder URL, web URL, or "manual"
+  sourceBranch  String?  // For git sources: "main", "master"
+  sourcePath    String?  // Optional subfolder filter: "docs/"
+  syncSchedule  String?  // Cron expression or null (manual only). e.g. "0 */6 * * *"
+
+  // Dify app config (non-secret — API key goes in Vault)
+  difyAppUrl    String   @default("http://dify-api:5001")
+  difyDatasetId String?  // Dify Knowledge Base dataset ID (set after first sync)
+
+  // Scope and ownership
+  scope         String   @default("global") // "global" | "user"
+  ownerId       String?  // null = platform-wide KB; set = user-scoped KB
+  isDefault     Boolean  @default(false)    // Platform default KB for new threads
+  createdById   String
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  threads       RagDiscussionThread[]
+  config        RagKnowledgeBaseConfig?
+  syncJobs      RagKbSyncJob[]
+  deployments   RagChannelDeployment[]
+
+  @@index([ownerId, scope])
+  @@index([isDefault])
+  @@index([createdById])
+}
+
+// Per-KB configuration: admin sets platform defaults, users can override selectively.
+model RagKnowledgeBaseConfig {
+  id                String           @id @default(cuid())
+  knowledgeBaseId   String           @unique
+  knowledgeBase     RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  // Admin-controlled platform defaults
+  systemPromptBase  String?  // Base system prompt template set by admin
+  llmModel          String?  // e.g. "gpt-4o-mini"
+  temperature       Float?   // 0.0 – 1.0, default 0.2
+  topK              Int?     // Number of chunks retrieved, default 6
+
+  // User-customizable overrides (users can adjust these without admin)
+  responseStyle     String?  // "formal" | "casual" | "technical" | "friendly"
+  toneInstructions  String?  // Free-text: "Always be concise, use bullet points"
+  restrictionRules  String?  // "Only answer questions about topic X"
+  welcomeMessage    String?  // Custom greeting shown at chat start
+
   updatedAt         DateTime @updatedAt
+
+  @@index([knowledgeBaseId])
 }
 
-model ApprovalDecision {
-  id        String   @id @default(cuid())
-  orderId   String
-  nodeOrder Int?
-  decision  String
-  decidedBy String
-  comment   String?
-  createdAt DateTime @default(now())
-  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+// Tracks each document sync job — used to show progress in the UI.
+// Created when a sync is triggered; updated by n8n webhook callbacks.
+model RagKbSyncJob {
+  id                String           @id @default(cuid())
+  knowledgeBaseId   String
+  knowledgeBase     RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
 
-  @@index([orderId, createdAt])
+  trigger           String           // "manual" | "scheduled" | "webhook"
+  triggeredById     String?          // userId who triggered (null = scheduled)
+  status            String           @default("pending") // "pending"|"running"|"completed"|"failed"
+
+  // Progress tracking (updated by n8n callbacks)
+  filesTotal        Int?
+  filesProcessed    Int              @default(0)
+  chunksTotal       Int?
+  chunksProcessed   Int              @default(0)
+  errorMessage      String?
+
+  // n8n execution reference for traceability
+  n8nExecutionId    String?
+  n8nWebhookUrl     String?
+
+  // Dynamic workflow step tracking — populated by n8n progress callbacks
+  // JSON array of: [{name, status, startedAt, completedAt, errorMessage, logRef}]
+  stepsJson         Json?
+
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime         @default(now())
+
+  @@index([knowledgeBaseId, createdAt])
+  @@index([status])
+  @@index([triggeredById])
 }
 
+// Channel deployment — tracks where a KB is deployed for chat delivery.
+// Phase 2: n8n activates a pre-built workflow for each channel type.
+model RagChannelDeployment {
+  id              String           @id @default(cuid())
+  knowledgeBaseId String
+  knowledgeBase   RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  channelType     String   // "slack" | "discord" | "whatsapp" | "telegram" | "google_chat"
+  channelName     String   // User-defined label: "My Company Slack"
+  n8nWorkflowId   String?  // n8n workflow ID (set after activation)
+  status          String   @default("pending") // "pending"|"active"|"error"|"disabled"
+  ownerId         String   // User who configured this channel
+  errorMessage    String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([ownerId, channelType])
+  @@index([knowledgeBaseId])
+  @@index([status])
+}
+
+// ─── RAG Discussion Threads and Messages ─────────────────────────────────────
+// Threads persist conversation context. flowiseSessionId is kept for backward
+// compatibility with legacy Flowise-backed threads. New Dify threads use
+// difyConversationId which Dify manages for session continuity.
 model RagDiscussionThread {
-  id              String                 @id @default(cuid())
-  ownerId         String
-  title           String
-  flowiseSessionId String                @unique
-  createdAt       DateTime               @default(now())
-  updatedAt       DateTime               @updatedAt
-  lastMessageAt   DateTime
-  expiresAt       DateTime
-  messages        RagDiscussionMessage[]
+  id                 String                 @id @default(cuid())
+  ownerId            String
+
+  // Optional link to a knowledge base (null = legacy Flowise thread)
+  knowledgeBaseId    String?
+  knowledgeBase      RagKnowledgeBase?      @relation(fields: [knowledgeBaseId], references: [id], onDelete: SetNull)
+
+  title              String
+  // Legacy: Flowise session ID for pre-Dify threads
+  flowiseSessionId   String                 @unique
+  // Dify: conversation_id returned by Dify API (enables follow-up context)
+  difyConversationId String?
+
+  lastMessageAt      DateTime
+  expiresAt          DateTime
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+
+  messages           RagDiscussionMessage[]
 
   @@index([ownerId, lastMessageAt])
   @@index([expiresAt])
+  @@index([knowledgeBaseId])
 }
 
 model RagDiscussionMessage {
   id        String              @id @default(cuid())
-  threadId   String
-  role      String
+  threadId  String
+  role      String              // "user" | "assistant"
   content   String
   createdAt DateTime            @default(now())
   thread    RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 
   @@index([threadId, createdAt])
-}
-
-model NodeTemplate {
-  id           String              @id @default(cuid())
-  ownerId      String
-  name         String
-  description  String?
-  category     String?
-  tagsJson     Json?
-  nodeType     String
-  configJson   Json
-  metadataJson Json?
-  createdAt    DateTime            @default(now())
-  updatedAt    DateTime            @updatedAt
-  shares       NodeTemplateShare[]
-
-  @@index([ownerId, updatedAt])
-  @@index([nodeType, updatedAt])
-}
-
-model NodeTemplateShare {
-  id               String       @id @default(cuid())
-  templateId       String
-  sharedWithUserId String
-  createdBy        String
-  createdAt        DateTime     @default(now())
-  template         NodeTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
-
-  @@unique([templateId, sharedWithUserId])
-  @@index([sharedWithUserId, createdAt])
 }

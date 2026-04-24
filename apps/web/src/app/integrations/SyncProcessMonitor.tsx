@@ -1,0 +1,246 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { ReactElement } from "react";
+import { fetchSyncHistory, fetchSyncStatus, isActiveSyncStatus } from "./api";
+import type { Integration, SyncJob } from "./types";
+import { formatDate, normalizeSyncSteps, stepBadgeVariant, stepStatusEmoji } from "./types";
+import { StepLogDrawer } from "./StepLogDrawer";
+
+type Props = {
+  integrations: Integration[];
+  onMergeSyncJob: (knowledgeBaseId: string, job: SyncJob) => void;
+};
+
+function isNeverSynced(x: unknown): x is { status: "never_synced"; knowledgeBaseId: string } {
+  return Boolean(x && typeof x === "object" && (x as { status?: string }).status === "never_synced");
+}
+
+export function SyncProcessMonitor(props: Props): ReactElement | null {
+  const { integrations, onMergeSyncJob } = props;
+
+  const [kbId, setKbId] = useState<string>("");
+  const [historyJobs, setHistoryJobs] = useState<SyncJob[]>([]);
+  const [selectedHistoryJobId, setSelectedHistoryJobId] = useState<string | "latest">("latest");
+  const [polledJob, setPolledJob] = useState<SyncJob | null>(null);
+  const [logDrawer, setLogDrawer] = useState<{ syncJobId: string; stepName: string | null } | null>(null);
+
+  const sortedIntegrations = useMemo(
+    () => [...integrations].sort((left, right) => Number(right.isDefault) - Number(left.isDefault)),
+    [integrations]
+  );
+
+  const pickDefaultKbId = useCallback((): string => {
+    const withLatest = sortedIntegrations.find((i) => i.latestSyncJob != null);
+    return withLatest?.id ?? sortedIntegrations[0]?.id ?? "";
+  }, [sortedIntegrations]);
+
+  useEffect(() => {
+    if (kbId && sortedIntegrations.some((i) => i.id === kbId)) return;
+    setKbId(pickDefaultKbId());
+  }, [sortedIntegrations, kbId, pickDefaultKbId]);
+
+  const selectedKb = useMemo(() => sortedIntegrations.find((i) => i.id === kbId) ?? null, [sortedIntegrations, kbId]);
+
+  const loadHistory = useCallback(async (id: string) => {
+    if (!id) {
+      setHistoryJobs([]);
+      return;
+    }
+    try {
+      const res = await fetchSyncHistory(id, 50);
+      setHistoryJobs(res.jobs ?? []);
+    } catch {
+      setHistoryJobs([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadHistory(kbId);
+  }, [kbId, loadHistory]);
+
+  const latestJob = selectedKb?.latestSyncJob ?? null;
+
+  const baseJob: SyncJob | null = useMemo(() => {
+    if (selectedHistoryJobId === "latest") return latestJob;
+    return historyJobs.find((j) => j.id === selectedHistoryJobId) ?? latestJob;
+  }, [selectedHistoryJobId, historyJobs, latestJob]);
+
+  const effectiveJob: SyncJob | null = useMemo(() => {
+    if (!baseJob) return null;
+    if (polledJob && polledJob.id === baseJob.id) {
+      return { ...baseJob, ...polledJob };
+    }
+    return baseJob;
+  }, [baseJob, polledJob]);
+
+  useEffect(() => {
+    setPolledJob(null);
+  }, [selectedHistoryJobId, kbId]);
+
+  const hasAnyLatest = useMemo(() => integrations.some((i) => i.latestSyncJob != null), [integrations]);
+  const showForHistory = historyJobs.length > 0;
+  const visible = hasAnyLatest || showForHistory;
+
+  const pollActive = Boolean(effectiveJob && isActiveSyncStatus(effectiveJob.status));
+  const viewingJobId = effectiveJob?.id ?? null;
+
+  useEffect(() => {
+    if (!kbId || !pollActive || !viewingJobId) return;
+
+    const run = () => {
+      void (async () => {
+        try {
+          const res = await fetchSyncStatus(kbId);
+          if (isNeverSynced(res)) return;
+          const job = res as SyncJob;
+          onMergeSyncJob(kbId, job);
+          if (job.id === viewingJobId) setPolledJob(job);
+        } catch {
+          /* ignore */
+        }
+      })();
+    };
+
+    run();
+    const id = window.setInterval(run, 3000);
+    return () => window.clearInterval(id);
+  }, [kbId, pollActive, viewingJobId, onMergeSyncJob]);
+
+  if (!visible || sortedIntegrations.length === 0) return null;
+
+  const steps = normalizeSyncSteps(effectiveJob?.stepsJson);
+  const filesTotal = effectiveJob?.filesTotal ?? 0;
+  const filesProcessed = effectiveJob?.filesProcessed ?? 0;
+  const progressPct = filesTotal > 0 ? Math.min(100, Math.round((filesProcessed / filesTotal) * 100)) : 0;
+
+  return (
+    <section className="integrations-panel ops-sync-monitor">
+      <div className="integrations-panel-header ops-sync-monitor-header">
+        <div>
+          <h2>Sync Process Monitor</h2>
+          <p>Live steps from n8n, log drill-down, and sync history.</p>
+        </div>
+        <div className="ops-sync-monitor-controls">
+          <label className="ops-sync-monitor-select">
+            <span>Knowledge base</span>
+            <select
+              value={kbId}
+              onChange={(event) => {
+                setKbId(event.target.value);
+                setSelectedHistoryJobId("latest");
+              }}
+            >
+              {sortedIntegrations.map((i) => (
+                <option key={i.id} value={i.id}>
+                  {i.name}
+                  {i.isDefault ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="ops-sync-monitor-select">
+            <span>Sync job</span>
+            <select
+              value={selectedHistoryJobId}
+              onChange={(event) => {
+                const v = event.target.value;
+                setSelectedHistoryJobId(v === "latest" ? "latest" : v);
+              }}
+            >
+              <option value="latest">Latest{latestJob ? ` (${latestJob.status})` : ""}</option>
+              {historyJobs.map((j) => (
+                <option key={j.id} value={j.id}>
+                  {formatDate(j.createdAt ?? j.startedAt)} — {j.status} — {j.id.slice(0, 8)}…
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div className="ops-sync-monitor-title-row">
+        <h3 className="ops-sync-monitor-kb-title">{selectedKb?.name ?? "—"}</h3>
+        <div className="ops-sync-progress-bar" role="progressbar" aria-valuenow={progressPct} aria-valuemin={0} aria-valuemax={100}>
+          <div className="ops-sync-progress-bar-fill" style={{ width: `${filesTotal > 0 ? progressPct : 0}%` }} />
+        </div>
+        <span className="ops-sync-progress-label">
+          {filesTotal > 0 ? `${filesProcessed} / ${filesTotal} files` : `${filesProcessed} files processed`}
+        </span>
+      </div>
+
+      {effectiveJob?.errorMessage && !isActiveSyncStatus(effectiveJob.status) ? (
+        <p className="integrations-status-error ops-sync-job-error">{effectiveJob.errorMessage}</p>
+      ) : null}
+
+      <div className="integrations-table-wrap ops-sync-step-wrap">
+        <table className="integrations-table ops-sync-step-table">
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th>Status</th>
+              <th>Started</th>
+              <th>Duration</th>
+              <th aria-label="Logs" />
+            </tr>
+          </thead>
+          <tbody>
+            {effectiveJob && steps.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="ops-sync-step-empty">
+                  No step entries yet. When n8n reports steps to <code>stepsJson</code>, they appear here.
+                </td>
+              </tr>
+            ) : null}
+            {steps.map((step) => {
+              const variant = stepBadgeVariant(step.status);
+              const isErr = variant === "failed" || Boolean(step.errorMessage);
+              return (
+                <tr key={step.key} className={isErr ? "is-error" : undefined}>
+                  <td>
+                    <div className="ops-sync-task-cell">
+                      <span>{step.task}</span>
+                      {step.errorMessage ? <small className="ops-sync-inline-err">{step.errorMessage}</small> : null}
+                    </div>
+                  </td>
+                  <td>
+                    <span className={`ops-step-badge ops-step-badge-${variant}`}>
+                      {stepStatusEmoji(step.status)} {step.status}
+                    </span>
+                  </td>
+                  <td>{formatDate(step.startedAt)}</td>
+                  <td>{step.durationLabel}</td>
+                  <td>
+                    {effectiveJob ? (
+                      <button
+                        type="button"
+                        className="ops-log-icon-btn"
+                        title="View logs"
+                        aria-label={`View logs for ${step.task}`}
+                        onClick={() =>
+                          setLogDrawer({
+                            syncJobId: effectiveJob.id,
+                            stepName: step.logStepName
+                          })
+                        }
+                      >
+                        📋
+                      </button>
+                    ) : null}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {logDrawer ? (
+        <>
+          <button type="button" className="ops-log-drawer-backdrop" aria-label="Close log drawer" onClick={() => setLogDrawer(null)} />
+          <StepLogDrawer open onClose={() => setLogDrawer(null)} syncJobId={logDrawer.syncJobId} stepName={logDrawer.stepName} />
+        </>
+      ) : null}
+    </section>
+  );
+}

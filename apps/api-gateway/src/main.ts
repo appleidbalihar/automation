@@ -1,14 +1,17 @@
 // @ts-nocheck
-import Fastify from "fastify";
-import { appendFile, mkdir } from "node:fs/promises";
-import { connect as connectTls } from "node:tls";
-import amqp from "amqplib";
-import type { Channel, ChannelModel } from "amqplib";
 import { authHook, requireAnyRole } from "@platform/auth";
 import { loadConfig } from "@platform/config";
 import { PlatformEvents } from "@platform/contracts";
 import { createCorrelationId, logInfo } from "@platform/observability";
 import { connectAmqp, createTlsRuntime, tlsFetch } from "@platform/tls-runtime";
+import type { Channel, ChannelModel } from "amqplib";
+import amqp from "amqplib";
+import Fastify from "fastify";
+import { appendFile, mkdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { connect as connectTls } from "node:tls";
+import Redis from "ioredis";
 
 const config = loadConfig("api-gateway", 4000);
 const tlsRuntime = createTlsRuntime({
@@ -50,15 +53,81 @@ interface CertTarget {
   rotationTargets: string[];
 }
 
-const certTargets: CertTarget[] = [
-  { service: "api-gateway", url: "https://api-gateway:4000", mode: "security-endpoint", rotationTargets: ["api-gateway-vault-agent"] },
-  { service: "workflow-service", url: config.workflowServiceUrl, mode: "security-endpoint", rotationTargets: ["workflow-service-vault-agent"] },
-  { service: "order-service", url: config.orderServiceUrl, mode: "security-endpoint", rotationTargets: ["order-service-vault-agent"] },
-  { service: "execution-engine", url: config.executionEngineServiceUrl, mode: "security-endpoint", rotationTargets: ["execution-engine-vault-agent"] },
-  { service: "integration-service", url: config.integrationServiceUrl, mode: "security-endpoint", rotationTargets: ["integration-service-vault-agent"] },
-  { service: "logging-service", url: config.loggingServiceUrl, mode: "security-endpoint", rotationTargets: ["logging-service-vault-agent"] },
-  { service: "keycloak", url: config.keycloakUrl, mode: "tls-handshake", rotationTargets: ["keycloak-vault-agent", "keycloak"] }
-];
+/**
+ * Build the certificate monitoring targets dynamically.
+ *
+ * Default targets are derived from the loaded service config so they always
+ * match whatever services are actually wired in docker-compose.yml.
+ *
+ * Additional targets can be injected at runtime via the CERT_TARGETS env var
+ * (a JSON array of CertTarget objects), allowing new services to appear on the
+ * Security Health page without any code changes.
+ *
+ * Example CERT_TARGETS value:
+ *   '[{"service":"my-service","url":"https://my-service:5000","mode":"security-endpoint","rotationTargets":["my-service-vault-agent"]}]'
+ */
+function buildCertTargets(): CertTarget[] {
+  // Baseline targets — always present and derived from config (never hardcoded hostnames)
+  const defaults: CertTarget[] = [
+    {
+      service: "api-gateway",
+      url: `https://api-gateway:${config.port}`,
+      mode: "security-endpoint",
+      rotationTargets: ["api-gateway-vault-agent"]
+    },
+    {
+      service: "workflow-service",
+      url: config.workflowServiceUrl,
+      mode: "security-endpoint",
+      rotationTargets: ["workflow-service-vault-agent"]
+    },
+    {
+      service: "logging-service",
+      url: config.loggingServiceUrl,
+      mode: "security-endpoint",
+      rotationTargets: ["logging-service-vault-agent"]
+    },
+    {
+      service: "keycloak",
+      url: config.keycloakUrl,
+      mode: "tls-handshake",
+      rotationTargets: ["keycloak-vault-agent", "keycloak"]
+    }
+  ];
+
+  // Merge in any additional targets from the CERT_TARGETS env var
+  const rawExtra = String(process.env.CERT_TARGETS ?? "").trim();
+  if (!rawExtra) return defaults;
+
+  let extra: CertTarget[] = [];
+  try {
+    const parsed = JSON.parse(rawExtra);
+    if (!Array.isArray(parsed)) throw new TypeError("CERT_TARGETS must be a JSON array");
+    extra = parsed.filter(
+      (item): item is CertTarget =>
+        typeof item === "object" &&
+        item !== null &&
+        typeof item.service === "string" &&
+        typeof item.url === "string" &&
+        (item.mode === "security-endpoint" || item.mode === "tls-handshake") &&
+        Array.isArray(item.rotationTargets)
+    );
+  } catch (parseError) {
+    logInfo("CERT_TARGETS env var is invalid JSON — ignoring extra targets", {
+      error: parseError instanceof Error ? parseError.message : String(parseError)
+    });
+    return defaults;
+  }
+
+  // Merge: env-var targets override defaults with same service name
+  const merged = new Map<string, CertTarget>();
+  for (const target of defaults) merged.set(target.service, target);
+  for (const target of extra) merged.set(target.service, target);
+
+  return Array.from(merged.values());
+}
+
+const certTargets: CertTarget[] = buildCertTargets();
 
 const certStatusByService = new Map<string, Record<string, unknown>>();
 let certScanTimer: NodeJS.Timeout | undefined;
@@ -122,6 +191,122 @@ class EventPublisher {
 }
 
 const eventPublisher = new EventPublisher(config.rabbitmqUrl);
+
+// ─── OAuth2 Connect Integration ───────────────────────────────────────────────
+
+const OAUTH_SECRET = String(process.env.PLATFORM_OAUTH_SECRET ?? "").trim();
+const OAUTH_CALLBACK_BASE_URL = String(process.env.OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/ap").trim();
+const OAUTH_POST_CONNECT_REDIRECT = String(process.env.OAUTH_POST_CONNECT_REDIRECT ?? "https://dev.eclassmanager.com/integrations").trim();
+const VAULT_ADDR_OAUTH = String(process.env.VAULT_ADDR ?? "http://vault:8200").trim();
+const VAULT_KV_MOUNT_OAUTH = String(process.env.VAULT_KV_MOUNT ?? "secret").trim();
+const VAULT_NAMESPACE_OAUTH = String(process.env.VAULT_NAMESPACE ?? "").trim();
+const STATE_TTL_SECONDS = 600; // 10 minutes
+
+const oauthProviderConfig: Record<string, { clientIdEnv: string; clientSecretEnv: string; authUrl: string; tokenUrl: string; scope: string }> = {
+  github: {
+    clientIdEnv: "GITHUB_CLIENT_ID",
+    clientSecretEnv: "GITHUB_CLIENT_SECRET",
+    authUrl: "https://github.com/login/oauth/authorize",
+    tokenUrl: "https://github.com/login/oauth/access_token",
+    scope: "repo"
+  },
+  gitlab: {
+    clientIdEnv: "GITLAB_CLIENT_ID",
+    clientSecretEnv: "GITLAB_CLIENT_SECRET",
+    authUrl: "https://gitlab.com/oauth/authorize",
+    tokenUrl: "https://gitlab.com/oauth/token",
+    scope: "read_repository read_api"
+  },
+  google: {
+    clientIdEnv: "GOOGLE_CLIENT_ID",
+    clientSecretEnv: "GOOGLE_CLIENT_SECRET",
+    authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+    tokenUrl: "https://oauth2.googleapis.com/token",
+    scope: "https://www.googleapis.com/auth/drive.readonly"
+  }
+};
+
+function tryReadFile(p: string): Buffer | undefined {
+  try { return readFileSync(p); } catch { return undefined; }
+}
+
+let redisClient: Redis | null = null;
+function getRedis(): Redis {
+  if (!redisClient) {
+    const url = String(process.env.REDIS_URL ?? "rediss://:platformredis@redis:6379");
+    const tls = url.startsWith("rediss://") ? {
+      cert: tryReadFile(config.tlsCertPath),
+      key:  tryReadFile(config.tlsKeyPath),
+      ca:   tryReadFile(config.tlsCaPath),
+      rejectUnauthorized: false
+    } : undefined;
+    redisClient = new Redis(url, {
+      tls,
+      lazyConnect: true,
+      maxRetriesPerRequest: 2,
+      enableReadyCheck: false,
+      connectTimeout: 5000
+    });
+    redisClient.on("error", (err) => logInfo("OAuth Redis error", { error: err.message }));
+  }
+  return redisClient;
+}
+
+function signState(payload: string): string {
+  if (!OAUTH_SECRET) throw new Error("PLATFORM_OAUTH_SECRET not configured");
+  const mac = createHmac("sha256", OAUTH_SECRET).update(payload).digest("hex");
+  return `${payload}.${mac}`;
+}
+
+function verifyState(signed: string): { userId: string; kbId: string; provider: string; nonce: string } | null {
+  const lastDot = signed.lastIndexOf(".");
+  if (lastDot === -1) return null;
+  const payload = signed.slice(0, lastDot);
+  const mac = signed.slice(lastDot + 1);
+  const expected = createHmac("sha256", OAUTH_SECRET).update(payload).digest("hex");
+  try {
+    if (!timingSafeEqual(Buffer.from(mac, "hex"), Buffer.from(expected, "hex"))) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (data.exp < Date.now() / 1000) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+async function getOAuthCredentials(provider: string, kbId: string, userId: string): Promise<{ clientId: string; clientSecret: string } | null> {
+  try {
+    const url = new URL(`/internal/oauth-credentials/${provider}`, config.workflowServiceUrl);
+    url.searchParams.set("kbId", kbId);
+    url.searchParams.set("userId", userId);
+    const res = await tlsFetch(tlsRuntime, url, {
+      headers: { "x-internal-secret": OAUTH_SECRET }
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) return null;
+    const body = (await res.json()) as { clientId?: string; clientSecret?: string };
+    if (!body.clientId) return null;
+    return { clientId: body.clientId, clientSecret: body.clientSecret ?? "" };
+  } catch {
+    return null;
+  }
+}
+
+async function oauthVaultRead(logicalPath: string): Promise<Record<string, unknown>> {
+  const response = await fetch(new URL(`/v1/${VAULT_KV_MOUNT_OAUTH}/data/${logicalPath}`, VAULT_ADDR_OAUTH), {
+    headers: { "content-type": "application/json", ...(VAULT_NAMESPACE_OAUTH ? { "X-Vault-Namespace": VAULT_NAMESPACE_OAUTH } : {}) }
+  });
+  if (response.status === 404) return {};
+  if (!response.ok) return {};
+  const body = (await response.json()) as { data?: { data?: Record<string, unknown> } };
+  return body.data?.data ?? {};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function proxy(
   request: any,
@@ -213,6 +398,36 @@ function scheduleCertificateScan(delayMs: number = 4000): void {
     );
   }, Math.max(500, delayMs));
   certScanKickTimers.add(timer);
+}
+
+function hasValidInternalSyncToken(request: any): boolean {
+  const expected = String(config.n8nWebhookToken ?? "").trim();
+  if (!expected) return false;
+  const headerToken = String(request.headers["x-rag-sync-token"] ?? request.headers["x-n8n-webhook-token"] ?? "").trim();
+  const bearerToken = String(request.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
+  return headerToken === expected || bearerToken === expected;
+}
+
+function authorizeSyncProgressCallback(request: any, reply: any): boolean {
+  if (hasValidInternalSyncToken(request)) {
+    request.auth = {
+      userId: "system/n8n-sync",
+      roles: ["admin"]
+    };
+    return true;
+  }
+
+  const context = request.auth ?? { userId: "anonymous", roles: ["viewer"] };
+  if (!context.userId || context.userId === "anonymous") {
+    reply.code(401).send({ error: "UNAUTHENTICATED" });
+    return false;
+  }
+  const allowed = ["admin", "useradmin", "operator"].some((role) => context.roles.includes(role));
+  if (!allowed) {
+    reply.code(403).send({ error: "FORBIDDEN", requiredRoles: ["admin", "useradmin", "operator"] });
+    return false;
+  }
+  return true;
 }
 
 function isPendingRotationComplete(
@@ -621,7 +836,6 @@ app.get("/auth/me", { preHandler: requireAnyRole(["admin", "useradmin", "operato
 app.get("/health/dependencies", async (request, reply) => {
   const checks = await Promise.all([
     dependencyHealth("workflow-service", config.workflowServiceUrl),
-    dependencyHealth("order-service", config.orderServiceUrl),
     dependencyHealth("logging-service", config.loggingServiceUrl)
   ]);
   const ok = checks.every((item) => item.ok);
@@ -635,7 +849,6 @@ app.get("/health/dependencies", async (request, reply) => {
 app.get("/health/readiness", async (request, reply) => {
   const dependencies = await Promise.all([
     dependencyHealth("workflow-service", config.workflowServiceUrl),
-    dependencyHealth("order-service", config.orderServiceUrl),
     dependencyHealth("logging-service", config.loggingServiceUrl)
   ]);
   const tls = tlsRuntime.getStatus();
@@ -774,24 +987,12 @@ app.delete("/admin/secrets", { preHandler: requireAnyRole(["admin"]) }, async (r
   await proxy(request, reply, "DELETE", config.workflowServiceUrl, "/admin/secrets");
 });
 
-app.get("/admin/secrets/usage", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
-  await proxy(request, reply, "GET", config.workflowServiceUrl, "/admin/secrets/usage");
-});
-
 app.post("/admin/secrets/migrate", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
   await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/secrets/migrate");
 });
 
 app.get("/admin/secrets/catalog", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.workflowServiceUrl, "/admin/secrets/catalog");
-});
-
-app.post("/admin/reset/workflows-orders/preview", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/reset/workflows-orders/preview");
-});
-
-app.post("/admin/reset/workflows-orders/execute", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/admin/reset/workflows-orders/execute");
 });
 
 app.post("/admin/secrets/by-path", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
@@ -806,82 +1007,109 @@ app.delete("/admin/secrets/by-path", { preHandler: requireAnyRole(["admin"]) }, 
   await proxy(request, reply, "DELETE", config.workflowServiceUrl, "/admin/secrets/by-path");
 });
 
-app.post("/workflows", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/workflows");
+// ─── Knowledge Base Routes ────────────────────────────────────────────────────
+// All authenticated users can list and view KBs.
+// Create/delete/set-default require admin or useradmin role.
+
+app.get("/rag/integrations", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/integrations");
 });
 
-app.get("/workflows", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "GET", config.workflowServiceUrl, "/workflows");
+app.post("/rag/integrations", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/rag/integrations");
 });
 
-app.get("/workflows/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+app.patch("/rag/integrations/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/workflows/${id}`);
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/rag/integrations/${id}`);
 });
 
-app.get("/workflows/:id/versions/:versionId", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const { id, versionId } = request.params as { id: string; versionId: string };
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/workflows/${id}/versions/${versionId}`);
-});
-
-app.patch("/workflows/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+app.patch("/rag/integrations/:id/oauth-app-credentials", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/workflows/${id}`);
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/rag/integrations/${id}/oauth-app-credentials`);
 });
 
-app.post("/workflows/:id/draft", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+app.post("/rag/integrations/:id/set-default", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/draft`);
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/integrations/${id}/set-default`);
 });
 
-app.put("/workflows/:id/versions/:versionId/draft", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const { id, versionId } = request.params as { id: string; versionId: string };
-  await proxy(request, reply, "PUT", config.workflowServiceUrl, `/workflows/${id}/versions/${versionId}/draft`);
-});
-
-app.post("/workflows/:id/copy", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+app.delete("/rag/integrations/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/copy`);
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/integrations/${id}`);
 });
 
-app.delete("/workflows/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+app.get("/rag/knowledge-bases", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/knowledge-bases");
+});
+
+app.post("/rag/knowledge-bases", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/rag/knowledge-bases");
+});
+
+app.get("/rag/knowledge-bases/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/workflows/${id}`);
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/rag/knowledge-bases/${id}`);
 });
 
-app.post("/workflows/:id/publish", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+app.patch("/rag/knowledge-bases/:id/config", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/publish`);
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/config`);
 });
 
-app.post("/workflows/:id/versions/:versionId/publish", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
-  const { id, versionId } = request.params as { id: string; versionId: string };
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/versions/${versionId}/publish`);
-});
-
-app.post("/workflows/:id/versions/:versionId/activate", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
-  const { id, versionId } = request.params as { id: string; versionId: string };
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/workflows/${id}/versions/${versionId}/activate`);
-});
-
-app.post("/workflows/import", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/workflows/import");
-});
-
-app.get("/workflows/:id/export", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+app.delete("/rag/knowledge-bases/:id", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/workflows/${id}/export`);
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/knowledge-bases/${id}`);
 });
 
-app.post("/planner/draft", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/planner/draft");
-});
-
-app.get("/workflows/:id/publish-audits", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+app.post("/rag/knowledge-bases/:id/set-default", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/workflows/${id}/publish-audits`);
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/set-default`);
 });
 
+app.post("/rag/knowledge-bases/:id/sync", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync`);
+});
+
+app.post("/rag/knowledge-bases/:id/sync-cancel", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-cancel`);
+});
+
+app.get("/rag/knowledge-bases/:id/sync-status", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-status`);
+});
+
+app.get("/rag/knowledge-bases/:id/sync-history", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-history`);
+});
+
+// sync-progress is called by n8n internally. n8n uses a shared callback token
+// because it is not an interactive Keycloak user.
+app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
+  if (!authorizeSyncProgressCallback(request, reply)) return;
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-progress`);
+});
+
+// ─── Channel Deployment Routes (Phase 2) ─────────────────────────────────────
+app.get("/rag/channels", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/channels");
+});
+
+app.post("/rag/channels", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/rag/channels");
+});
+
+app.delete("/rag/channels/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/channels/${id}`);
+});
+
+// ─── RAG Discussion Routes ────────────────────────────────────────────────────
 app.get("/rag/discussions", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/discussions");
 });
@@ -905,211 +1133,6 @@ app.delete("/rag/discussions/:id", { preHandler: requireAnyRole(["admin", "usera
   await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/discussions/${id}`);
 });
 
-app.post("/node-templates/import", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/node-templates/import");
-});
-
-app.post("/node-templates", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/node-templates");
-});
-
-app.get("/node-templates", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "GET", config.workflowServiceUrl, "/node-templates");
-});
-
-app.get("/node-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/node-templates/${id}`);
-});
-
-app.patch("/node-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/node-templates/${id}`);
-});
-
-app.delete("/node-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/node-templates/${id}`);
-});
-
-app.post("/node-templates/:id/duplicate", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/node-templates/${id}/duplicate`);
-});
-
-app.get("/node-templates/:id/shares", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/node-templates/${id}/shares`);
-});
-
-app.post("/node-templates/:id/share", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/node-templates/${id}/share`);
-});
-
-app.delete("/node-templates/:id/share/:username", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const params = request.params as { id: string; username: string };
-  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/node-templates/${params.id}/share/${params.username}`);
-});
-
-app.get("/node-templates/:id/export", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/node-templates/${id}/export`);
-});
-
-app.post("/integrations", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/integrations");
-});
-
-app.get("/integrations", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "GET", config.workflowServiceUrl, "/integrations");
-});
-
-app.get("/integrations/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/integrations/${id}`);
-});
-
-app.patch("/integrations/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/integrations/${id}`);
-});
-
-app.get("/integrations/:id/shares", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/integrations/${id}/shares`);
-});
-
-app.post("/integrations/:id/share", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/integrations/${id}/share`);
-});
-
-app.delete("/integrations/:id/share/:username", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const params = request.params as { id: string; username: string };
-  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/integrations/${params.id}/share/${params.username}`);
-});
-
-app.post("/integrations/:id/duplicate", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/integrations/${id}/duplicate`);
-});
-
-app.get("/integrations/:id/usage", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/integrations/${id}/usage`);
-});
-
-app.post("/integrations/:id/test", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/integrations/${id}/test`);
-});
-
-app.post("/integrations/:id/activate", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/integrations/${id}/activate`);
-});
-
-app.post("/integrations/:id/deactivate", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/integrations/${id}/deactivate`);
-});
-
-app.delete("/integrations/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/integrations/${id}`);
-});
-
-app.post("/environments", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.workflowServiceUrl, "/environments");
-});
-
-app.get("/environments", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "GET", config.workflowServiceUrl, "/environments");
-});
-
-app.get("/environments/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/environments/${id}`);
-});
-
-app.patch("/environments/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/environments/${id}`);
-});
-
-app.get("/environments/:id/shares", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.workflowServiceUrl, `/environments/${id}/shares`);
-});
-
-app.post("/environments/:id/share", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/environments/${id}/share`);
-});
-
-app.delete("/environments/:id/share/:username", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const params = request.params as { id: string; username: string };
-  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/environments/${params.id}/share/${params.username}`);
-});
-
-app.post("/environments/:id/duplicate", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.workflowServiceUrl, `/environments/${id}/duplicate`);
-});
-
-app.delete("/environments/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/environments/${id}`);
-});
-
-app.post("/orders/execute", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  await proxy(request, reply, "POST", config.orderServiceUrl, "/orders/execute");
-});
-
-app.get("/orders", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "GET", config.orderServiceUrl, "/orders");
-});
-
-app.get("/orders/approvals", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  await proxy(request, reply, "GET", config.orderServiceUrl, "/orders/approvals");
-});
-
-app.get("/orders/:id/approvals", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.orderServiceUrl, `/orders/${id}/approvals`);
-});
-
-app.get("/orders/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "GET", config.orderServiceUrl, `/orders/${id}`);
-});
-
-app.post("/orders/:id/request-approval", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.orderServiceUrl, `/orders/${id}/request-approval`);
-});
-
-app.post("/orders/:id/approve", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.orderServiceUrl, `/orders/${id}/approve`);
-});
-
-app.post("/orders/:id/reject", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.orderServiceUrl, `/orders/${id}/reject`);
-});
-
-app.post("/orders/:id/retry", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.orderServiceUrl, `/orders/${id}/retry`);
-});
-
-app.post("/orders/:id/rollback", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
-  const id = (request.params as { id: string }).id;
-  await proxy(request, reply, "POST", config.orderServiceUrl, `/orders/${id}/rollback`);
-});
-
 app.get("/logs", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.loggingServiceUrl, "/logs");
 });
@@ -1117,6 +1140,171 @@ app.get("/logs", { preHandler: requireAnyRole(["admin", "useradmin", "operator",
 app.get("/logs/timeline", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.loggingServiceUrl, "/logs/timeline");
 });
+
+// Proxy RAG sync job logs query to logging service (reads from OpenSearch with Postgres fallback)
+app.get("/logs/sync-job", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.loggingServiceUrl, "/logs/sync-job");
+});
+
+// ─── OAuth2 routes ────────────────────────────────────────────────────────────
+
+// GET /oauth/connect/:provider?kbId=xxx
+// JWT-authenticated. Generates HMAC-signed state, stores in Redis, redirects to provider.
+app.get("/oauth/connect/:provider", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const { provider } = request.params as { provider: string };
+  const { kbId, clientId: inlineClientId } = request.query as { kbId?: string; clientId?: string };
+  const provCfg = oauthProviderConfig[provider];
+  if (!provCfg) return reply.code(400).send({ error: "UNKNOWN_PROVIDER", provider });
+  if (!kbId) return reply.code(400).send({ error: "MISSING_KB_ID" });
+
+  const userId = request.auth?.userId;
+  if (!userId) return reply.code(401).send({ error: "UNAUTHORIZED" });
+
+  // Prefer clientId passed inline (just registered) over Vault lookup to avoid timing issues
+  let clientId = String(inlineClientId ?? "").trim();
+  if (!clientId) {
+    const oauthCreds = await getOAuthCredentials(provider, kbId, userId);
+    if (!oauthCreds) return reply.code(503).send({ error: "OAUTH_NOT_CONFIGURED", provider });
+    clientId = oauthCreds.clientId;
+  }
+
+  const nonce = randomBytes(24).toString("hex");
+  const payload = Buffer.from(JSON.stringify({ userId, kbId, provider, nonce, exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS })).toString("base64url");
+  const state = signState(payload);
+
+  const redirectUri = `${OAUTH_CALLBACK_BASE_URL}/oauth/callback/${provider}`;
+  const authorizeUrl = new URL(provCfg.authUrl);
+  authorizeUrl.searchParams.set("client_id", clientId);
+  authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+  authorizeUrl.searchParams.set("scope", provCfg.scope);
+  authorizeUrl.searchParams.set("state", state);
+  if (provider === "google") {
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("access_type", "offline");
+    authorizeUrl.searchParams.set("prompt", "consent");
+  }
+
+  // If caller wants a JSON response (browser SPA using fetch + auth header), return URL instead of 302
+  const { json } = request.query as { json?: string };
+  if (json === "1") {
+    return reply.send({ url: authorizeUrl.toString() });
+  }
+  return reply.redirect(authorizeUrl.toString());
+});
+
+// GET /oauth/callback/:provider?code=xxx&state=xxx
+// Unauthenticated — browser arrives here from provider redirect.
+// State HMAC + Redis validates identity. Exchanges code, stores tokens via workflow-service.
+app.get("/oauth/callback/:provider", async (request, reply) => {
+  const { provider } = request.params as { provider: string };
+  const { code, state, error: providerError } = request.query as { code?: string; state?: string; error?: string };
+
+  if (providerError) {
+    logInfo("OAuth provider returned error", { provider, error: providerError });
+    return reply.redirect(`${OAUTH_POST_CONNECT_REDIRECT}?oauth_error=${encodeURIComponent(providerError)}&provider=${provider}`);
+  }
+
+  if (!code || !state) return reply.code(400).send({ error: "MISSING_CODE_OR_STATE" });
+
+  const provCfg = oauthProviderConfig[provider];
+  if (!provCfg) return reply.code(400).send({ error: "UNKNOWN_PROVIDER" });
+
+  // 1. Verify HMAC signature
+  const stateData = verifyState(state);
+  if (!stateData || stateData.provider !== provider) {
+    logInfo("OAuth state verification failed", { provider });
+    return reply.code(400).send({ error: "INVALID_STATE" });
+  }
+
+  // 2. Validate Redis single-use token (non-fatal on Redis error — code is also single-use at provider)
+  try {
+    const deleted = await getRedis().del(`oauth:state:${stateData.nonce}`);
+    if (deleted === 0) {
+      return reply.redirect(`${OAUTH_POST_CONNECT_REDIRECT}?oauth_error=state_replayed&provider=${provider}`);
+    }
+  } catch (err) {
+    logInfo("OAuth state Redis del failed — continuing", { error: err instanceof Error ? err.message : String(err) });
+  }
+
+  // 3. Read per-integration client credentials from Vault via workflow-service
+  const oauthCreds = await getOAuthCredentials(provider, stateData.kbId, stateData.userId);
+  const clientId = oauthCreds?.clientId ?? "";
+  const clientSecret = oauthCreds?.clientSecret ?? "";
+  if (!clientId || !clientSecret) return reply.code(503).send({ error: "OAUTH_NOT_CONFIGURED", provider });
+
+  // 4. Exchange code for tokens
+  const redirectUri = `${OAUTH_CALLBACK_BASE_URL}/oauth/callback/${provider}`;
+  let tokenPayload: Record<string, unknown>;
+  try {
+    const tokenRes = await fetch(provCfg.tokenUrl, {
+      method: "POST",
+      headers: { "accept": "application/json", "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri, grant_type: "authorization_code" }).toString()
+    });
+    tokenPayload = (await tokenRes.json()) as Record<string, unknown>;
+    if (tokenPayload.error) throw new Error(String(tokenPayload.error));
+  } catch (err) {
+    logInfo("OAuth token exchange failed", { provider, error: err instanceof Error ? err.message : String(err) });
+    return reply.redirect(`${OAUTH_POST_CONNECT_REDIRECT}?oauth_error=token_exchange_failed&provider=${provider}`);
+  }
+
+  const accessToken = String(tokenPayload.access_token ?? "").trim();
+  const refreshToken = String(tokenPayload.refresh_token ?? "").trim();
+  const expiresIn = Number(tokenPayload.expires_in ?? 0);
+  if (!accessToken) {
+    logInfo("OAuth token exchange: no access_token in response", { provider });
+    return reply.redirect(`${OAUTH_POST_CONNECT_REDIRECT}?oauth_error=no_access_token&provider=${provider}`);
+  }
+
+  // 5. Forward tokens to workflow-service internal endpoint
+  const tokenExpiry = expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000).toISOString() : undefined;
+  try {
+    const wfRes = await tlsFetch(tlsRuntime, new URL(`/internal/oauth-token/${stateData.kbId}`, config.workflowServiceUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-internal-secret": OAUTH_SECRET },
+      body: JSON.stringify({ userId: stateData.userId, provider, accessToken, refreshToken: refreshToken || undefined, tokenExpiry })
+    });
+    if (!wfRes.ok) {
+      const body = await wfRes.text().catch(() => "");
+      logInfo("OAuth workflow-service token store failed", { provider, status: wfRes.status, body });
+      return reply.redirect(`${OAUTH_POST_CONNECT_REDIRECT}?oauth_error=store_failed&provider=${provider}`);
+    }
+  } catch (err) {
+    logInfo("OAuth workflow-service call failed", { provider, error: err instanceof Error ? err.message : String(err) });
+    return reply.redirect(`${OAUTH_POST_CONNECT_REDIRECT}?oauth_error=store_failed&provider=${provider}`);
+  }
+
+  // 6. Redirect operator back to integrations page with success signal
+  return reply.redirect(`${OAUTH_POST_CONNECT_REDIRECT}?connected=true&provider=${provider}&kbId=${stateData.kbId}`);
+});
+
+// DELETE /oauth/token/:provider?kbId=xxx
+// JWT-authenticated. Disconnects OAuth — removes OAuth token fields from Vault, sets auth_method back to "pat".
+app.delete("/oauth/token/:provider", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const { provider } = request.params as { provider: string };
+  const { kbId } = request.query as { kbId?: string };
+  const userId = request.auth?.userId;
+  if (!userId) return reply.code(401).send({ error: "UNAUTHORIZED" });
+  if (!kbId) return reply.code(400).send({ error: "MISSING_KB_ID" });
+  if (!oauthProviderConfig[provider]) return reply.code(400).send({ error: "UNKNOWN_PROVIDER" });
+
+  try {
+    const wfRes = await tlsFetch(tlsRuntime, new URL(`/internal/oauth-token/${kbId}`, config.workflowServiceUrl), {
+      method: "DELETE",
+      headers: { "content-type": "application/json", "x-internal-secret": OAUTH_SECRET },
+      body: JSON.stringify({ userId, provider })
+    });
+    if (!wfRes.ok) {
+      const body = await wfRes.text().catch(() => "");
+      return reply.code(wfRes.status).send({ error: "DISCONNECT_FAILED", details: body });
+    }
+    return reply.code(200).send({ ok: true });
+  } catch (err) {
+    return reply.code(502).send({ error: "UPSTREAM_UNAVAILABLE", details: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.addHook("onClose", async () => {
   if (certScanTimer) {
@@ -1129,6 +1317,7 @@ app.addHook("onClose", async () => {
   certScanKickTimers.clear();
   await eventPublisher.close();
   await tlsRuntime.close();
+  await redisClient?.quit().catch(() => undefined);
 });
 
 async function start(): Promise<void> {

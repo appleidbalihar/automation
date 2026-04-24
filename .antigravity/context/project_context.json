@@ -1,0 +1,36 @@
+{
+  "projectName": "Enterprise Automation Platform",
+  "path": "/home/bali/09_automationplatform",
+  "version": "0.1.0",
+  "architecture": "microservices",
+  "techStack": {
+    "packageManager": "pnpm@9.15.0",
+    "monorepo": "turbo",
+    "frontend": "Next.js 15, React 19, ReactFlow",
+    "backend": "Fastify, TypeScript, amqplib, ioredis"
+  },
+  "modules": {
+    "apps": [
+      "api-gateway",
+      "logging-service",
+      "web",
+      "workflow-service"
+    ],
+    "packages": [
+      "auth",
+      "config",
+      "contracts",
+      "db",
+      "observability",
+      "tls-runtime",
+      "ui-kit"
+    ]
+  },
+  "keyConcepts": [
+    "Workflow Execution Checkpoint",
+    "Visual node builder (ReactFlow)",
+    "Action Retry / Rollback system",
+    "Enterprise UI/UX compliance",
+    "RAG + Chat service integration"
+  ]
+}

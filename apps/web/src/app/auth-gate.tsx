@@ -86,7 +86,7 @@ function LoginPanel({
         <h1>{mode === "login" ? "Automation Platform Sign In" : "Automation Platform Registration"}</h1>
         <p>
           {mode === "login"
-            ? "Sign in with your Keycloak account to access workflows, orders, logs, and operations."
+            ? "Sign in with the application account platform-admin / admin123. The Keycloak console admin account is separate."
             : "Create your account. The user will be provisioned in Keycloak automatically."}
         </p>
         <div className="integration-tabs">

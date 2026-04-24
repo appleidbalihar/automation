@@ -4,7 +4,9 @@ import {
   RAG_DISCUSSION_RETENTION_DAYS,
   buildRagThreadExpiry,
   deriveRagThreadTitle,
-  extractFlowiseText
+  extractFlowiseText,
+  mapRagDiscussionSummary,
+  mapRagDiscussionThread
 } from "../src/rag-chat.js";
 
 test("deriveRagThreadTitle trims and truncates first prompt", () => {
@@ -29,4 +31,33 @@ test("extractFlowiseText prefers text and falls back to json", () => {
 
 test("extractFlowiseText rejects unusable payloads", () => {
   assert.throws(() => extractFlowiseText({}), /FLOWISE_EMPTY_RESPONSE/);
+});
+
+test("discussion mappers expose dify vs legacy backend metadata", () => {
+  const legacySummary = mapRagDiscussionSummary({
+    id: "legacy-thread",
+    title: "Legacy",
+    createdAt: new Date("2026-04-15T00:00:00.000Z"),
+    updatedAt: new Date("2026-04-15T00:00:00.000Z"),
+    lastMessageAt: new Date("2026-04-15T00:00:00.000Z"),
+    expiresAt: new Date("2026-04-22T00:00:00.000Z"),
+    knowledgeBaseId: null
+  });
+  assert.equal(legacySummary.backend, "legacy-flowise");
+  assert.equal(legacySummary.knowledgeBaseId, undefined);
+
+  const difyThread = mapRagDiscussionThread(
+    {
+      id: "dify-thread",
+      title: "Dify",
+      createdAt: new Date("2026-04-15T00:00:00.000Z"),
+      updatedAt: new Date("2026-04-15T00:00:00.000Z"),
+      lastMessageAt: new Date("2026-04-15T00:00:00.000Z"),
+      expiresAt: new Date("2026-04-22T00:00:00.000Z"),
+      knowledgeBaseId: "kb-1"
+    },
+    []
+  );
+  assert.equal(difyThread.backend, "dify");
+  assert.equal(difyThread.knowledgeBaseId, "kb-1");
 });

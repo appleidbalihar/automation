@@ -8,12 +8,8 @@ import { fetchIdentity } from "./auth-client";
 
 const baseNavItems: Array<{ href: string; label: string }> = [
   { href: "/dashboard", label: "Dashboard" },
+  { href: "/operations-ai/setup", label: "Operations AI Setup" },
   { href: "/operations-ai", label: "Operations AI" },
-  { href: "/node-library", label: "Node Library" },
-  { href: "/integrations", label: "External Integrations" },
-  { href: "/workflows", label: "Workflow Builder" },
-  { href: "/orders", label: "Orders" },
-  { href: "/approvals", label: "Approvals" },
   { href: "/logs", label: "Logs" }
 ];
 

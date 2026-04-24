@@ -5,6 +5,7 @@ import type { ReactElement } from "react";
 import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
 import { resolveApiBase } from "./api-base";
 
+
 type SecretItem = {
   path: string;
   key: string;
@@ -16,7 +17,6 @@ type SecretItem = {
   resourceType?: string;
   resourceId?: string | null;
   resourceName?: string | null;
-  workflowCount?: number | null;
 };
 
 type SecretCatalog = {
@@ -25,24 +25,11 @@ type SecretCatalog = {
   items: SecretItem[];
 };
 
-type UsageResponse = {
-  ref: string;
-  usage: {
-    integrations: Array<{ id: string; name: string; ownerId: string }>;
-    environments: Array<{ id: string; name: string; ownerId: string }>;
-    workflows: Array<{ id: string; workflowId: string; version: number }>;
-  };
-};
-
 function formatTs(value?: string | null): string {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
-}
-
-function toVaultRef(path: string, key: string): string {
-  return `vault:secret/data/${path}#${key}`;
 }
 
 function describeUsage(item: SecretItem): string {
@@ -72,8 +59,6 @@ export function AdminSecretsPanel(): ReactElement {
   const [keyName, setKeyName] = useState<string>("");
   const [value, setValue] = useState<string>("");
 
-  const [usage, setUsage] = useState<UsageResponse["usage"] | null>(null);
-  const [selectedRef, setSelectedRef] = useState<string>("");
 
   async function requestJson<T>(pathValue: string, options?: RequestInit): Promise<T> {
     const auth = authHeaderFromStoredToken();
@@ -164,24 +149,6 @@ export function AdminSecretsPanel(): ReactElement {
     }
   }
 
-  async function traceUsage(): Promise<void> {
-    const ref = selectedRef.trim();
-    if (!ref) {
-      setUsage(null);
-      return;
-    }
-    setStatus("Loading usage...");
-    setError("");
-    try {
-      const payload = await requestJson<UsageResponse>(`/admin/secrets/usage?ref=${encodeURIComponent(ref)}`);
-      setUsage(payload.usage);
-      setStatus("Usage loaded.");
-    } catch (usageError) {
-      setStatus("");
-      setError(usageError instanceof Error ? usageError.message : "Failed to load usage");
-    }
-  }
-
   if (!isAdmin && !loading) {
     return (
       <section className="card">
@@ -198,6 +165,64 @@ export function AdminSecretsPanel(): ReactElement {
         <p>All configured Vault secrets are listed here for platform-admin management.</p>
         {status ? <p className="ops-status-line">{status}</p> : null}
         {error ? <p className="ops-error">{error}</p> : null}
+      </section>
+
+      <section className="card">
+        <h3 style={{ marginTop: 0 }}>Integration OAuth Credentials</h3>
+        <p style={{ marginTop: 0, fontSize: "0.88rem", color: "#475569" }}>
+          Per-integration OAuth App credentials (Client ID / Client Secret). Each knowledge source stores its own credentials in Vault.
+          To update credentials, open the integration in <a href="/integrations">Operations AI Setup</a> and edit the OAuth tab.
+        </p>
+        {(() => {
+          // Group by (ownerId, resourceId) — find unique integrations that have oauth_client_id or oauth_client_secret
+          type IntegrationRow = { userId: string; kbId: string; kbName: string | null; provider: string; hasClientId: boolean; hasClientSecret: boolean; authMethod: string | null };
+          const rowMap = new Map<string, IntegrationRow>();
+          for (const item of items) {
+            if (item.resourceType !== "integration" || !item.ownerId || !item.resourceId) continue;
+            const rowKey = `${item.ownerId}:${item.resourceId}`;
+            if (!rowMap.has(rowKey)) {
+              rowMap.set(rowKey, { userId: item.ownerId, kbId: item.resourceId, kbName: item.resourceName ?? null, provider: "", hasClientId: false, hasClientSecret: false, authMethod: null });
+            }
+            const row = rowMap.get(rowKey)!;
+            if (item.key === "oauth_client_id") row.hasClientId = true;
+            if (item.key === "oauth_client_secret") row.hasClientSecret = true;
+            if (item.key === "auth_method") row.authMethod = item.value;
+            // Infer provider from github_token / auth_method path etc.
+            if (item.key === "github_token") row.provider = "github";
+            if (item.key === "gitlab_token") row.provider = "gitlab";
+            if (item.key === "googledrive_access_token") row.provider = "googledrive";
+          }
+          const rows = Array.from(rowMap.values());
+          if (rows.length === 0) {
+            return <p style={{ fontSize: "0.88rem", color: "#64748b" }}>No integrations with stored credentials found.</p>;
+          }
+          return (
+            <div className="ops-table-wrap">
+              <table className="ops-table">
+                <thead>
+                  <tr>
+                    <th>User</th>
+                    <th>Integration</th>
+                    <th>Provider</th>
+                    <th>OAuth App</th>
+                    <th>Auth Method</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row) => (
+                    <tr key={`${row.userId}:${row.kbId}`}>
+                      <td>{row.userId}</td>
+                      <td>{row.kbName ?? row.kbId}</td>
+                      <td>{row.provider || "—"}</td>
+                      <td>{row.hasClientId ? "✓ Configured" : "✗ Not set"}</td>
+                      <td>{row.authMethod === "oauth" ? "🔗 OAuth" : row.authMethod === "pat" ? "🔑 PAT" : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        })()}
       </section>
 
       <section className="card">
@@ -237,17 +262,15 @@ export function AdminSecretsPanel(): ReactElement {
                 <th>Key</th>
                 <th>Purpose</th>
                 <th>Used By</th>
-                <th>Workflows</th>
                 <th>Value</th>
                 <th>Version</th>
                 <th>Updated</th>
-                <th>Action</th>
               </tr>
             </thead>
             <tbody>
               {items.length === 0 ? (
                 <tr>
-                  <td colSpan={9}>{loading ? "Loading..." : "No secrets found."}</td>
+                  <td colSpan={7}>{loading ? "Loading..." : "No secrets found."}</td>
                 </tr>
               ) : (
                 items.map((item) => (
@@ -256,111 +279,15 @@ export function AdminSecretsPanel(): ReactElement {
                     <td>{item.key}</td>
                     <td>{item.purpose ?? "Platform Secret"}</td>
                     <td>{describeUsage(item)}</td>
-                    <td>{item.workflowCount ?? 0}</td>
                     <td>{item.value}</td>
                     <td>{item.version}</td>
                     <td>{formatTs(item.updatedAt)}</td>
-                    <td>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setPath(item.path);
-                          setKeyName(item.key);
-                          const ref = toVaultRef(item.path, item.key);
-                          setSelectedRef(ref);
-                          setUsage(null);
-                          setStatus("Loading usage...");
-                          setError("");
-                          requestJson<UsageResponse>(`/admin/secrets/usage?ref=${encodeURIComponent(ref)}`)
-                            .then((payload) => {
-                              setUsage(payload.usage);
-                              setStatus("Usage loaded.");
-                            })
-                            .catch((usageError) => {
-                              setStatus("");
-                              setError(usageError instanceof Error ? usageError.message : "Failed to load usage");
-                            });
-                        }}
-                      >
-                        Select
-                      </button>
-                    </td>
                   </tr>
                 ))
               )}
             </tbody>
           </table>
         </div>
-      </section>
-
-      <section className="card">
-        <h3 style={{ marginTop: 0 }}>Usage</h3>
-        <p style={{ marginTop: 0 }}>
-          Select a secret row to see where it is used. Reference: <code>{selectedRef || "-"}</code>
-        </p>
-        <div className="ops-grid">
-          <button type="button" onClick={() => traceUsage().catch(() => undefined)} disabled={!selectedRef}>
-            Refresh Usage
-          </button>
-        </div>
-        {usage ? (
-          <>
-            <div className="ops-table-wrap" style={{ marginTop: 12 }}>
-              <table className="ops-table">
-                <thead>
-                  <tr>
-                    <th>Resource</th>
-                    <th>Count</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>Integrations</td>
-                    <td>{usage.integrations.length}</td>
-                  </tr>
-                  <tr>
-                    <td>Environments</td>
-                    <td>{usage.environments.length}</td>
-                  </tr>
-                  <tr>
-                    <td>Workflow Versions</td>
-                    <td>{usage.workflows.length}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <div className="ops-table-wrap" style={{ marginTop: 12 }}>
-              <table className="ops-table">
-                <thead>
-                  <tr>
-                    <th>Type</th>
-                    <th>Used In</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>Integrations</td>
-                    <td>{usage.integrations.length > 0 ? usage.integrations.map((entry) => entry.name).join(", ") : "-"}</td>
-                  </tr>
-                  <tr>
-                    <td>Environments</td>
-                    <td>{usage.environments.length > 0 ? usage.environments.map((entry) => entry.name).join(", ") : "-"}</td>
-                  </tr>
-                  <tr>
-                    <td>Workflow Versions</td>
-                    <td>
-                      {usage.workflows.length > 0
-                        ? usage.workflows.map((entry) => `${entry.workflowId}:v${entry.version}`).join(", ")
-                        : "-"}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </>
-        ) : (
-          <p style={{ marginBottom: 0 }}>No usage loaded yet.</p>
-        )}
       </section>
     </>
   );

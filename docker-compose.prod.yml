@@ -9,20 +9,13 @@ x-shared-env: &shared-env
   KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-automation-web}
   KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-replace-me}
   WORKFLOW_SERVICE_URL: https://workflow-service:4001
-  ORDER_SERVICE_URL: https://order-service:4002
-  EXECUTION_ENGINE_SERVICE_URL: https://execution-engine:4003
-  INTEGRATION_SERVICE_URL: https://integration-service:4004
   LOGGING_SERVICE_URL: https://logging-service:4005
-  TEMPORAL_ADDRESS: temporal:7233
-  TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
-  TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-automation-task-queue}
-  FLOWISE_PLANNER_URL: ${FLOWISE_PLANNER_URL:-http://flowise:3000/api/v1/prediction/default}
   FLOWISE_OPERATIONS_CHAT_URL: ${FLOWISE_OPERATIONS_CHAT_URL:-http://flowise:3000/api/v1/prediction/4b37e62c-da5c-43e5-ba10-8a1cfc9d06f1}
   FLOWISE_API_KEY: ${FLOWISE_API_KEY:-}
-  INTEGRATION_REST_URL_ALLOWLIST: ${INTEGRATION_REST_URL_ALLOWLIST:-^https?://|^http://localhost:}
-  INTEGRATION_SCRIPT_ALLOWLIST: ${INTEGRATION_SCRIPT_ALLOWLIST:-.*}
-  INTEGRATION_SSH_ALLOWLIST: ${INTEGRATION_SSH_ALLOWLIST:-.*}
-  INTEGRATION_NETCONF_ALLOWLIST: ${INTEGRATION_NETCONF_ALLOWLIST:-.*}
+  DIFY_API_BASE_URL: ${DIFY_API_BASE_URL:-http://dify-api:5001}
+  N8N_API_BASE_URL: ${N8N_API_BASE_URL:-http://n8n:5678}
+  N8N_WEBHOOK_TOKEN: ${N8N_WEBHOOK_TOKEN:-}
+  RAG_SYNC_PROGRESS_CALLBACK_BASE_URL: ${RAG_SYNC_PROGRESS_CALLBACK_BASE_URL:-https://api-gateway:4000}
   VAULT_ADDR: http://vault:8200
   VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
   VAULT_STRICT_SECRETS: ${VAULT_STRICT_SECRETS:-true}
@@ -235,41 +228,6 @@ services:
       - vault_data:/vault/file:ro
       - tls_keycloak:/tls
 
-  temporal-postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: temporal
-      POSTGRES_PASSWORD: temporal
-      POSTGRES_DB: temporal
-    volumes:
-      - temporal_pg_data:/var/lib/postgresql/data
-
-  temporal:
-    image: temporalio/auto-setup:1.26.2
-    environment:
-      DB: postgres12
-      DB_PORT: 5432
-      POSTGRES_USER: temporal
-      POSTGRES_PWD: temporal
-      POSTGRES_SEEDS: temporal-postgres
-      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/development-sql.yaml
-    depends_on:
-      temporal-postgres:
-        condition: service_started
-    volumes:
-      - ./infra/temporal/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
-
-  temporal-ui:
-    image: temporalio/ui:2.30.3
-    environment:
-      TEMPORAL_ADDRESS: temporal:7233
-      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
-    depends_on:
-      temporal:
-        condition: service_started
-    ports:
-      - "8088:8080"
-
   flowise:
     image: flowiseai/flowise:2.2.3
     environment:
@@ -359,94 +317,6 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  order-service-vault-agent:
-    <<: *vault-agent
-    environment:
-      VAULT_ADDR: http://vault:8200
-      SERVICE_NAME: order-service
-      CERT_COMMON_NAME: order-service
-      CERT_ALT_NAMES: order-service,localhost
-    volumes:
-      - ./infra/vault:/vault/scripts:ro
-      - vault_data:/vault/file:ro
-      - tls_order_service:/tls
-
-  order-service:
-    image: *app-service-image
-    environment:
-      <<: *shared-env
-      PORT: 4002
-      SERVICE_NAME: order-service
-    volumes:
-      - tls_order_service:/tls:ro
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-      rabbitmq:
-        condition: service_started
-      temporal:
-        condition: service_started
-      order-service-vault-agent:
-        condition: service_started
-    restart: unless-stopped
-
-  execution-engine-vault-agent:
-    <<: *vault-agent
-    environment:
-      VAULT_ADDR: http://vault:8200
-      SERVICE_NAME: execution-engine
-      CERT_COMMON_NAME: execution-engine
-      CERT_ALT_NAMES: execution-engine,localhost
-    volumes:
-      - ./infra/vault:/vault/scripts:ro
-      - vault_data:/vault/file:ro
-      - tls_execution_engine:/tls
-
-  execution-engine:
-    image: *app-service-image
-    environment:
-      <<: *shared-env
-      PORT: 4003
-      SERVICE_NAME: execution-engine
-    volumes:
-      - tls_execution_engine:/tls:ro
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-      execution-engine-vault-agent:
-        condition: service_started
-    restart: unless-stopped
-
-  integration-service-vault-agent:
-    <<: *vault-agent
-    environment:
-      VAULT_ADDR: http://vault:8200
-      SERVICE_NAME: integration-service
-      CERT_COMMON_NAME: integration-service
-      CERT_ALT_NAMES: integration-service,localhost
-    volumes:
-      - ./infra/vault:/vault/scripts:ro
-      - vault_data:/vault/file:ro
-      - tls_integration_service:/tls
-
-  integration-service:
-    image: *app-service-image
-    environment:
-      <<: *shared-env
-      PORT: 4004
-      SERVICE_NAME: integration-service
-      VAULT_ADDR: http://integration-service-vault-agent:8200
-    volumes:
-      - tls_integration_service:/tls:ro
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-      vault:
-        condition: service_started
-      integration-service-vault-agent:
-        condition: service_started
-    restart: unless-stopped
-
   logging-service-vault-agent:
     <<: *vault-agent
     environment:
@@ -500,8 +370,6 @@ services:
     depends_on:
       workflow-service:
         condition: service_started
-      order-service:
-        condition: service_started
       logging-service:
         condition: service_started
       api-gateway-vault-agent:
@@ -514,6 +382,8 @@ services:
     image: *app-web-image
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${WEB_NEXT_PUBLIC_API_BASE_URL:-}
+      NEXT_PUBLIC_PLATFORM_URL: ${PLATFORM_URL:-https://dev.eclassmanager.com}
+      NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/ap}
       WEB_INTERNAL_API_BASE_URL: ${WEB_INTERNAL_API_BASE_URL:-https://api-gateway:4000}
       PORT: 3000
       KEYCLOAK_URL: ${WEB_KEYCLOAK_URL:-https://keycloak:8443}
@@ -588,9 +458,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - tls_api_gateway:/tls/api-gateway:ro
       - tls_workflow_service:/tls/workflow-service:ro
-      - tls_order_service:/tls/order-service:ro
-      - tls_execution_engine:/tls/execution-engine:ro
-      - tls_integration_service:/tls/integration-service:ro
       - tls_logging_service:/tls/logging-service:ro
       - rotation_control:/rotation-control
     depends_on:
@@ -605,9 +472,6 @@ volumes:
   vault_data:
   tls_api_gateway:
   tls_workflow_service:
-  tls_order_service:
-  tls_execution_engine:
-  tls_integration_service:
   tls_logging_service:
   rotation_control:
   tls_postgres:
@@ -617,5 +481,4 @@ volumes:
   tls_minio:
   tls_web:
   tls_web_ingress:
-  temporal_pg_data:
   flowise_data:

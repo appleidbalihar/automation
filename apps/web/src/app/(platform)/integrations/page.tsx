@@ -1,6 +1,6 @@
 import type { ReactElement } from "react";
-import { IntegrationsManager } from "../../integrations-manager";
+import { IntegrationsPage } from "../../integrations-page";
 
-export default function IntegrationsPage(): ReactElement {
-  return <IntegrationsManager />;
+export default function IntegrationsRoute(): ReactElement {
+  return <IntegrationsPage />;
 }

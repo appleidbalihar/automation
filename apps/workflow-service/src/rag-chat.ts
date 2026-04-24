@@ -1,4 +1,10 @@
-import type { RagDiscussionMessage, RagDiscussionMessageRole, RagDiscussionSummary, RagDiscussionThread } from "@platform/contracts";
+import type {
+  RagDiscussionBackend,
+  RagDiscussionMessage,
+  RagDiscussionMessageRole,
+  RagDiscussionSummary,
+  RagDiscussionThread
+} from "@platform/contracts";
 
 const THREAD_TITLE_MAX_LENGTH = 72;
 const THREAD_PREVIEW_MAX_LENGTH = 120;
@@ -37,6 +43,32 @@ export function extractFlowiseText(payload: unknown): string {
   throw new Error("FLOWISE_EMPTY_RESPONSE");
 }
 
+/**
+ * Extracts the assistant answer from a Dify blocking chat-message response.
+ * Dify returns: { answer: string, conversation_id: string, message_id: string, ... }
+ */
+export function extractDifyAnswer(payload: unknown): string {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("DIFY_INVALID_RESPONSE");
+  }
+  const value = payload as Record<string, unknown>;
+  if (typeof value.answer === "string" && value.answer.trim()) return value.answer;
+  // Fallback: some Dify versions use message field
+  if (typeof value.message === "string" && value.message.trim()) return value.message;
+  throw new Error("DIFY_EMPTY_RESPONSE");
+}
+
+/**
+ * Extracts Dify's conversation_id from a chat-message response.
+ * This ID must be persisted in RagDiscussionThread.difyConversationId so that
+ * follow-up messages continue the same Dify session.
+ */
+export function extractDifyConversationId(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return "";
+  const value = payload as Record<string, unknown>;
+  return typeof value.conversation_id === "string" ? value.conversation_id : "";
+}
+
 function previewFromMessage(content?: string): string | undefined {
   if (!content) return undefined;
   const normalized = collapseWhitespace(content);
@@ -51,6 +83,7 @@ type ThreadRecord = {
   updatedAt: Date;
   lastMessageAt: Date;
   expiresAt: Date;
+  knowledgeBaseId?: string | null;
 };
 
 type MessageRecord = {
@@ -75,6 +108,7 @@ export function mapRagDiscussionSummary(
   thread: ThreadRecord,
   latestMessageContent?: string
 ): RagDiscussionSummary {
+  const backend: RagDiscussionBackend = thread.knowledgeBaseId ? "dify" : "legacy-flowise";
   return {
     id: thread.id,
     title: thread.title,
@@ -82,11 +116,14 @@ export function mapRagDiscussionSummary(
     updatedAt: thread.updatedAt.toISOString(),
     lastMessageAt: thread.lastMessageAt.toISOString(),
     expiresAt: thread.expiresAt.toISOString(),
-    preview: previewFromMessage(latestMessageContent)
+    preview: previewFromMessage(latestMessageContent),
+    knowledgeBaseId: thread.knowledgeBaseId ?? undefined,
+    backend
   };
 }
 
 export function mapRagDiscussionThread(thread: ThreadRecord, messages: MessageRecord[]): RagDiscussionThread {
+  const backend: RagDiscussionBackend = thread.knowledgeBaseId ? "dify" : "legacy-flowise";
   return {
     id: thread.id,
     title: thread.title,
@@ -94,6 +131,8 @@ export function mapRagDiscussionThread(thread: ThreadRecord, messages: MessageRe
     updatedAt: thread.updatedAt.toISOString(),
     lastMessageAt: thread.lastMessageAt.toISOString(),
     expiresAt: thread.expiresAt.toISOString(),
+    knowledgeBaseId: thread.knowledgeBaseId ?? undefined,
+    backend,
     messages: messages.map(mapRagDiscussionMessage)
   };
 }

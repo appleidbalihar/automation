@@ -1,6 +1,6 @@
+import dotenv from "dotenv";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import dotenv from "dotenv";
 
 export interface AppConfig {
   serviceName: string;
@@ -27,9 +27,17 @@ export interface AppConfig {
   temporalAddress: string;
   temporalNamespace: string;
   temporalTaskQueue: string;
+  // Flowise (legacy — kept for backward compat with existing threads)
   flowisePlannerUrl: string;
   flowiseOperationsChatUrl: string;
   flowiseApiKey?: string;
+  // Dify RAG engine — API keys are stored in Vault, never in env
+  difyApiBaseUrl: string;
+  // n8n sync orchestrator — API keys are stored in Vault, never in env
+  n8nApiBaseUrl: string;
+  n8nWebhookToken?: string;
+  // n8n REST API key — used to stop running executions on sync-cancel
+  n8nApiKey?: string;
 }
 
 function bootstrapEnv(): void {
@@ -93,6 +101,13 @@ export function loadConfig(serviceName: string, fallbackPort: number): AppConfig
       "FLOWISE_OPERATIONS_CHAT_URL",
       "http://flowise:3000/api/v1/prediction/4b37e62c-da5c-43e5-ba10-8a1cfc9d06f1"
     ),
-    flowiseApiKey: process.env.FLOWISE_API_KEY
+    flowiseApiKey: process.env.FLOWISE_API_KEY,
+    // Dify — base URL only; per-KB API keys are fetched from Vault at runtime
+    difyApiBaseUrl: required("DIFY_API_BASE_URL", "http://dify-api:5001"),
+    // n8n — base URL only; credentials are fetched from Vault at runtime
+    n8nApiBaseUrl: required("N8N_API_BASE_URL", "http://n8n:5678"),
+    n8nWebhookToken: process.env.N8N_WEBHOOK_TOKEN,
+    // n8n REST API key for stopping running executions on sync-cancel
+    n8nApiKey: process.env.N8N_API_KEY
   };
 }

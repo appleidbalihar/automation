@@ -1,0 +1,264 @@
+{
+  "updatedAt": "2026-04-21T18:18:15.301Z",
+  "createdAt": "2026-04-20T18:10:54.184Z",
+  "id": "22d3d7b8-d94b-4300-a3a3-b55835e6c902",
+  "name": "GitLab → Dify KB Sync",
+  "description": null,
+  "active": true,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "rag-sync-gitlab",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        256,
+        304
+      ],
+      "webhookId": "rag-sync-gitlab"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst kbId = body.kbId;\nconst sourceUrl = body.sourceUrl;\nconst sourceBranch = body.sourceBranch || 'main';\nconst sourcePath = (body.sourcePath || '').replace(/^\\/+|\\/+$/g, '');\nconst difyDatasetId = body.difyDatasetId;\nconst difyApiUrl = body.difyApiUrl || 'http://dify-api:5001';\nconst difyApiKey = body.difyApiKey || '';\nconst syncJobId = body.syncJobId;\nconst progressCallbackUrl = body.progressCallbackUrl;\nconst sourceToken = body.sourceToken || '';\n\nif (!kbId || !sourceUrl || !difyDatasetId || !difyApiKey || !syncJobId) {\n  throw new Error('Missing required sync parameters: kbId, sourceUrl, difyDatasetId, difyApiKey, syncJobId');\n}\n\nconst match = sourceUrl.match(/gitlab\\.com\\/([^/]+(?:\\/[^/]+)*)\\/([^/]+)$/);\nif (!match) throw new Error('Invalid GitLab URL: ' + sourceUrl);\nconst namespace = match[1];\nconst repo = match[2].replace(/\\.git$/, '');\nconst projectPath = `${namespace}/${repo}`;\nconst encodedProjectPath = encodeURIComponent(projectPath);\n\nreturn [{ json: { kbId, projectPath, encodedProjectPath, branch: sourceBranch, path: sourcePath, difyDatasetId, difyApiUrl, difyApiKey, syncJobId, progressCallbackUrl, sourceToken } }];"
+      },
+      "id": "parse-params",
+      "name": "Parse Sync Params",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://gitlab.com/api/v4/projects/{{ $json.encodedProjectPath }}/repository/tree?ref={{ $json.branch }}&recursive=true&per_page=100",
+        "options": {}
+      },
+      "id": "get-repo-tree",
+      "name": "Get Repo File Tree",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        704,
+        304
+      ],
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const tree = $input.first().json || [];\nconst params = $('Parse Sync Params').first().json;\nconst basePath = params.path || '';\n\nconst files = tree\n  .filter(item => {\n    if (item.type !== 'blob') return false;\n    const ext = item.path.split('.').pop().toLowerCase();\n    if (!['md', 'txt', 'rst', 'mdx'].includes(ext)) return false;\n    if (basePath && !item.path.startsWith(basePath)) return false;\n    return true;\n  })\n  .slice(0, 500);\n\nreturn files.map(file => ({\n  json: {\n    ...params,\n    filePath: file.path,\n    totalFiles: files.length,\n    encodedFilePath: encodeURIComponent(file.path)\n  }\n}));"
+      },
+      "id": "filter-files",
+      "name": "Filter Markdown Files",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://gitlab.com/api/v4/projects/{{ $json.encodedProjectPath }}/repository/files/{{ $json.encodedFilePath }}/raw?ref={{ $json.branch }}",
+        "options": {}
+      },
+      "id": "fetch-file-content",
+      "name": "Fetch File Content",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1136,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Parse Sync Params').first().json.difyApiUrl }}/v1/datasets/{{ $('Parse Sync Params').first().json.difyDatasetId }}/document/create_by_text",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Parse Sync Params').first().json.difyApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"name\": \"{{ $('Filter Markdown Files').item.json.filePath }}\",\n  \"text\": \"{{ $json.data }}\",\n  \"indexing_technique\": \"high_quality\",\n  \"process_rule\": {\n    \"mode\": \"custom\",\n    \"rules\": {\n      \"pre_processing_rules\": [\n        {\"id\": \"remove_extra_spaces\", \"enabled\": true},\n        {\"id\": \"remove_urls_emails\", \"enabled\": false}\n      ],\n      \"segmentation\": {\n        \"separator\": \"\\n\\n\",\n        \"max_tokens\": 1800,\n        \"chunk_overlap\": 200\n      }\n    }\n  }\n}",
+        "options": {}
+      },
+      "id": "upload-to-dify",
+      "name": "Upload Doc to Dify KB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1360,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Parse Sync Params').first().json.progressCallbackUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"syncJobId\": \"{{ $('Parse Sync Params').first().json.syncJobId }}\",\n  \"status\": \"{{ ($runIndex + 1) >= $('Filter Markdown Files').item.json.totalFiles ? 'completed' : 'running' }}\",\n  \"filesProcessed\": {{ $runIndex + 1 }},\n  \"filesTotal\": {{ $('Filter Markdown Files').item.json.totalFiles }}\n}",
+        "options": {}
+      },
+      "id": "report-progress",
+      "name": "Report Progress",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1584,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"accepted\": true, \"syncJobId\": \"{{ $('Parse Sync Params').first().json.syncJobId }}\" }",
+        "options": {}
+      },
+      "id": "webhook-response",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        480,
+        512
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Sync Params",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Sync Params": {
+      "main": [
+        [
+          {
+            "node": "Get Repo File Tree",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Repo File Tree": {
+      "main": [
+        [
+          {
+            "node": "Filter Markdown Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Markdown Files": {
+      "main": [
+        [
+          {
+            "node": "Fetch File Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch File Content": {
+      "main": [
+        [
+          {
+            "node": "Upload Doc to Dify KB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Doc to Dify KB": {
+      "main": [
+        [
+          {
+            "node": "Report Progress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "staticData": null,
+  "meta": {
+    "description": "Syncs markdown docs from a GitLab repository to a Dify Knowledge Base. Triggered by platform workflow-service via webhook. Progress is reported back via progressCallbackUrl."
+  },
+  "pinData": {},
+  "versionId": "ddfd918a-5d00-45da-8321-6e63b734eb5d",
+  "activeVersionId": "12f132ad-5538-4c20-8186-2e3d9a8faa31",
+  "versionCounter": 8,
+  "triggerCount": 1,
+  "tags": [],
+  "shared": [
+    {
+      "updatedAt": "2026-04-20T18:10:54.184Z",
+      "createdAt": "2026-04-20T18:10:54.184Z",
+      "role": "workflow:owner",
+      "workflowId": "22d3d7b8-d94b-4300-a3a3-b55835e6c902",
+      "projectId": "8ZpOf2mHuOoOXOCA",
+      "project": {
+        "updatedAt": "2026-04-21T15:55:40.166Z",
+        "createdAt": "2026-04-20T13:00:02.823Z",
+        "id": "8ZpOf2mHuOoOXOCA",
+        "name": "Platform Admin <platform-admin@automation-platform.local>",
+        "type": "personal",
+        "icon": null,
+        "description": null,
+        "creatorId": "b39f03fb-8258-4183-a8fc-1c6c980f2436"
+      }
+    }
+  ],
+  "versionMetadata": {
+    "name": null,
+    "description": null
+  }
+}

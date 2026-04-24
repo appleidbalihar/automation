@@ -46,7 +46,30 @@ export async function POST(request: Request): Promise<NextResponse> {
     });
 
     const raw = await response.text();
-    const payload = raw.length > 0 ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    // Keycloak may return HTML (e.g. a login page or error page) when misconfigured
+    // or when the realm/endpoint URL is wrong. Guard against JSON.parse throwing.
+    let payload: Record<string, unknown> = {};
+    if (raw.length > 0) {
+      const trimmed = raw.trimStart();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          payload = JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          // Non-JSON body (e.g. HTML error page from Keycloak proxy)
+          payload = {};
+        }
+      }
+      // If Keycloak returned HTML, surface a clear error instead of crashing
+      if (!response.ok && Object.keys(payload).length === 0) {
+        return NextResponse.json(
+          {
+            error: "KEYCLOAK_INVALID_RESPONSE",
+            details: `Keycloak returned a non-JSON response (HTTP ${response.status}). Check KEYCLOAK_URL and realm configuration.`
+          },
+          { status: 502 }
+        );
+      }
+    }
     if (!response.ok) {
       return NextResponse.json(
         {
