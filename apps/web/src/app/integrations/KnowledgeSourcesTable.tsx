@@ -1,18 +1,21 @@
 "use client";
 
-import { useMemo } from "react";
 import type { ReactElement } from "react";
+import { useMemo } from "react";
 import type { Integration } from "./types";
-import { formatDate, syncDisabledReason } from "./types";
+import { formatDate, hasFailedDifyIndexing, syncDisabledReason } from "./types";
 
 type Props = {
   integrations: Integration[];
   busy: string;
   onSetDefault: (id: string) => void;
   onSync: (id: string) => void;
+  onRetryFailedIndexing: (id: string, options?: { syncJobId?: string; documentIds?: string[] }) => void;
   onCancelSync: (id: string) => void;
   onEdit: (integration: Integration) => void;
   onDelete: (id: string) => void;
+  onCleanup: (id: string) => void;
+  onShare: (id: string) => void;
   status: string;
   error: string;
   onCreateSource: () => void;
@@ -28,8 +31,15 @@ function authBadge(authMethod: "oauth" | "pat" | null, credentialConfigured: boo
   return <span className="integrations-badge integrations-badge-warn">No token</span>;
 }
 
+/** Resolve the effective paths to display: prefer sourcePaths array, fall back to legacy sourcePath string. */
+function resolvePaths(integration: Integration): string[] {
+  if (integration.sourcePaths && integration.sourcePaths.length > 0) return integration.sourcePaths;
+  if (integration.sourcePath) return [integration.sourcePath];
+  return [];
+}
+
 export function KnowledgeSourcesTable(props: Props): ReactElement {
-  const { integrations, busy, onSetDefault, onSync, onCancelSync, onEdit, onDelete, status, error, onCreateSource } = props;
+  const { integrations, busy, onSetDefault, onSync, onRetryFailedIndexing, onCancelSync, onEdit, onDelete, onCleanup, onShare, status, error, onCreateSource } = props;
 
   const sortedIntegrations = useMemo(
     () => [...integrations].sort((a, b) => Number(b.isDefault) - Number(a.isDefault)),
@@ -65,6 +75,7 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
             <thead>
               <tr>
                 <th>Source</th>
+                <th>Project</th>
                 <th>Type</th>
                 <th>Location</th>
                 <th>Auth</th>
@@ -77,6 +88,8 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
               {sortedIntegrations.map((integration) => {
                 const job = integration.latestSyncJob;
                 const syncRunning = job && ["running", "pending"].includes(String(job.status).toLowerCase());
+                const canRetryIndexing = hasFailedDifyIndexing(job);
+                const paths = resolvePaths(integration);
 
                 return (
                   <tr key={integration.id}>
@@ -91,6 +104,15 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                       </div>
                     </td>
 
+                    {/* Project name */}
+                    <td>
+                      {integration.projectName ? (
+                        <span className="ops-project-chip">{integration.projectName}</span>
+                      ) : (
+                        <span className="ops-source-desc">—</span>
+                      )}
+                    </td>
+
                     {/* Type */}
                     <td>
                       <span className="ops-type-chip">{integration.sourceType}</span>
@@ -100,8 +122,15 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                     <td>
                       <div className="integrations-location-cell">
                         <span className="ops-url-text">{integration.sourceUrl}</span>
-                        {integration.sourceBranch || integration.sourcePath ? (
-                          <small>{(integration.sourceBranch || "—") + " · " + (integration.sourcePath || "full source")}</small>
+                        {integration.sourceBranch ? (
+                          <small className="ops-branch-label">⎇ {integration.sourceBranch}</small>
+                        ) : null}
+                        {paths.length > 0 ? (
+                          <div className="ops-paths-list">
+                            {paths.map((p, idx) => (
+                              <small key={idx} className="ops-path-item">📁 {p}</small>
+                            ))}
+                          </div>
                         ) : null}
                       </div>
                     </td>
@@ -149,24 +178,47 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                             {busy === `cancel:${integration.id}` ? "…" : "Cancel"}
                           </button>
                         ) : (
-                          <button
-                            type="button"
-                            className={`ops-action-btn${integration.syncReady ? " ops-action-sync" : " ops-action-sync-disabled"}`}
-                            onClick={() => void onSync(integration.id)}
-                            disabled={!integration.syncReady || busy === `sync:${integration.id}`}
-                            title={integration.syncReady ? "Trigger sync" : syncDisabledReason(integration)}
-                          >
-                            {busy === `sync:${integration.id}` ? "…" : "Sync"}
-                          </button>
+                          <>
+                            {canRetryIndexing ? (
+                              <button
+                                type="button"
+                                className="ops-action-btn ops-action-retry"
+                                onClick={() => void onRetryFailedIndexing(integration.id)}
+                                disabled={busy === `retry-indexing:${integration.id}`}
+                                title="Retry only the Dify documents that failed indexing"
+                              >
+                                {busy === `retry-indexing:${integration.id}` ? "…" : "Retry indexing"}
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              className={`ops-action-btn${integration.syncReady ? " ops-action-sync" : " ops-action-sync-disabled"}`}
+                              onClick={() => void onSync(integration.id)}
+                              disabled={!integration.syncReady || busy === `sync:${integration.id}`}
+                              title={integration.syncReady ? "Trigger a full sync for this knowledge source" : syncDisabledReason(integration)}
+                            >
+                              {busy === `sync:${integration.id}` ? "Syncing…" : "⟳ Sync"}
+                            </button>
+                          </>
                         )}
 
                         <button
                           type="button"
                           className="ops-action-btn ops-action-edit"
                           onClick={() => onEdit(integration)}
-                          title="Edit source"
+                          title="Edit source settings"
                         >
                           Edit
+                        </button>
+
+                        {/* Share — allow owner/admin to grant chat access to other users */}
+                        <button
+                          type="button"
+                          className="ops-action-btn ops-action-share"
+                          onClick={() => onShare(integration.id)}
+                          title="Share this knowledge base with other users (chat access only)"
+                        >
+                          🔗 Share
                         </button>
 
                         {!integration.isDefault ? (
@@ -181,12 +233,23 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                           </button>
                         ) : null}
 
+                        {/* Cleanup button — removes all indexed documents for this source */}
+                        <button
+                          type="button"
+                          className="ops-action-btn ops-action-cleanup"
+                          onClick={() => void onCleanup(integration.id)}
+                          disabled={busy === `cleanup:${integration.id}`}
+                          title="Remove all indexed documents and Dify knowledge base data for this source"
+                        >
+                          {busy === `cleanup:${integration.id}` ? "…" : "🗑 Cleanup"}
+                        </button>
+
                         <button
                           type="button"
                           className="ops-action-btn ops-action-delete"
                           onClick={() => void onDelete(integration.id)}
                           disabled={busy === `delete:${integration.id}`}
-                          title="Delete integration"
+                          title="Delete this integration entirely"
                         >
                           {busy === `delete:${integration.id}` ? "…" : "Delete"}
                         </button>

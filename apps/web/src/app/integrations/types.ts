@@ -12,14 +12,25 @@ export type SyncJob = {
   stepsJson?: unknown;
 };
 
+export type FailedDifyDocument = {
+  filePath?: string;
+  difyDocId?: string;
+  batchId?: string;
+  indexingStatus?: string;
+  error?: string;
+  retryable?: boolean;
+};
+
 export type Integration = {
   id: string;
   name: string;
+  projectName: string | null;
   description: string | null;
   sourceType: string;
   sourceUrl: string;
   sourceBranch: string | null;
   sourcePath: string | null;
+  sourcePaths: string[] | null;
   syncSchedule: string | null;
   credentialConfigured: boolean;
   chatReady: boolean;
@@ -33,11 +44,12 @@ export type Integration = {
 
 export type IntegrationForm = {
   name: string;
+  projectName: string;
   description: string;
   sourceType: "github" | "gitlab" | "googledrive" | "web";
   sourceUrl: string;
   sourceBranch: string;
-  sourcePath: string;
+  sourcePaths: string[];
   githubToken: string;
   gitlabToken: string;
   googleDriveAccessToken: string;
@@ -47,11 +59,12 @@ export type IntegrationForm = {
 
 export const EMPTY_FORM: IntegrationForm = {
   name: "",
+  projectName: "",
   description: "",
   sourceType: "github",
   sourceUrl: "",
   sourceBranch: "main",
-  sourcePath: "docs/",
+  sourcePaths: ["docs/"],
   githubToken: "",
   gitlabToken: "",
   googleDriveAccessToken: "",
@@ -68,6 +81,7 @@ export type NormalizedSyncStep = {
   startedAt: string | null;
   durationLabel: string;
   errorMessage: string | null;
+  failedDocuments: FailedDifyDocument[];
 };
 
 export function formatDate(value?: string | null): string {
@@ -95,21 +109,25 @@ export function normalizeRepositoryInput(url: string, current: IntegrationForm):
   const trimmed = url.trim();
   const gitlabTreeMatch = trimmed.match(/^(https?:\/\/gitlab\.com\/.+?)\/-\/tree\/([^/]+)\/?(.*)$/i);
   if (gitlabTreeMatch) {
+    const detectedPath = gitlabTreeMatch[3];
     return {
       sourceType: "gitlab",
       sourceUrl: gitlabTreeMatch[1],
       sourceBranch: gitlabTreeMatch[2] || current.sourceBranch,
-      sourcePath: gitlabTreeMatch[3] || current.sourcePath
+      // Only replace the first path entry if a path was detected in the URL
+      sourcePaths: detectedPath ? [detectedPath, ...current.sourcePaths.slice(1)] : current.sourcePaths
     };
   }
 
   const githubTreeMatch = trimmed.match(/^(https?:\/\/github\.com\/[^/]+\/[^/]+)\/tree\/([^/]+)\/?(.*)$/i);
   if (githubTreeMatch) {
+    const detectedPath = githubTreeMatch[3];
     return {
       sourceType: "github",
       sourceUrl: githubTreeMatch[1],
       sourceBranch: githubTreeMatch[2] || current.sourceBranch,
-      sourcePath: githubTreeMatch[3] || current.sourcePath
+      // Only replace the first path entry if a path was detected in the URL
+      sourcePaths: detectedPath ? [detectedPath, ...current.sourcePaths.slice(1)] : current.sourcePaths
     };
   }
 
@@ -148,6 +166,35 @@ function formatDuration(ms: number | null): string {
   return `${m}m ${rs}s`;
 }
 
+function normalizeFailedDifyDocuments(value: unknown): FailedDifyDocument[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((raw) => {
+      const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+      return {
+        filePath: typeof o.filePath === "string" ? o.filePath : typeof o.name === "string" ? o.name : undefined,
+        difyDocId:
+          typeof o.difyDocId === "string"
+            ? o.difyDocId
+            : typeof o.docId === "string"
+              ? o.docId
+              : typeof o.documentId === "string"
+                ? o.documentId
+                : undefined,
+        batchId: typeof o.batchId === "string" ? o.batchId : undefined,
+        indexingStatus:
+          typeof o.indexingStatus === "string"
+            ? o.indexingStatus
+            : typeof o.indexing_status === "string"
+              ? o.indexing_status
+              : undefined,
+        error: typeof o.error === "string" ? o.error : typeof o.errorMessage === "string" ? o.errorMessage : undefined,
+        retryable: typeof o.retryable === "boolean" ? o.retryable : undefined
+      };
+    })
+    .filter((doc) => doc.filePath || doc.difyDocId || doc.batchId || doc.error);
+}
+
 export function normalizeSyncSteps(stepsJson: unknown): NormalizedSyncStep[] {
   if (!Array.isArray(stepsJson)) return [];
   return stepsJson.map((raw, i) => {
@@ -177,9 +224,22 @@ export function normalizeSyncSteps(stepsJson: unknown): NormalizedSyncStep[] {
       status,
       startedAt,
       durationLabel: formatDuration(pickDurationMs(o)),
-      errorMessage: err
+      errorMessage: err,
+      failedDocuments: normalizeFailedDifyDocuments(o.failedDocuments)
     };
   });
+}
+
+export function hasFailedDifyIndexing(job: SyncJob | null | undefined): boolean {
+  if (!job || String(job.status).toLowerCase() !== "failed") return false;
+  return normalizeSyncSteps(job.stepsJson).some((step) => isFailedDifyIndexingStep(step));
+}
+
+export function isFailedDifyIndexingStep(step: NormalizedSyncStep): boolean {
+  return (
+    (step.logStepName === "dify_indexing" || step.logStepName === "retry_failed_indexing") &&
+    (step.status === "failed" || step.errorMessage != null || step.failedDocuments.length > 0)
+  );
 }
 
 export function stepBadgeVariant(status: string): "pending" | "running" | "completed" | "failed" {

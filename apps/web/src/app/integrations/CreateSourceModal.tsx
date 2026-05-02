@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
 import type { Dispatch, ReactElement, SetStateAction } from "react";
+import { useState } from "react";
 import type { IntegrationForm } from "./types";
 import { normalizeRepositoryInput } from "./types";
 
@@ -223,6 +223,11 @@ export function CreateSourceModal(props: Props): ReactElement | null {
               <input value={form.name} onChange={(e) => setForm((c) => ({ ...c, name: e.target.value }))} placeholder="My Ops Docs" />
             </label>
 
+            <label>
+              <span>Project Name <small style={{ fontWeight: 400, color: "#64748b" }}>(optional — group multiple sources)</small></span>
+              <input value={form.projectName} onChange={(e) => setForm((c) => ({ ...c, projectName: e.target.value }))} placeholder="e.g. Ops Platform, RAG Pipeline" />
+            </label>
+
             <label className="integrations-form-span-2">
               <span>Source URL</span>
               <input
@@ -238,10 +243,35 @@ export function CreateSourceModal(props: Props): ReactElement | null {
                   <span>Branch</span>
                   <input value={form.sourceBranch} onChange={(e) => setForm((c) => ({ ...c, sourceBranch: e.target.value }))} placeholder="main" />
                 </label>
-                <label>
-                  <span>Path</span>
-                  <input value={form.sourcePath} onChange={(e) => setForm((c) => ({ ...c, sourcePath: e.target.value }))} placeholder="docs/" />
-                </label>
+                <div className="integrations-form-span-2">
+                  <span className="ops-paths-label">Document Paths <small style={{ fontWeight: 400, color: "#64748b" }}>(add multiple paths to index)</small></span>
+                  {form.sourcePaths.map((p, idx) => (
+                    <div key={idx} className="ops-path-row">
+                      <input
+                        value={p}
+                        onChange={(e) => {
+                          const next = [...form.sourcePaths];
+                          next[idx] = e.target.value;
+                          setForm((c) => ({ ...c, sourcePaths: next }));
+                        }}
+                        placeholder="docs/"
+                      />
+                      {form.sourcePaths.length > 1 ? (
+                        <button
+                          type="button"
+                          className="ops-path-remove-btn"
+                          onClick={() => setForm((c) => ({ ...c, sourcePaths: c.sourcePaths.filter((_, i) => i !== idx) }))}
+                          aria-label="Remove path"
+                        >✕</button>
+                      ) : null}
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    className="ops-path-add-btn"
+                    onClick={() => setForm((c) => ({ ...c, sourcePaths: [...c.sourcePaths, ""] }))}
+                  >+ Add another path</button>
+                </div>
               </>
             )}
 
@@ -317,6 +347,11 @@ export function CreateSourceModal(props: Props): ReactElement | null {
           </label>
 
           <label>
+            <span>Project Name <small style={{ fontWeight: 400, color: "#64748b" }}>(optional — group sources)</small></span>
+            <input value={form.projectName} onChange={(e) => setForm((c) => ({ ...c, projectName: e.target.value }))} placeholder="e.g. Ops Platform" />
+          </label>
+
+          <label>
             <span>Source Type</span>
             <select value={form.sourceType} onChange={(e) => setForm((c) => ({ ...c, sourceType: e.target.value as IntegrationForm["sourceType"] }))}>
               <option value="github">GitHub</option>
@@ -341,10 +376,35 @@ export function CreateSourceModal(props: Props): ReactElement | null {
                 <span>Branch</span>
                 <input value={form.sourceBranch} onChange={(e) => setForm((c) => ({ ...c, sourceBranch: e.target.value }))} placeholder="main" />
               </label>
-              <label>
-                <span>Path</span>
-                <input value={form.sourcePath} onChange={(e) => setForm((c) => ({ ...c, sourcePath: e.target.value }))} placeholder="docs/" />
-              </label>
+              <div className="integrations-form-span-2">
+                <span className="ops-paths-label">Document Paths <small style={{ fontWeight: 400, color: "#64748b" }}>(add multiple paths to index)</small></span>
+                {form.sourcePaths.map((p, idx) => (
+                  <div key={idx} className="ops-path-row">
+                    <input
+                      value={p}
+                      onChange={(e) => {
+                        const next = [...form.sourcePaths];
+                        next[idx] = e.target.value;
+                        setForm((c) => ({ ...c, sourcePaths: next }));
+                      }}
+                      placeholder="docs/"
+                    />
+                    {form.sourcePaths.length > 1 ? (
+                      <button
+                        type="button"
+                        className="ops-path-remove-btn"
+                        onClick={() => setForm((c) => ({ ...c, sourcePaths: c.sourcePaths.filter((_, i) => i !== idx) }))}
+                        aria-label="Remove path"
+                      >✕</button>
+                    ) : null}
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="ops-path-add-btn"
+                  onClick={() => setForm((c) => ({ ...c, sourcePaths: [...c.sourcePaths, ""] }))}
+                >+ Add another path</button>
+              </div>
             </>
           )}
 

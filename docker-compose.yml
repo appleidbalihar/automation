@@ -10,8 +10,6 @@ x-shared-env: &shared-env
   KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-replace-me}
   WORKFLOW_SERVICE_URL: https://workflow-service:4001
   LOGGING_SERVICE_URL: https://logging-service:4005
-  FLOWISE_OPERATIONS_CHAT_URL: ${FLOWISE_OPERATIONS_CHAT_URL:-http://flowise:3000/api/v1/prediction/4b37e62c-da5c-43e5-ba10-8a1cfc9d06f1}
-  FLOWISE_API_KEY: ${FLOWISE_API_KEY:-}
   # Dify — internal base URL only; API keys are stored in Vault, never in env
   DIFY_API_BASE_URL: ${DIFY_API_BASE_URL:-http://dify-api:5001}
   # n8n — internal base URL only; credentials are stored in Vault, never in env
@@ -57,7 +55,7 @@ services:
       [
         "bash",
         "-lc",
-        "cp /tls/cert.pem /var/lib/postgresql/server.crt && cp /tls/key.pem /var/lib/postgresql/server.key && cp /tls/ca.pem /var/lib/postgresql/root.crt && chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key /var/lib/postgresql/root.crt && chmod 600 /var/lib/postgresql/server.key && chmod 644 /var/lib/postgresql/server.crt /var/lib/postgresql/root.crt && export PATH=/usr/lib/postgresql/15/bin:$PATH && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key -c ssl_ca_file=/var/lib/postgresql/root.crt -c hba_file=/etc/postgresql/pg_hba.conf"
+        "cp /tls/cert.pem /var/lib/postgresql/server.crt && cp /tls/key.pem /var/lib/postgresql/server.key && cp /tls/ca.pem /var/lib/postgresql/root.crt && chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key /var/lib/postgresql/root.crt && chmod 600 /var/lib/postgresql/server.key && chmod 644 /var/lib/postgresql/server.crt /var/lib/postgresql/root.crt && export PATH=/usr/lib/postgresql/15/bin:$$PATH && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key -c ssl_ca_file=/var/lib/postgresql/root.crt -c hba_file=/etc/postgresql/pg_hba.conf -c max_connections=${POSTGRES_MAX_CONNECTIONS:-300} -c idle_session_timeout=${POSTGRES_IDLE_SESSION_TIMEOUT:-5min}"
       ]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-platform}
@@ -221,27 +219,6 @@ services:
       - vault_data:/vault/file:ro
       - tls_keycloak:/tls
 
-  flowise:
-    image: flowiseai/flowise:2.2.3
-    environment:
-      PORT: 3000
-      DATABASE_TYPE: sqlite
-      DATABASE_PATH: /root/.flowise
-      LOG_LEVEL: debug
-      DEBUG: langchain*,flowise*
-      NODE_ENV: development
-      REQUEST_TIMEOUT: 300000   # 5 minutes global timeout
-      FLOWISE_OPENAI_BASEPATH: ${FLOWISE_OPENAI_BASEPATH:-}
-      FLOWISE_TECH_ENGINEER_REPO_LINK: ${FLOWISE_TECH_ENGINEER_REPO_LINK:-https://github.com/appleidbalihar/automation}
-      FLOWISE_TECH_ENGINEER_REPO_BRANCH: ${FLOWISE_TECH_ENGINEER_REPO_BRANCH:-master}
-      FLOWISE_OPENAI_CHAT_MODEL: ${FLOWISE_OPENAI_CHAT_MODEL:-gpt-4o-mini}
-      FLOWISE_OPENAI_EMBEDDING_MODEL: ${FLOWISE_OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
-
-    ports:
-      - "3001:3000"
-    volumes:
-      - flowise_data:/root/.flowise
-
   vault:
     image: hashicorp/vault:1.17
     cap_add:
@@ -314,8 +291,6 @@ services:
       db-migrate:
         condition: service_completed_successfully
       rabbitmq:
-        condition: service_started
-      flowise:
         condition: service_started
       workflow-service-vault-agent:
         condition: service_started
@@ -780,7 +755,6 @@ volumes:
   tls_minio:
   tls_web:
   tls_web_ingress:
-  flowise_data:
   # Dify volumes
   dify_db_data:
   dify_redis_data:

@@ -1,5 +1,5 @@
 export type RagDiscussionMessageRole = "user" | "assistant";
-export type RagDiscussionBackend = "dify" | "legacy-flowise";
+export type RagDiscussionBackend = "dify";
 
 export interface RagDiscussionSummary {
   id: string;

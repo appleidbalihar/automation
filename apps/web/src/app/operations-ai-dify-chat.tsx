@@ -1,12 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, ReactElement } from "react";
-import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { resolveApiBase } from "./api-base";
+import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
 
-type RagDiscussionBackend = "dify" | "legacy-flowise";
+type RagDiscussionBackend = "dify";
 
 type RagDiscussionSummary = {
   id: string;
@@ -225,6 +225,7 @@ export function OperationsAiDifyChat(): ReactElement {
   const [showConfig, setShowConfig] = useState<boolean>(false);
   const [savingConfig, setSavingConfig] = useState<boolean>(false);
   const [syncingKb, setSyncingKb] = useState<boolean>(false);
+  const [retryingIndexing, setRetryingIndexing] = useState<boolean>(false);
   const [configForm, setConfigForm] = useState({ responseStyle: "", toneInstructions: "", restrictionRules: "" });
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -502,6 +503,25 @@ export function OperationsAiDifyChat(): ReactElement {
     }
   }
 
+  async function handleRetryFailedIndexing(): Promise<void> {
+    if (!selectedKbId) return;
+    setRetryingIndexing(true);
+    setSidebarError("");
+    try {
+      await fetchRag(`/rag/knowledge-bases/${selectedKbId}/retry-failed-indexing`, { method: "POST" });
+      const [job, history] = await Promise.all([
+        fetchRag<RagKbSyncJob>(`/rag/knowledge-bases/${selectedKbId}/sync-status`),
+        fetchRag<RagSyncHistoryResponse>(`/rag/knowledge-bases/${selectedKbId}/sync-history?limit=5`)
+      ]);
+      setKbs((current) => current.map((kb) => (kb.id === selectedKbId ? { ...kb, syncJobs: [job] } : kb)));
+      setSyncHistory(history.jobs);
+    } catch (error) {
+      setSidebarError(error instanceof Error ? error.message : "Failed to retry indexing.");
+    } finally {
+      setRetryingIndexing(false);
+    }
+  }
+
   async function handleSaveConfig(): Promise<void> {
     if (!selectedKbId) return;
     setSavingConfig(true);
@@ -532,11 +552,11 @@ export function OperationsAiDifyChat(): ReactElement {
     <section className="operations-ai-page">
       <header className="operations-ai-header">
         <div>
-          <p className="operations-ai-eyebrow">Operations Copilot</p>
-          <h1>Operations AI</h1>
+          <p className="operations-ai-eyebrow">RAG Assistant</p>
+          <h1>RAG Assistant</h1>
           <p className="operations-ai-subtitle">
-            Ask questions about platform operations, onboarding, secrets, logs, and security health. New conversations are routed through
-            the Dify knowledge base flow, while older Flowise threads remain available as legacy history.
+            Ask questions about your connected knowledge bases. New conversations are routed through
+            the Dify RAG pipeline so answers are grounded in the documents you connected.
           </p>
         </div>
         <div className="operations-ai-header-note">
@@ -552,8 +572,8 @@ export function OperationsAiDifyChat(): ReactElement {
               <h2>Knowledge Bases</h2>
               <p>Dify-backed operations knowledge and sync status.</p>
             </div>
-            <Link href="/operations-ai/setup" className="operations-ai-secondary-button">
-              Open Setup
+            <Link href="/knowledge-connector" className="operations-ai-secondary-button">
+              Knowledge Connector
             </Link>
           </div>
 
@@ -584,25 +604,44 @@ export function OperationsAiDifyChat(): ReactElement {
               </select>
 
               <div style={{ marginTop: "0.75rem", fontSize: "0.75rem", padding: "0.75rem", background: "rgba(0,0,0,0.05)", borderRadius: "8px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
                   <span>
                     Sync status: <strong>{syncStatusLabel(activeSyncJob)}</strong>
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => void handleManualSync()}
-                    disabled={syncingKb || activeSyncJob?.status === "running"}
-                    style={{
-                      background: "none",
-                      border: "1px solid currentColor",
-                      borderRadius: "4px",
-                      padding: "0.25rem 0.5rem",
-                      fontSize: "0.75rem",
-                      cursor: "pointer"
-                    }}
-                  >
-                    {syncingKb || activeSyncJob?.status === "running" ? "Syncing..." : "Sync Now"}
-                  </button>
+                  <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                    {activeSyncJob?.status === "failed" ? (
+                      <button
+                        type="button"
+                        onClick={() => void handleRetryFailedIndexing()}
+                        disabled={retryingIndexing}
+                        style={{
+                          background: "none",
+                          border: "1px solid currentColor",
+                          borderRadius: "4px",
+                          padding: "0.25rem 0.5rem",
+                          fontSize: "0.75rem",
+                          cursor: "pointer"
+                        }}
+                      >
+                        {retryingIndexing ? "Retrying..." : "Retry Failed Indexing"}
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => void handleManualSync()}
+                      disabled={syncingKb || activeSyncJob?.status === "running"}
+                      style={{
+                        background: "none",
+                        border: "1px solid currentColor",
+                        borderRadius: "4px",
+                        padding: "0.25rem 0.5rem",
+                        fontSize: "0.75rem",
+                        cursor: "pointer"
+                      }}
+                    >
+                      {syncingKb || activeSyncJob?.status === "running" ? "Syncing..." : "Sync Now"}
+                    </button>
+                  </div>
                 </div>
                 {activeSyncJob?.filesTotal ? (
                   <div style={{ marginTop: "0.5rem", width: "100%", height: "6px", background: "#ddd", borderRadius: "999px", overflow: "hidden" }}>
@@ -634,8 +673,8 @@ export function OperationsAiDifyChat(): ReactElement {
               </div>
 
               <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.75rem" }}>
-                <Link href="/operations-ai/setup" className="operations-ai-secondary-button">
-                  Open Setup
+                <Link href="/knowledge-connector" className="operations-ai-secondary-button">
+                  Knowledge Connector
                 </Link>
               </div>
             </div>
@@ -785,17 +824,12 @@ export function OperationsAiDifyChat(): ReactElement {
                 </div>
                 {activeSummary ? (
                   <div className="operations-ai-transcript-meta">
-                    <span>{activeSummary.backend === "dify" ? "Dify" : "Legacy Flowise"}</span>
+                    <span>Dify</span>
                     <span>Expires {formatThreadTime(activeSummary.expiresAt)}</span>
                   </div>
                 ) : null}
               </div>
 
-              {activeThread?.backend === "legacy-flowise" ? (
-                <div className="operations-ai-inline-error">
-                  This is a legacy Flowise thread kept for backward compatibility. New discussions now start on the Dify knowledge base flow.
-                </div>
-              ) : null}
               {chatError ? <div className="operations-ai-inline-error">{chatError}</div> : null}
 
               <div ref={transcriptRef} className="operations-ai-transcript">
@@ -839,8 +873,8 @@ export function OperationsAiDifyChat(): ReactElement {
                       </p>
                       {!hasKnowledgeBases ? (
                         <p style={{ marginTop: "1rem" }}>
-                          <Link href="/operations-ai/setup" className="operations-ai-secondary-button">
-                            Open Setup
+                          <Link href="/knowledge-connector" className="operations-ai-secondary-button">
+                            Knowledge Connector
                           </Link>
                         </p>
                       ) : null}

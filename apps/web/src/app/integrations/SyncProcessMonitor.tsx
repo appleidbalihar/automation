@@ -1,15 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchSyncHistory, fetchSyncStatus, isActiveSyncStatus } from "./api";
-import type { Integration, SyncJob } from "./types";
-import { formatDate, normalizeSyncSteps, stepBadgeVariant, stepStatusEmoji } from "./types";
 import { StepLogDrawer } from "./StepLogDrawer";
+import type { Integration, SyncJob } from "./types";
+import { formatDate, isFailedDifyIndexingStep, normalizeSyncSteps, stepBadgeVariant, stepStatusEmoji } from "./types";
 
 type Props = {
   integrations: Integration[];
   onMergeSyncJob: (knowledgeBaseId: string, job: SyncJob) => void;
+  onRetryFailedIndexing: (knowledgeBaseId: string, options?: { syncJobId?: string; documentIds?: string[] }) => void;
+  busy: string;
 };
 
 function isNeverSynced(x: unknown): x is { status: "never_synced"; knowledgeBaseId: string } {
@@ -17,7 +19,7 @@ function isNeverSynced(x: unknown): x is { status: "never_synced"; knowledgeBase
 }
 
 export function SyncProcessMonitor(props: Props): ReactElement | null {
-  const { integrations, onMergeSyncJob } = props;
+  const { integrations, onMergeSyncJob, onRetryFailedIndexing, busy } = props;
 
   const [kbId, setKbId] = useState<string>("");
   const [historyJobs, setHistoryJobs] = useState<SyncJob[]>([]);
@@ -48,7 +50,7 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
       return;
     }
     try {
-      const res = await fetchSyncHistory(id, 50);
+      const res = await fetchSyncHistory(id, 10);
       setHistoryJobs(res.jobs ?? []);
     } catch {
       setHistoryJobs([]);
@@ -114,12 +116,43 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
   const filesProcessed = effectiveJob?.filesProcessed ?? 0;
   const progressPct = filesTotal > 0 ? Math.min(100, Math.round((filesProcessed / filesTotal) * 100)) : 0;
 
+  // Check if ANY integration currently has an active sync (for the background banner)
+  const anyActiveSyncKbId = integrations.find((i) => {
+    const job = i.latestSyncJob;
+    return job && isActiveSyncStatus(job.status);
+  })?.id ?? null;
+
+  // If the currently viewed KB is not the one with an active sync,
+  // and the monitor is showing a different (non-active) KB, show a banner.
+  const backgroundSyncRunning = anyActiveSyncKbId !== null && anyActiveSyncKbId !== kbId;
+  const backgroundSyncKb = backgroundSyncRunning
+    ? integrations.find((i) => i.id === anyActiveSyncKbId) ?? null
+    : null;
+
   return (
     <section className="integrations-panel ops-sync-monitor">
+      {/* Banner: a sync is running in background on a different KB */}
+      {backgroundSyncRunning && backgroundSyncKb ? (
+        <div className="ops-bg-sync-banner">
+          <span className="ops-bg-sync-spinner">🔄</span>
+          <span>
+            Sync running in background for <strong>{backgroundSyncKb.name}</strong>
+            {backgroundSyncKb.projectName ? ` (${backgroundSyncKb.projectName})` : ""} —
+            <button
+              type="button"
+              className="ops-bg-sync-switch-btn"
+              onClick={() => { setKbId(anyActiveSyncKbId); setSelectedHistoryJobId("latest"); }}
+            >
+              Switch to view progress
+            </button>
+          </span>
+        </div>
+      ) : null}
+
       <div className="integrations-panel-header ops-sync-monitor-header">
         <div>
           <h2>Sync Process Monitor</h2>
-          <p>Live steps from n8n, log drill-down, and sync history.</p>
+          <p>Live steps from n8n, log drill-down, and sync history. Syncs continue running even if you navigate away.</p>
         </div>
         <div className="ops-sync-monitor-controls">
           <label className="ops-sync-monitor-select">
@@ -149,11 +182,15 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
               }}
             >
               <option value="latest">Latest{latestJob ? ` (${latestJob.status})` : ""}</option>
-              {historyJobs.map((j) => (
-                <option key={j.id} value={j.id}>
-                  {formatDate(j.createdAt ?? j.startedAt)} — {j.status} — {j.id.slice(0, 8)}…
-                </option>
-              ))}
+              {historyJobs.map((j) => {
+                const trigger = String((j as any).trigger ?? "sync");
+                const typeIcon = trigger === "cleanup" ? "🗑" : trigger === "retry_failed_indexing" ? "🔁" : "🔄";
+                return (
+                  <option key={j.id} value={j.id}>
+                    {typeIcon} {formatDate(j.createdAt ?? j.startedAt)} — {j.status}
+                  </option>
+                );
+              })}
             </select>
           </label>
         </div>
@@ -195,12 +232,55 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
             {steps.map((step) => {
               const variant = stepBadgeVariant(step.status);
               const isErr = variant === "failed" || Boolean(step.errorMessage);
+              const canRetryIndexing = isErr && isFailedDifyIndexingStep(step) && effectiveJob?.status === "failed" && Boolean(kbId);
+
+              // Detect smart-sync / cleanup operation type for visual differentiation
+              const isCleanupStep = step.logStepName.startsWith("cleanup_") || step.task.startsWith("Cleanup:");
+              const isIndexStep = step.logStepName.startsWith("index_path_") || step.task.startsWith("Index:");
+              const isProjectNameStep = step.logStepName === "update_project_name";
+
               return (
                 <tr key={step.key} className={isErr ? "is-error" : undefined}>
                   <td>
                     <div className="ops-sync-task-cell">
-                      <span>{step.task}</span>
+                      <div className="ops-sync-task-name-row">
+                        {isCleanupStep ? <span className="ops-step-op-badge ops-step-op-cleanup">🗑 Cleanup</span> : null}
+                        {isIndexStep ? <span className="ops-step-op-badge ops-step-op-index">📥 Index</span> : null}
+                        {isProjectNameStep ? <span className="ops-step-op-badge ops-step-op-meta">🏷 Metadata</span> : null}
+                        <span>{step.task}</span>
+                      </div>
                       {step.errorMessage ? <small className="ops-sync-inline-err">{step.errorMessage}</small> : null}
+                      {step.failedDocuments.length > 0 ? (
+                        <div className="ops-failed-doc-list">
+                          {step.failedDocuments.map((doc, index) => (
+                            <div key={`${doc.difyDocId ?? doc.batchId ?? doc.filePath ?? "doc"}-${index}`} className="ops-failed-doc">
+                              <strong>{doc.filePath ?? doc.difyDocId ?? "Unknown document"}</strong>
+                              {doc.error ? <span>Dify error: {doc.error}</span> : null}
+                              {doc.difyDocId ? <small>Dify document: {doc.difyDocId}</small> : null}
+                              {canRetryIndexing && doc.difyDocId ? (
+                                <button
+                                  type="button"
+                                  className="ops-action-btn ops-action-retry ops-inline-retry-btn"
+                                  onClick={() => void onRetryFailedIndexing(kbId, { syncJobId: effectiveJob.id, documentIds: [doc.difyDocId!] })}
+                                  disabled={busy === `retry-indexing:${doc.difyDocId}`}
+                                >
+                                  {busy === `retry-indexing:${doc.difyDocId}` ? "…" : "Retry file"}
+                                </button>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                      {canRetryIndexing ? (
+                        <button
+                          type="button"
+                          className="ops-action-btn ops-action-retry ops-inline-retry-btn"
+                          onClick={() => void onRetryFailedIndexing(kbId, { syncJobId: effectiveJob.id })}
+                          disabled={busy === `retry-indexing:${kbId}`}
+                        >
+                          {busy === `retry-indexing:${kbId}` ? "…" : "Retry indexing"}
+                        </button>
+                      ) : null}
                     </div>
                   </td>
                   <td>

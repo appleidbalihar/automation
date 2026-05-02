@@ -4,7 +4,6 @@ import {
   RAG_DISCUSSION_RETENTION_DAYS,
   buildRagThreadExpiry,
   deriveRagThreadTitle,
-  extractFlowiseText,
   mapRagDiscussionSummary,
   mapRagDiscussionThread
 } from "../src/rag-chat.js";
@@ -24,27 +23,17 @@ test("buildRagThreadExpiry applies seven day retention", () => {
   assert.equal(RAG_DISCUSSION_RETENTION_DAYS, 7);
 });
 
-test("extractFlowiseText prefers text and falls back to json", () => {
-  assert.equal(extractFlowiseText({ text: "Operations answer" }), "Operations answer");
-  assert.equal(extractFlowiseText({ json: { status: "ok" } }), JSON.stringify({ status: "ok" }, null, 2));
-});
-
-test("extractFlowiseText rejects unusable payloads", () => {
-  assert.throws(() => extractFlowiseText({}), /FLOWISE_EMPTY_RESPONSE/);
-});
-
-test("discussion mappers expose dify vs legacy backend metadata", () => {
-  const legacySummary = mapRagDiscussionSummary({
-    id: "legacy-thread",
-    title: "Legacy",
+test("discussion mappers always report dify backend", () => {
+  const summary = mapRagDiscussionSummary({
+    id: "dify-thread-summary",
+    title: "Summary",
     createdAt: new Date("2026-04-15T00:00:00.000Z"),
     updatedAt: new Date("2026-04-15T00:00:00.000Z"),
     lastMessageAt: new Date("2026-04-15T00:00:00.000Z"),
     expiresAt: new Date("2026-04-22T00:00:00.000Z"),
-    knowledgeBaseId: null
+    knowledgeBaseId: "kb-1"
   });
-  assert.equal(legacySummary.backend, "legacy-flowise");
-  assert.equal(legacySummary.knowledgeBaseId, undefined);
+  assert.equal(summary.backend, "dify");
 
   const difyThread = mapRagDiscussionThread(
     {

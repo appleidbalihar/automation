@@ -2,14 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
 import type { ReactElement } from "react";
+import { useEffect, useState } from "react";
 import { fetchIdentity } from "./auth-client";
 
 const baseNavItems: Array<{ href: string; label: string }> = [
   { href: "/dashboard", label: "Dashboard" },
-  { href: "/operations-ai/setup", label: "Operations AI Setup" },
-  { href: "/operations-ai", label: "Operations AI" },
+  { href: "/knowledge-connector", label: "Knowledge Connector" },
+  { href: "/rag-assistant", label: "RAG Assistant" },
   { href: "/logs", label: "Logs" }
 ];
 

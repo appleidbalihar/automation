@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
 import type { ReactElement } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Integration } from "./types";
 
 const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.eclassmanager.com").replace(/\/$/, "");
@@ -11,22 +11,79 @@ type Props = {
   integration: Integration | null;
   busy: string;
   onClose: () => void;
-  onSave: (id: string, patch: Record<string, unknown>) => void;
+  /**
+   * onSave receives both the patch fields and smart-sync metadata:
+   *  - addedPaths: paths that are new vs what was saved before
+   *  - removedPaths: paths that were removed vs what was saved before
+   *  - projectNameChanged: whether projectName was changed
+   */
+  onSave: (
+    id: string,
+    patch: Record<string, unknown>,
+    syncMeta: { addedPaths: string[]; removedPaths: string[]; projectNameChanged: boolean }
+  ) => void;
   onOAuthReconnect: (integration: Integration, appCredentials: { clientId: string; clientSecret: string } | null) => void;
   onOAuthDisconnect: (integration: Integration) => void;
   onUpdateToken: (integration: Integration, token: string) => void;
 };
 
+/**
+ * Resolve unique, non-empty paths from an integration record.
+ * Prefers the sourcePaths array; falls back to the legacy sourcePath string.
+ * De-duplicates so that if both fields contain the same value, we only show it once.
+ */
+function resolveInitialPaths(integration: Integration): string[] {
+  const arr: string[] = [];
+  const seen = new Set<string>();
+
+  const candidates = integration.sourcePaths && integration.sourcePaths.length > 0
+    ? integration.sourcePaths
+    : integration.sourcePath
+      ? [integration.sourcePath]
+      : [];
+
+  for (const p of candidates) {
+    const trimmed = p.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      arr.push(trimmed);
+    }
+  }
+  return arr.length > 0 ? arr : [""];
+}
+
 export function EditSourceModal(props: Props): ReactElement | null {
   const { integration, busy, onClose, onSave, onOAuthReconnect, onOAuthDisconnect, onUpdateToken } = props;
+
+  // Track the integration id to detect when a different integration is opened
+  const prevIntegrationId = useRef<string | null>(null);
+
   const [name, setName] = useState(integration?.name ?? "");
+  const [projectName, setProjectName] = useState(integration?.projectName ?? "");
   const [description, setDescription] = useState(integration?.description ?? "");
   const [sourceBranch, setSourceBranch] = useState(integration?.sourceBranch ?? "");
-  const [sourcePath, setSourcePath] = useState(integration?.sourcePath ?? "");
+  const [sourcePaths, setSourcePaths] = useState<string[]>(() => (integration ? resolveInitialPaths(integration) : [""]));
   const [patDraft, setPatDraft] = useState("");
   const [credTab, setCredTab] = useState<"oauth" | "pat">(integration?.authMethod === "oauth" ? "oauth" : "pat");
   const [appClientId, setAppClientId] = useState("");
   const [appClientSecret, setAppClientSecret] = useState("");
+
+  // Reset all form fields when a different integration is opened (e.g. user opens edit on another row)
+  useEffect(() => {
+    if (!integration) return;
+    if (prevIntegrationId.current !== integration.id) {
+      prevIntegrationId.current = integration.id;
+      setName(integration.name ?? "");
+      setProjectName(integration.projectName ?? "");
+      setDescription(integration.description ?? "");
+      setSourceBranch(integration.sourceBranch ?? "");
+      setSourcePaths(resolveInitialPaths(integration));
+      setPatDraft("");
+      setAppClientId("");
+      setAppClientSecret("");
+      setCredTab(integration.authMethod === "oauth" ? "oauth" : "pat");
+    }
+  }, [integration]);
 
   if (!integration) return null;
 
@@ -37,13 +94,32 @@ export function EditSourceModal(props: Props): ReactElement | null {
   const oauthProvider = integration.sourceType === "googledrive" ? "google" : integration.sourceType;
   const supportsOauth = ["github", "gitlab", "googledrive"].includes(integration.sourceType);
 
+  // The "original" saved paths for diff computation
+  const originalPaths = resolveInitialPaths(integration).filter(Boolean);
+
   function handleSave(): void {
-    onSave(integration!.id, {
-      name: name.trim() || integration!.name,
-      description: description.trim() || undefined,
-      sourceBranch: sourceBranch.trim() || undefined,
-      sourcePath: sourcePath.trim() || undefined
-    });
+    const filteredPaths = [...new Set(sourcePaths.map((p) => p.trim()).filter(Boolean))];
+    const origSet = new Set(originalPaths);
+    const newSet = new Set(filteredPaths);
+
+    // Compute what changed so the page can trigger smart incremental sync
+    const addedPaths = filteredPaths.filter((p) => !origSet.has(p));
+    const removedPaths = originalPaths.filter((p) => !newSet.has(p));
+    const projectNameChanged = (projectName.trim() || "") !== (integration!.projectName ?? "");
+
+    onSave(
+      integration!.id,
+      {
+        name: name.trim() || integration!.name,
+        projectName: projectName.trim() || undefined,
+        description: description.trim() || undefined,
+        sourceBranch: sourceBranch.trim() || undefined,
+        sourcePaths: filteredPaths.length > 0 ? filteredPaths : undefined,
+        // backward-compat single-path field
+        sourcePath: filteredPaths[0] ?? undefined
+      },
+      { addedPaths, removedPaths, projectNameChanged }
+    );
   }
 
   return (
@@ -61,12 +137,17 @@ export function EditSourceModal(props: Props): ReactElement | null {
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder={integration.name} />
           </label>
 
+          <label>
+            <span>Project Name <small style={{ fontWeight: 400, color: "#64748b" }}>(optional — group sources)</small></span>
+            <input value={projectName} onChange={(e) => setProjectName(e.target.value)} placeholder="e.g. Ops Platform" />
+          </label>
+
           <label className="integrations-form-span-2">
             <span>Description</span>
             <textarea value={description ?? ""} onChange={(e) => setDescription(e.target.value)} rows={2} placeholder="Optional description" />
           </label>
 
-          <label>
+          <label className="integrations-form-span-2">
             <span>Source URL</span>
             <input value={integration.sourceUrl} disabled className="ops-input-readonly" />
           </label>
@@ -77,10 +158,35 @@ export function EditSourceModal(props: Props): ReactElement | null {
                 <span>Branch</span>
                 <input value={sourceBranch} onChange={(e) => setSourceBranch(e.target.value)} placeholder={integration.sourceBranch ?? "main"} />
               </label>
-              <label>
-                <span>Path</span>
-                <input value={sourcePath} onChange={(e) => setSourcePath(e.target.value)} placeholder={integration.sourcePath ?? "docs/"} />
-              </label>
+              <div className="integrations-form-span-2">
+                <span className="ops-paths-label">Document Paths <small style={{ fontWeight: 400, color: "#64748b" }}>(add multiple paths to index)</small></span>
+                {sourcePaths.map((p, idx) => (
+                  <div key={idx} className="ops-path-row">
+                    <input
+                      value={p}
+                      onChange={(e) => {
+                        const next = [...sourcePaths];
+                        next[idx] = e.target.value;
+                        setSourcePaths(next);
+                      }}
+                      placeholder={integration.sourcePath ?? "docs/"}
+                    />
+                    {sourcePaths.length > 1 ? (
+                      <button
+                        type="button"
+                        className="ops-path-remove-btn"
+                        onClick={() => setSourcePaths((prev) => prev.filter((_, i) => i !== idx))}
+                        aria-label="Remove path"
+                      >✕</button>
+                    ) : null}
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="ops-path-add-btn"
+                  onClick={() => setSourcePaths((prev) => [...prev, ""])}
+                >+ Add another path</button>
+              </div>
             </>
           ) : null}
         </div>

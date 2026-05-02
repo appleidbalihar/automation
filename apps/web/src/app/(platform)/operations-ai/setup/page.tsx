@@ -1,6 +1,6 @@
-import type { ReactElement } from "react";
-import { IntegrationsPage } from "../../../integrations-page";
+import { redirect } from "next/navigation";
 
-export default function OperationsAiSetupPage(): ReactElement {
-  return <IntegrationsPage />;
+// Redirect old URL to new branded URL
+export default function OldSetupRedirect(): never {
+  redirect("/knowledge-connector");
 }

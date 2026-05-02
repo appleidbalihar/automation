@@ -29,20 +29,6 @@ export function buildRagThreadExpiry(now: Date): Date {
   return new Date(now.getTime() + RAG_DISCUSSION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
 }
 
-export function extractFlowiseText(payload: unknown): string {
-  if (typeof payload === "string") return payload;
-  if (!payload || typeof payload !== "object") {
-    throw new Error("FLOWISE_INVALID_RESPONSE");
-  }
-
-  const value = payload as Record<string, unknown>;
-  if (typeof value.text === "string" && value.text.trim()) return value.text;
-  if (value.json !== undefined) return JSON.stringify(value.json, null, 2);
-  if (typeof value.output === "string" && value.output.trim()) return value.output;
-  if (typeof value.message === "string" && value.message.trim()) return value.message;
-  throw new Error("FLOWISE_EMPTY_RESPONSE");
-}
-
 /**
  * Extracts the assistant answer from a Dify blocking chat-message response.
  * Dify returns: { answer: string, conversation_id: string, message_id: string, ... }
@@ -108,7 +94,7 @@ export function mapRagDiscussionSummary(
   thread: ThreadRecord,
   latestMessageContent?: string
 ): RagDiscussionSummary {
-  const backend: RagDiscussionBackend = thread.knowledgeBaseId ? "dify" : "legacy-flowise";
+  const backend: RagDiscussionBackend = "dify";
   return {
     id: thread.id,
     title: thread.title,
@@ -123,7 +109,7 @@ export function mapRagDiscussionSummary(
 }
 
 export function mapRagDiscussionThread(thread: ThreadRecord, messages: MessageRecord[]): RagDiscussionThread {
-  const backend: RagDiscussionBackend = thread.knowledgeBaseId ? "dify" : "legacy-flowise";
+  const backend: RagDiscussionBackend = "dify";
   return {
     id: thread.id,
     title: thread.title,

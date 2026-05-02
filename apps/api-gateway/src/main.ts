@@ -7,11 +7,11 @@ import { connectAmqp, createTlsRuntime, tlsFetch } from "@platform/tls-runtime";
 import type { Channel, ChannelModel } from "amqplib";
 import amqp from "amqplib";
 import Fastify from "fastify";
-import { appendFile, mkdir } from "node:fs/promises";
-import { readFileSync } from "node:fs";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { connect as connectTls } from "node:tls";
 import Redis from "ioredis";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { appendFile, mkdir } from "node:fs/promises";
+import { connect as connectTls } from "node:tls";
 
 const config = loadConfig("api-gateway", 4000);
 const tlsRuntime = createTlsRuntime({
@@ -328,6 +328,9 @@ async function proxy(
   };
   if (request.auth?.userId) {
     headers["x-user-id"] = request.auth.userId;
+    // x-user-name carries the same preferred_username for display purposes.
+    // Workflow-service uses this to store ownerUsername on KB creation.
+    headers["x-user-name"] = request.auth.userId;
   }
   if (request.auth?.roles?.length) {
     headers["x-user-roles"] = request.auth.roles.join(",");
@@ -340,7 +343,12 @@ async function proxy(
     method,
     headers
   };
-  if (method !== "GET" && request.body !== undefined) {
+  // Only set content-type and body for requests that actually have a body.
+  // DELETE requests without a body must NOT set content-type: application/json
+  // because Fastify (and some proxies) reject empty JSON bodies.
+  const hasBody = method !== "GET" && method !== "DELETE" && request.body !== undefined;
+  const hasDeleteBody = method === "DELETE" && request.body !== undefined && Object.keys(request.body as object).length > 0;
+  if (hasBody || hasDeleteBody) {
     headers["content-type"] = "application/json";
     init.body = JSON.stringify(request.body);
   }
@@ -1057,6 +1065,23 @@ app.patch("/rag/knowledge-bases/:id/config", { preHandler: requireAnyRole(["admi
   await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/config`);
 });
 
+// ─── KB Share Management Routes ───────────────────────────────────────────────
+// Owner or admin can share a KB with another user by their username.
+app.post("/rag/knowledge-bases/:id/shares", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/shares`);
+});
+
+app.get("/rag/knowledge-bases/:id/shares", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/shares`);
+});
+
+app.delete("/rag/knowledge-bases/:id/shares/:shareId", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
+  const { id, shareId } = request.params as { id: string; shareId: string };
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/shares/${shareId}`);
+});
+
 app.delete("/rag/knowledge-bases/:id", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
   await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/knowledge-bases/${id}`);
@@ -1072,9 +1097,20 @@ app.post("/rag/knowledge-bases/:id/sync", { preHandler: requireAnyRole(["admin",
   await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync`);
 });
 
+app.post("/rag/knowledge-bases/:id/retry-failed-indexing", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/retry-failed-indexing`);
+});
+
 app.post("/rag/knowledge-bases/:id/sync-cancel", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
   await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-cancel`);
+});
+
+// Cleanup: remove all indexed documents and Dify KB data for a source (no fetch/index — deletion only)
+app.post("/rag/knowledge-bases/:id/cleanup", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/cleanup`);
 });
 
 app.get("/rag/knowledge-bases/:id/sync-status", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {

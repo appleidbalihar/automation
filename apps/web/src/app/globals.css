@@ -587,6 +587,12 @@ a {
   font-size: 13px;
 }
 
+.ops-error {
+  margin: 6px 0;
+  color: #991b1b;
+  font-size: 13px;
+}
+
 .ops-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -598,6 +604,11 @@ a {
   display: grid;
   gap: 6px;
   font-size: 13px;
+}
+
+.ops-grid small {
+  color: #64748b;
+  font-size: 12px;
 }
 
 .ops-grid input,
@@ -618,6 +629,61 @@ a {
 .ops-grid button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.ops-grid-compact {
+  margin-top: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.ops-section-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.ops-table-wrap {
+  overflow-x: auto;
+}
+
+.ops-table {
+  width: 100%;
+  min-width: 980px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.ops-table th,
+.ops-table td {
+  border-bottom: 1px solid #e5e7eb;
+  padding: 9px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.ops-table th {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ops-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 230px;
+}
+
+.ops-row-actions button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: var(--surface);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .operations-ai-page {
@@ -1295,6 +1361,39 @@ a {
   line-height: 1.4;
 }
 
+.ops-failed-doc-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.ops-failed-doc {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  background: #fff7f7;
+  color: #7f1d1d;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.ops-failed-doc strong {
+  color: #111827;
+  overflow-wrap: anywhere;
+}
+
+.ops-failed-doc small,
+.ops-failed-doc span {
+  overflow-wrap: anywhere;
+}
+
+.ops-inline-retry-btn {
+  width: fit-content;
+  margin-top: 4px;
+}
+
 .ops-step-badge {
   display: inline-flex;
   align-items: center;
@@ -1871,20 +1970,31 @@ a {
 }
 
 .ops-action-sync {
-  background: #1e3a5f;
-  color: #fff;
-  border-color: #1e3a5f;
+  background: #f0f9ff;
+  color: #0369a1 !important;
+  border-color: #bae6fd;
+  transition: background 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
 }
 
 .ops-action-sync:hover:not(:disabled) {
-  background: #1e40af;
+  background: #e0f2fe !important;
+  color: #0369a1 !important;
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(3, 105, 161, 0.15);
+}
+
+.ops-action-sync:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: none;
+  background: #f0f9ff !important;
 }
 
 .ops-action-sync-disabled {
-  background: #f1f5f9;
-  color: #94a3b8;
-  border-color: #e2e8f0;
+  background: #f0f9ff;
+  color: #0369a1 !important;
+  border-color: #bae6fd;
   cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .ops-action-cancel {
@@ -1893,10 +2003,21 @@ a {
   border-color: #fcd34d;
 }
 
+.ops-action-retry {
+  background: #ecfeff;
+  color: #155e75;
+  border-color: #67e8f9;
+}
+
+.ops-action-retry:hover:not(:disabled) {
+  background: #cffafe;
+}
+
 .ops-action-edit {
   background: #f8fafc;
   color: #334155;
   border-color: #d1d5db;
+  transition: background 0.12s ease;
 }
 
 .ops-action-edit:hover {
@@ -1911,6 +2032,32 @@ a {
 
 .ops-action-default:hover:not(:disabled) {
   background: #dcfce7;
+}
+
+/* Cleanup button — destructive-light */
+.ops-action-cleanup {
+  background: #fff7ed;
+  color: #9a3412;
+  border-color: #fed7aa;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ops-action-cleanup:hover:not(:disabled) {
+  background: #ffedd5;
+  border-color: #fb923c;
+}
+
+/* Share button — teal/link accent */
+.ops-action-share {
+  background: #f0f9ff;
+  color: #0369a1;
+  border-color: #bae6fd;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ops-action-share:hover:not(:disabled) {
+  background: #e0f2fe;
+  border-color: #38bdf8;
 }
 
 .ops-action-delete {
@@ -2196,4 +2343,185 @@ a {
   font-size: 0.76rem;
   color: #64748b;
   font-style: italic;
+}
+
+/* ── Project name chip (table cell) ─────────────────────────────────────── */
+.ops-project-chip {
+  display: inline-block;
+  padding: 2px 10px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #1d4ed8;
+  white-space: nowrap;
+}
+
+/* ── Branch label in location cell ──────────────────────────────────────── */
+.ops-branch-label {
+  font-size: 0.76rem;
+  color: #64748b;
+}
+
+/* ── Multiple paths list in location cell ────────────────────────────────── */
+.ops-paths-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+}
+
+.ops-path-item {
+  font-size: 0.75rem;
+  color: #475569;
+  line-height: 1.4;
+}
+
+/* ── Multi-path editor (Create/Edit modals) ──────────────────────────────── */
+.ops-paths-label {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  color: #0f172a;
+  margin-bottom: 8px;
+}
+
+.ops-path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+/* Path input inherits form-grid styling but needs flex-grow */
+.ops-path-row input {
+  flex: 1;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  padding: 11px 12px;
+  background: #fff;
+  font: inherit;
+  color: inherit;
+}
+
+.ops-path-remove-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #fca5a5;
+  border-radius: 6px;
+  background: #fff1f2;
+  color: #be123c;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0;
+  line-height: 1;
+  transition: background 0.12s ease;
+}
+
+.ops-path-remove-btn:hover {
+  background: #ffe4e6;
+}
+
+.ops-path-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px dashed #93c5fd;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ops-path-add-btn:hover {
+  background: #dbeafe;
+  border-color: #60a5fa;
+}
+
+/* ── Background sync running banner ─────────────────────────────────────── */
+.ops-bg-sync-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  border-radius: 10px;
+  font-size: 0.85rem;
+  color: #78350f;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.ops-bg-sync-spinner {
+  font-size: 1rem;
+  animation: spin 1.5s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.ops-bg-sync-switch-btn {
+  background: none;
+  border: none;
+  color: #1d4ed8;
+  cursor: pointer;
+  font-weight: 600;
+  text-decoration: underline;
+  font-size: inherit;
+  padding: 0 4px;
+}
+
+.ops-bg-sync-switch-btn:hover {
+  color: #1e40af;
+}
+
+/* ── Per-step operation type badges (Cleanup / Index / Metadata) ─────────── */
+.ops-sync-task-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ops-step-op-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.ops-step-op-cleanup {
+  background: #fff7ed;
+  color: #9a3412;
+  border: 1px solid #fed7aa;
+}
+
+.ops-step-op-index {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+}
+
+.ops-step-op-meta {
+  background: #f5f3ff;
+  color: #6d28d9;
+  border: 1px solid #ddd6fe;
 }

@@ -1,18 +1,23 @@
 import { loadConfig } from "@platform/config";
-import { logInfo } from "@platform/observability";
 import type {
   RagDiscussionSendMessageResponse,
   RagDiscussionSummary,
   RagDiscussionThread
 } from "@platform/contracts";
 import { prisma } from "@platform/db";
+import { logInfo } from "@platform/observability";
 import { createTlsRuntime, tlsFetch } from "@platform/tls-runtime";
 import Fastify from "fastify";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import type { DifyProvisioningConfig } from "./dify-config.js";
+import {
+  DEFAULT_WORKFLOW_IDS,
+  buildDifyProvisioningConfig,
+  resolveDifyWorkflowId
+} from "./dify-config.js";
 import {
   buildRagThreadExpiry,
   deriveRagThreadTitle,
-  extractFlowiseText,
   mapRagDiscussionMessage,
   mapRagDiscussionSummary,
   mapRagDiscussionThread
@@ -35,16 +40,14 @@ const tlsRuntime = createTlsRuntime({
 const app = Fastify({ logger: false, https: tlsRuntime.getServerOptions() } as any);
 
 const VAULT_KV_MOUNT = String(process.env.VAULT_KV_MOUNT ?? "secret").trim() || "secret";
-const DEFAULT_WORKFLOW_IDS: Record<string, string> = {
-  github: "rag-sync-github",
-  gitlab: "rag-sync-gitlab",
-  googledrive: "rag-sync-gdrive",
-  web: "rag-sync-web",
-  upload: ""
-};
-
 function requesterUserId(headers: Record<string, unknown>): string {
   return String(headers["x-user-id"] ?? "").trim() || "unknown";
+}
+
+function requesterUserName(headers: Record<string, unknown>): string {
+  // x-user-name is the Keycloak preferred_username forwarded by the API gateway.
+  // Falls back to x-user-id (same value) if not set.
+  return String(headers["x-user-name"] ?? headers["x-user-id"] ?? "").trim() || "unknown";
 }
 
 function requesterRoles(headers: Record<string, unknown>): string[] {
@@ -152,6 +155,18 @@ async function listVaultLeafPaths(prefix: string): Promise<string[]> {
 function nonEmptyString(value: unknown): string | undefined {
   const normalized = String(value ?? "").trim();
   return normalized ? normalized : undefined;
+}
+
+function isSensitiveSecretKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return (
+    normalized.includes("password") ||
+    normalized.includes("secret") ||
+    normalized.includes("token") ||
+    normalized.endsWith("_key") ||
+    normalized.includes("api_key") ||
+    normalized === "key"
+  );
 }
 
 function normalizeAccessToken(value: unknown): string | undefined {
@@ -358,11 +373,7 @@ async function readGlobalDifyProvisioningDefaults(sourceType: string): Promise<{
   workflowId: string;
 }> {
   const configSecret = await readVaultKv("platform/global/dify/config");
-  const normalizedType = sourceType === "gdrive" ? "googledrive" : sourceType;
-  const workflowId =
-    nonEmptyString(configSecret[`${normalizedType}_workflow_id`]) ??
-    DEFAULT_WORKFLOW_IDS[normalizedType] ??
-    "";
+  const workflowId = resolveDifyWorkflowId(sourceType, configSecret, DEFAULT_WORKFLOW_IDS);
   return {
     difyAppUrl: nonEmptyString(configSecret.default_app_url) ?? config.difyApiBaseUrl,
     defaultApiKey: nonEmptyString(configSecret.default_api_key),
@@ -370,28 +381,51 @@ async function readGlobalDifyProvisioningDefaults(sourceType: string): Promise<{
   };
 }
 
-type DifyProvisioningConfig = {
-  difyAppUrl: string;
-  consoleEmail: string;
-  consoleName: string;
-  consolePassword: string;
-  initPassword?: string;
-  modelProvider: string;
-  modelApiKey?: string;
-  modelApiBase?: string;
-  chatModel: string;
-  embeddingModel: string;
-  workflowId: string;
-};
-
 type DifyConsoleSession = {
   baseUrl: string;
   token: string;
   config: DifyProvisioningConfig;
 };
 
+type DifyDatasetDocument = {
+  id?: string;
+  name?: string;
+  indexing_status?: string;
+  archived?: boolean;
+  error?: string | null;
+  created_at?: string | number | null;
+  updated_at?: string | number | null;
+};
+
+type FailedDifyIndexingDocument = {
+  filePath?: string;
+  difyDocId?: string;
+  batchId?: string;
+  indexingStatus?: string;
+  error?: string;
+  retryable?: boolean;
+};
+
+type RetryFailedDifyIndexingOptions = {
+  syncJobId?: string;
+  documentIds?: string[];
+};
+
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+function parseDifyDateMs(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 10_000_000_000 ? value : value * 1000;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
 }
 
 function ragSyncProgressCallbackBaseUrl(): string {
@@ -439,19 +473,16 @@ async function readDifyProvisioningConfig(sourceType: string): Promise<DifyProvi
     });
   }
 
-  return {
-    difyAppUrl,
-    consoleEmail,
-    consoleName,
-    consolePassword,
-    initPassword: nonEmptyString(configSecret.init_password),
-    modelProvider: nonEmptyString(configSecret.model_provider) ?? "openai",
-    modelApiKey: nonEmptyString(configSecret.model_api_key),
-    modelApiBase: nonEmptyString(configSecret.model_api_base),
-    chatModel: nonEmptyString(configSecret.chat_model) ?? "gpt-4o-mini",
-    embeddingModel: nonEmptyString(configSecret.embedding_model) ?? "text-embedding-3-small",
-    workflowId: defaults.workflowId
-  };
+  return buildDifyProvisioningConfig({
+    configSecret: {
+      ...configSecret,
+      default_app_url: difyAppUrl,
+      console_email: consoleEmail,
+      console_name: consoleName
+    },
+    defaults,
+    consolePassword
+  });
 }
 
 async function difyConsoleFetch(
@@ -530,40 +561,60 @@ async function ensureDifyConsoleSession(sourceType: string): Promise<DifyConsole
   const token = nonEmptyString(login.payload.data);
   if (!token) throw new Error("DIFY_CONSOLE_LOGIN_TOKEN_MISSING");
 
-  const modelCredentials = {
-    openai_api_key: provisioningConfig.modelApiKey,
-    ...(provisioningConfig.modelApiBase ? { openai_api_base: provisioningConfig.modelApiBase } : {})
-  };
+  const isCompatibleProvider = provisioningConfig.modelProvider === "openai_api_compatible";
+  const endpointUrl = provisioningConfig.modelApiBase
+    ? `${trimTrailingSlash(provisioningConfig.modelApiBase)}/v1`
+    : undefined;
 
-  try {
-    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}`, {
-      method: "POST",
-      token,
-      body: { credentials: modelCredentials },
-      ok: [201]
-    });
-  } catch (error) {
-    // Some OpenAI-compatible gateways authorize only selected models. Dify's
-    // provider-level validation probes a default model, so fall back to explicit
-    // per-model credentials for the chat and embedding models we actually use.
-    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/models`, {
+  // openai_api_compatible uses different credential keys and requires per-model registration
+  if (isCompatibleProvider) {
+    const baseCreds = {
+      api_key: provisioningConfig.modelApiKey,
+      endpoint_url: endpointUrl ?? "https://api.openai.com/v1"
+    };
+    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/openai_api_compatible/models`, {
       method: "POST",
       token,
       body: {
         model: provisioningConfig.chatModel,
         model_type: "llm",
-        credentials: modelCredentials
+        credentials: { ...baseCreds, mode: "chat", context_size: "128000", max_tokens_to_sample: "4096", stream_mode_delimiter: "\n\n" }
       }
     });
-    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/models`, {
+    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/openai_api_compatible/models`, {
       method: "POST",
       token,
       body: {
         model: provisioningConfig.embeddingModel,
         model_type: "text-embedding",
-        credentials: modelCredentials
+        credentials: { ...baseCreds, context_size: "8191" }
       }
     });
+  } else {
+    const modelCredentials = {
+      openai_api_key: provisioningConfig.modelApiKey,
+      ...(provisioningConfig.modelApiBase ? { openai_api_base: provisioningConfig.modelApiBase } : {})
+    };
+    try {
+      await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}`, {
+        method: "POST",
+        token,
+        body: { credentials: modelCredentials },
+        ok: [201]
+      });
+    } catch {
+      // Some OpenAI gateways only authorize selected models — fall back to per-model credentials.
+      await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/models`, {
+        method: "POST",
+        token,
+        body: { model: provisioningConfig.chatModel, model_type: "llm", credentials: modelCredentials }
+      });
+      await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/models`, {
+        method: "POST",
+        token,
+        body: { model: provisioningConfig.embeddingModel, model_type: "text-embedding", credentials: modelCredentials }
+      });
+    }
   }
 
   await difyConsoleFetch(
@@ -611,6 +662,42 @@ async function createDifyDataset(session: DifyConsoleSession, name: string): Pro
   const datasetId = nonEmptyString(created.payload.id);
   if (!datasetId) throw new Error("DIFY_DATASET_ID_MISSING");
   return datasetId;
+}
+
+async function configureDifyDatasetEmbedding(session: DifyConsoleSession, datasetId: string): Promise<void> {
+  const existing = await difyConsoleFetch(session.baseUrl, `/datasets/${datasetId}`, {
+    method: "GET",
+    token: session.token
+  });
+  const dataset = existing.payload;
+  const indexingTechnique = nonEmptyString(dataset.indexing_technique) ?? "high_quality";
+  const embeddingModel = nonEmptyString(dataset.embedding_model);
+  const embeddingProvider = nonEmptyString(dataset.embedding_model_provider);
+  if (
+    indexingTechnique !== "high_quality" ||
+    (embeddingModel === session.config.embeddingModel && embeddingProvider === session.config.modelProvider)
+  ) {
+    return;
+  }
+
+  await difyConsoleFetch(session.baseUrl, `/datasets/${datasetId}`, {
+    method: "PATCH",
+    token: session.token,
+    body: {
+      name: nonEmptyString(dataset.name) ?? "Knowledge Base",
+      description: nonEmptyString(dataset.description) ?? "",
+      indexing_technique: "high_quality",
+      permission: nonEmptyString(dataset.permission) ?? "only_me",
+      embedding_model: session.config.embeddingModel,
+      embedding_model_provider: session.config.modelProvider,
+      retrieval_model: dataset.retrieval_model ?? {
+        search_method: "semantic_search",
+        reranking_enable: false,
+        top_k: 4,
+        score_threshold_enabled: false
+      }
+    }
+  });
 }
 
 async function createDifyApp(session: DifyConsoleSession, name: string, description?: string | null): Promise<string> {
@@ -756,6 +843,7 @@ async function ensureDifyKnowledgeBaseProvisioned(kbId: string): Promise<void> {
       data: { difyDatasetId: datasetId, difyAppUrl: session.config.difyAppUrl }
     });
   }
+  await configureDifyDatasetEmbedding(session, datasetId);
 
   let appId = nonEmptyString(existingSecrets.app_id);
   if (!appId) {
@@ -818,54 +906,57 @@ async function listRagDiscussionSummaries(ownerId: string): Promise<RagDiscussio
   return threads.map((thread) => mapRagDiscussionSummary(thread, thread.messages[0]?.content));
 }
 
+/**
+ * Resolve a visible knowledge base for starting or continuing a discussion.
+ * Uses the new ownership model: ownerId or shared-with, no scope field.
+ */
 async function resolveVisibleKnowledgeBaseForDiscussion(
   ownerId: string,
   headers: Record<string, unknown>,
   requestedKnowledgeBaseId?: string
 ): Promise<{ id: string } | null> {
   const privileged = isAdminOrUserAdmin(headers);
-  const where = requestedKnowledgeBaseId
-    ? privileged
-      ? { id: requestedKnowledgeBaseId }
-      : {
-          id: requestedKnowledgeBaseId,
-          OR: [{ scope: "global" }, { ownerId }]
-        }
-    : privileged
-      ? {}
-      : {
-          OR: [{ scope: "global" }, { ownerId }]
-        };
 
   if (requestedKnowledgeBaseId) {
-    return prisma.ragKnowledgeBase.findFirst({
-      where,
-      select: { id: true }
-    });
+    // Check if the user can access this specific KB
+    const canAccess = await canAccessKnowledgeBase(requestedKnowledgeBaseId, ownerId, privileged);
+    if (!canAccess) return null;
+    return { id: requestedKnowledgeBaseId };
   }
 
+  // No specific KB requested — find user's default or most recent accessible KB
   const userConfig = await readUserRagConfig(ownerId);
   const userDefaultId = nonEmptyString(userConfig.default_kb_id);
   if (userDefaultId) {
-    const preferred = await prisma.ragKnowledgeBase.findFirst({
-      where: privileged
-        ? { id: userDefaultId }
-        : {
-            id: userDefaultId,
-            OR: [{ scope: "global" }, { ownerId }]
-          },
-      select: { id: true }
-    });
-    if (preferred) return preferred;
+    const canAccess = await canAccessKnowledgeBase(userDefaultId, ownerId, privileged);
+    if (canAccess) return { id: userDefaultId };
   }
 
-  const visible = await prisma.ragKnowledgeBase.findMany({
-    where,
-    select: { id: true },
-    orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }],
-    take: 1
+  // Fall back to first accessible KB (owned or shared-with)
+  if (privileged) {
+    const kb = await (prisma as any).ragKnowledgeBase.findFirst({
+      select: { id: true },
+      orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }]
+    });
+    return kb ?? null;
+  }
+
+  const sharedKbIds = await (prisma as any).ragKbShare.findMany({
+    where: { sharedWithId: ownerId },
+    select: { knowledgeBaseId: true }
   });
-  return visible[0] ?? null;
+  const sharedIds = sharedKbIds.map((s: { knowledgeBaseId: string }) => s.knowledgeBaseId);
+  const kb = await (prisma as any).ragKnowledgeBase.findFirst({
+    where: {
+      OR: [
+        { ownerId },
+        { id: { in: sharedIds } }
+      ]
+    },
+    select: { id: true },
+    orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }]
+  });
+  return kb ?? null;
 }
 
 async function getRagDiscussionThread(threadId: string, ownerId: string): Promise<RagDiscussionThread | null> {
@@ -909,27 +1000,36 @@ async function createRagDiscussion(
   return mapRagDiscussionSummary(thread);
 }
 
-async function sendToFlowise(content: string, sessionId: string): Promise<string> {
-  const response = await fetch(config.flowiseOperationsChatUrl, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(config.flowiseApiKey ? { authorization: `Bearer ${config.flowiseApiKey}` } : {})
-    },
-    body: JSON.stringify({ question: content, overrideConfig: { sessionId } })
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`FLOWISE_REQUEST_FAILED:${response.status}:${text}`);
-  }
-  return extractFlowiseText(await response.json());
+/**
+ * Extracts token usage from a Dify chat-message response payload.
+ * Dify returns usage inside: { metadata: { usage: { prompt_tokens, completion_tokens, total_tokens, ... } } }
+ */
+function extractDifyTokenUsage(payload: Record<string, unknown>): {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+} | null {
+  const metadata = payload.metadata;
+  if (!metadata || typeof metadata !== "object") return null;
+  const usage = (metadata as Record<string, unknown>).usage;
+  if (!usage || typeof usage !== "object") return null;
+  const u = usage as Record<string, unknown>;
+  const promptTokens = typeof u.prompt_tokens === "number" ? u.prompt_tokens : 0;
+  const completionTokens = typeof u.completion_tokens === "number" ? u.completion_tokens : 0;
+  const totalTokens = typeof u.total_tokens === "number" ? u.total_tokens : promptTokens + completionTokens;
+  if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0) return null;
+  return { promptTokens, completionTokens, totalTokens };
 }
 
 /**
  * Calls Dify chat-messages API for a given knowledge base.
  * The API key is fetched from Vault at runtime — it is never stored in env vars.
  * Vault path: platform/global/dify/{kbId} → app_api_key
- * Returns the answer text and Dify's conversation_id for session continuity.
+ *
+ * Auto-recovery on 401: If Dify returns 401 (stale/wiped API key), the service
+ * automatically logs in to the Dify console, creates a fresh API key, updates
+ * Vault, and retries once. This handles the case where the Dify container
+ * restarts with a fresh DB (clearing all api_tokens) without operator intervention.
  */
 async function sendToDify(
   content: string,
@@ -937,27 +1037,78 @@ async function sendToDify(
   kbId: string,
   difyAppUrl: string,
   userId: string
-): Promise<{ answer: string; conversationId: string }> {
+): Promise<{ answer: string; conversationId: string; tokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | null }> {
   // Fetch the Dify API key from Vault — never from env vars
   const secrets = await readVaultKv(`platform/global/dify/${kbId}`);
   const apiKey = String(secrets.app_api_key ?? secrets.api_key ?? "").trim();
   if (!apiKey) throw new Error(`DIFY_API_KEY_NOT_CONFIGURED:${kbId}`);
 
-  const response = await fetch(`${difyAppUrl}/v1/chat-messages`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      inputs: {},
-      query: content,
-      response_mode: "blocking",
-      // Pass empty string for first message; Dify creates a new conversation
-      conversation_id: difyConversationId ?? "",
-      user: userId
-    })
+  const chatBody = JSON.stringify({
+    inputs: {},
+    query: content,
+    response_mode: "blocking",
+    // Pass empty string for first message; Dify creates a new conversation
+    conversation_id: difyConversationId ?? "",
+    user: userId
   });
+
+  const doRequest = async (key: string): Promise<Response> => {
+    return fetch(`${difyAppUrl}/v1/chat-messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key}`
+      },
+      body: chatBody
+    });
+  };
+
+  let response = await doRequest(apiKey);
+
+  // Auto-recover stale API key: Dify wipes api_tokens on DB reset/container restart.
+  // On 401 → login to Dify console, create fresh key, update Vault, retry once.
+  if (response.status === 401) {
+    logInfo("DIFY_KEY_STALE — attempting auto-recovery", {
+      service: "workflow-service",
+      kbId,
+      userId
+    });
+    try {
+      const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId } });
+      const sourceType = String(kb?.sourceType ?? "github");
+      const appId = nonEmptyString(secrets.app_id);
+      if (!appId) throw new Error("DIFY_APP_ID_MISSING_IN_VAULT");
+
+      // Login to Dify console and create a fresh app API key
+      const session = await ensureDifyConsoleSession(sourceType);
+      const freshAppApiKey = await createDifyAppApiKey(session, appId);
+
+      // Persist the new key to Vault so subsequent requests use it immediately
+      await writeVaultKv(`platform/global/dify/${kbId}`, {
+        ...secrets,
+        api_key: freshAppApiKey,
+        app_api_key: freshAppApiKey
+      });
+
+      logInfo("DIFY_KEY_RECOVERED — retrying request", {
+        service: "workflow-service",
+        kbId,
+        userId
+      });
+
+      // Retry once with the fresh key
+      response = await doRequest(freshAppApiKey);
+
+      if (response.status === 401) {
+        throw new Error(`DIFY_AUTH_RECOVERY_FAILED:${kbId}`);
+      }
+    } catch (recoveryError) {
+      const errMsg = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+      // If recovery itself failed, surface original 401 with context
+      throw new Error(`DIFY_REQUEST_FAILED:401:{"code":"unauthorized","message":"${errMsg}","status":401}`);
+    }
+  }
+
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`DIFY_REQUEST_FAILED:${response.status}:${text}`);
@@ -967,7 +1118,593 @@ async function sendToDify(
     ? payload.answer
     : (() => { throw new Error("DIFY_EMPTY_RESPONSE"); })();
   const conversationId = typeof payload.conversation_id === "string" ? payload.conversation_id : "";
-  return { answer, conversationId };
+  // Extract token usage from Dify's metadata — used for observability/cost tracking
+  const tokenUsage = extractDifyTokenUsage(payload);
+  return { answer, conversationId, tokenUsage };
+}
+
+async function difyDatasetFetch(
+  difyAppUrl: string,
+  path: string,
+  apiKey: string,
+  options: {
+    method?: string;
+    body?: Record<string, unknown>;
+    ok?: number[];
+  } = {}
+): Promise<Record<string, any>> {
+  const response = await fetch(`${trimTrailingSlash(difyAppUrl)}/v1${path}`, {
+    method: options.method ?? "GET",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) as Record<string, any> : {};
+  const expected = options.ok ?? [200, 201];
+  if (!expected.includes(response.status)) {
+    const message = typeof payload.message === "string" ? payload.message : text;
+    throw new Error(`DIFY_DATASET_REQUEST_FAILED:${path}:${response.status}:${message}`);
+  }
+  return payload;
+}
+
+async function listDifyDatasetDocuments(
+  difyAppUrl: string,
+  datasetId: string,
+  apiKey: string
+): Promise<DifyDatasetDocument[]> {
+  const documents: DifyDatasetDocument[] = [];
+  for (let page = 1; page <= 20; page++) {
+    const payload = await difyDatasetFetch(
+      difyAppUrl,
+      `/datasets/${encodeURIComponent(datasetId)}/documents?page=${page}&limit=100`,
+      apiKey
+    );
+    const data = Array.isArray(payload.data) ? payload.data as DifyDatasetDocument[] : [];
+    documents.push(...data);
+    if (!payload.has_more || data.length === 0) break;
+  }
+  return documents;
+}
+
+function isDifyIndexingActive(status: string): boolean {
+  return ["waiting", "parsing", "cleaning", "splitting", "indexing"].includes(status);
+}
+
+function isRetryableDifyIndexingError(error: string | undefined): boolean {
+  const normalized = String(error ?? "").toLowerCase();
+  if (!normalized) return false;
+  return [
+    "too many requests",
+    "rate limit",
+    "ratelimit",
+    "429",
+    "timeout",
+    "timed out",
+    "temporary",
+    "temporarily",
+    "embedding",
+    "upstream",
+    "unavailable",
+    "overloaded",
+    "try again"
+  ].some((needle) => normalized.includes(needle));
+}
+
+function normalizeFailedDifyDocuments(value: unknown): FailedDifyIndexingDocument[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((raw) => {
+      const o = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+      const filePath = nonEmptyString(o.filePath) ?? nonEmptyString(o.name);
+      const difyDocId = nonEmptyString(o.difyDocId) ?? nonEmptyString(o.docId) ?? nonEmptyString(o.documentId);
+      const batchId = nonEmptyString(o.batchId);
+      const indexingStatus = nonEmptyString(o.indexingStatus) ?? nonEmptyString(o.indexing_status);
+      const error = nonEmptyString(o.error) ?? nonEmptyString(o.errorMessage);
+      const retryable = typeof o.retryable === "boolean" ? o.retryable : undefined;
+      return { filePath, difyDocId, batchId, indexingStatus, error, retryable };
+    })
+    .filter((doc) => doc.filePath || doc.difyDocId || doc.batchId || doc.error);
+}
+
+function mergeFailedDifyDocumentDetails(
+  requested: FailedDifyIndexingDocument[],
+  documents: DifyDatasetDocument[]
+): FailedDifyIndexingDocument[] {
+  return requested.map((doc) => {
+    const match = documents.find((candidate) =>
+      (doc.difyDocId && candidate.id === doc.difyDocId) ||
+      (doc.filePath && candidate.name === doc.filePath)
+    );
+    if (!match) return doc;
+    return {
+      ...doc,
+      filePath: doc.filePath ?? match.name,
+      difyDocId: doc.difyDocId ?? match.id,
+      indexingStatus: String(match.indexing_status ?? doc.indexingStatus ?? ""),
+      error: nonEmptyString(match.error) ?? doc.error
+    };
+  });
+}
+
+function failedDifyDocumentFromDatasetDocument(doc: DifyDatasetDocument): FailedDifyIndexingDocument {
+  return {
+    filePath: doc.name,
+    difyDocId: doc.id,
+    indexingStatus: doc.indexing_status,
+    error: doc.error ?? undefined,
+    retryable: isRetryableDifyIndexingError(doc.error ?? undefined)
+  };
+}
+
+function dedupeFailedDifyDocuments(documents: FailedDifyIndexingDocument[]): FailedDifyIndexingDocument[] {
+  const seen = new Set<string>();
+  const deduped: FailedDifyIndexingDocument[] = [];
+  for (const doc of documents) {
+    const key = doc.difyDocId ?? `${doc.filePath ?? "unknown"}:${doc.batchId ?? ""}:${doc.error ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(doc);
+  }
+  return deduped;
+}
+
+function failedDocumentsFromSyncJob(job: Record<string, any> | null | undefined): FailedDifyIndexingDocument[] {
+  const steps = Array.isArray(job?.stepsJson) ? job.stepsJson as Record<string, unknown>[] : [];
+  const failedDocuments = steps.flatMap((step) => normalizeFailedDifyDocuments(step.failedDocuments));
+  return dedupeFailedDifyDocuments(failedDocuments);
+}
+
+async function inferFailedDifyDocumentsForSyncJob(input: {
+  job: Record<string, any>;
+  difyAppUrl: string;
+  datasetId: string;
+  datasetApiKey: string;
+}): Promise<FailedDifyIndexingDocument[]> {
+  const explicit = failedDocumentsFromSyncJob(input.job);
+  if (explicit.length) return explicit;
+
+  const documents = await listDifyDatasetDocuments(input.difyAppUrl, input.datasetId, input.datasetApiKey);
+  const startedAtMs = parseDifyDateMs(input.job.startedAt);
+  const completedAtMs = parseDifyDateMs(input.job.completedAt) ?? Date.now();
+  const windowStartMs = startedAtMs == null ? null : startedAtMs - 60_000;
+  const windowEndMs = completedAtMs + 60_000;
+  const failed = documents.filter((doc) => {
+    if (!doc.id || doc.archived || String(doc.indexing_status ?? "") !== "error") return false;
+    const createdAtMs = parseDifyDateMs(doc.created_at) ?? parseDifyDateMs(doc.updated_at);
+    if (windowStartMs == null || createdAtMs == null) return true;
+    return createdAtMs >= windowStartMs && createdAtMs <= windowEndMs;
+  });
+  return dedupeFailedDifyDocuments(failed.map(failedDifyDocumentFromDatasetDocument));
+}
+
+async function updateSyncJobStep(syncJobId: string, step: Record<string, unknown>): Promise<void> {
+  const job = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: syncJobId } });
+  if (!job) return;
+  const existing = Array.isArray(job.stepsJson)
+    ? (job.stepsJson as Record<string, unknown>[])
+    : [];
+  const stepName = String(step.stepName ?? step.task ?? "dify_indexing");
+  const idx = existing.findIndex((s) => String(s["stepName"] ?? s["task"] ?? "") === stepName);
+  if (idx >= 0) existing[idx] = { ...existing[idx], ...step };
+  else existing.push(step);
+  await (prisma as any).ragKbSyncJob.update({
+    where: { id: syncJobId },
+    data: { stepsJson: existing }
+  });
+}
+
+async function pollDifyRetryIndexingJob(input: {
+  syncJobId: string;
+  sourceSyncJobId?: string;
+  difyAppUrl: string;
+  datasetId: string;
+  datasetApiKey: string;
+  documentIds: string[];
+}): Promise<void> {
+  const maxAttempts = 48;
+  const intervalMs = 5000;
+  let latestDocuments: DifyDatasetDocument[] = [];
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    latestDocuments = await listDifyDatasetDocuments(input.difyAppUrl, input.datasetId, input.datasetApiKey);
+    const targetDocuments = latestDocuments.filter((doc) => doc.id && input.documentIds.includes(doc.id));
+    const completed = targetDocuments.filter((doc) => String(doc.indexing_status ?? "") === "completed").length;
+    const active = targetDocuments.some((doc) => isDifyIndexingActive(String(doc.indexing_status ?? "")));
+    const failedDocuments = targetDocuments
+      .filter((doc) => String(doc.indexing_status ?? "") === "error")
+      .map(failedDifyDocumentFromDatasetDocument);
+
+    await (prisma as any).ragKbSyncJob.update({
+      where: { id: input.syncJobId },
+      data: {
+        filesProcessed: completed,
+        chunksProcessed: completed,
+        stepsJson: [
+          {
+            task: "Retry Failed Indexing",
+            stepName: "retry_failed_indexing",
+            status: active ? "running" : "completed",
+            message: `${completed}/${input.documentIds.length} failed documents recovered`,
+            failedDocuments
+          }
+        ]
+      }
+    }).catch(() => undefined);
+
+    if (!active) break;
+  }
+
+  const finalDocuments = latestDocuments.length
+    ? latestDocuments
+    : await listDifyDatasetDocuments(input.difyAppUrl, input.datasetId, input.datasetApiKey);
+  const targetDocuments = finalDocuments.filter((doc) => doc.id && input.documentIds.includes(doc.id));
+  const completed = targetDocuments.filter((doc) => String(doc.indexing_status ?? "") === "completed").length;
+  const failed = targetDocuments.filter((doc) => String(doc.indexing_status ?? "") === "error");
+  const active = targetDocuments.some((doc) => isDifyIndexingActive(String(doc.indexing_status ?? "")));
+  const firstError = failed.find((doc) => doc.error)?.error;
+  const failedDocuments = failed.map(failedDifyDocumentFromDatasetDocument);
+  const finalStatus = failed.length || active ? "failed" : "completed";
+  const errorMessage = active
+    ? "Dify retry indexing timed out"
+    : failed.length
+      ? `${failed.length} documents still failed indexing${firstError ? `: ${firstError}` : ""}`
+      : null;
+
+  await (prisma as any).ragKbSyncJob.update({
+    where: { id: input.syncJobId },
+    data: {
+      status: finalStatus,
+      filesProcessed: completed,
+      chunksProcessed: completed,
+      errorMessage,
+      completedAt: new Date(),
+      stepsJson: [
+        {
+          task: "Retry Failed Indexing",
+          stepName: "retry_failed_indexing",
+          status: finalStatus,
+          startedAt: undefined,
+          completedAt: new Date().toISOString(),
+          message: `${completed}/${input.documentIds.length} failed documents recovered`,
+          errorMessage: errorMessage ?? undefined,
+          failedDocuments
+        }
+      ]
+    }
+  });
+
+  if (input.sourceSyncJobId) {
+    const sourceJob = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.sourceSyncJobId } }).catch(() => null);
+    const sourceFailedDocuments = failedDocumentsFromSyncJob(sourceJob);
+    if (sourceJob && sourceFailedDocuments.length > 0) {
+      const sourceIds = sourceFailedDocuments.map((doc) => doc.difyDocId).filter(Boolean) as string[];
+      const sourceTargets = finalDocuments.filter((doc) => doc.id && sourceIds.includes(doc.id));
+      const remaining = sourceTargets
+        .filter((doc) => String(doc.indexing_status ?? "") === "error" || isDifyIndexingActive(String(doc.indexing_status ?? "")))
+        .map(failedDifyDocumentFromDatasetDocument);
+      const sourceTotal = Number(sourceJob.filesTotal ?? sourceIds.length);
+      const sourceCompleted = sourceTotal > 0 ? Math.max(0, sourceTotal - remaining.length) : sourceTargets.filter((doc) => String(doc.indexing_status ?? "") === "completed").length;
+      const sourceStatus = remaining.length ? "failed" : "completed";
+      const sourceErrorMessage = remaining.length ? `${remaining.length} documents still failed indexing` : null;
+      await (prisma as any).ragKbSyncJob.update({
+        where: { id: input.sourceSyncJobId },
+        data: {
+          status: sourceStatus,
+          filesProcessed: sourceCompleted,
+          chunksProcessed: sourceCompleted,
+          errorMessage: sourceErrorMessage,
+          completedAt: new Date()
+        }
+      }).catch(() => undefined);
+      await updateSyncJobStep(input.sourceSyncJobId, {
+        task: "Dify Indexing",
+        stepName: "dify_indexing",
+        status: sourceStatus,
+        completedAt: new Date().toISOString(),
+        message: remaining.length ? `${sourceCompleted} indexed, ${remaining.length} errors` : `${sourceCompleted} / ${sourceTotal || sourceCompleted} indexed`,
+        errorMessage: sourceErrorMessage ?? undefined,
+        failedDocuments: remaining
+      }).catch(() => undefined);
+    }
+  }
+}
+
+async function pollFailedDifyDocumentsAfterRetry(input: {
+  difyAppUrl: string;
+  datasetId: string;
+  datasetApiKey: string;
+  failedDocuments: FailedDifyIndexingDocument[];
+}): Promise<{ completed: number; failed: FailedDifyIndexingDocument[]; active: boolean }> {
+  const targetIds = input.failedDocuments.map((doc) => doc.difyDocId).filter(Boolean) as string[];
+  let latestDocuments: DifyDatasetDocument[] = [];
+
+  for (let attempt = 0; attempt < 48; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    latestDocuments = await listDifyDatasetDocuments(input.difyAppUrl, input.datasetId, input.datasetApiKey);
+    const targets = latestDocuments.filter((doc) => doc.id && targetIds.includes(doc.id));
+    const active = targets.some((doc) => isDifyIndexingActive(String(doc.indexing_status ?? "")));
+    const failed = targets.filter((doc) => String(doc.indexing_status ?? "") === "error");
+    if (!active && targets.length >= targetIds.length) {
+      return {
+        completed: targets.filter((doc) => String(doc.indexing_status ?? "") === "completed").length,
+        failed: mergeFailedDifyDocumentDetails(input.failedDocuments, failed),
+        active: false
+      };
+    }
+  }
+
+  const targets = latestDocuments.filter((doc) => doc.id && targetIds.includes(doc.id));
+  const failedOrActive = targets.filter((doc) =>
+    String(doc.indexing_status ?? "") === "error" ||
+    isDifyIndexingActive(String(doc.indexing_status ?? ""))
+  );
+  return {
+    completed: targets.filter((doc) => String(doc.indexing_status ?? "") === "completed").length,
+    failed: mergeFailedDifyDocumentDetails(input.failedDocuments, failedOrActive),
+    active: failedOrActive.some((doc) => isDifyIndexingActive(String(doc.indexing_status ?? "")))
+  };
+}
+
+async function autoRetryFailedDifyIndexingForJob(input: {
+  syncJobId: string;
+  knowledgeBaseId: string;
+  failedDocuments: FailedDifyIndexingDocument[];
+}): Promise<void> {
+  const retryDelaysMs = [60_000, 120_000];
+  const nonRetryableFailures = input.failedDocuments.filter((doc) =>
+    !doc.difyDocId ||
+    doc.retryable === false ||
+    !isRetryableDifyIndexingError(doc.error)
+  );
+  let remaining = input.failedDocuments.filter((doc) =>
+    doc.difyDocId &&
+    doc.retryable !== false &&
+    isRetryableDifyIndexingError(doc.error)
+  );
+
+  const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: input.knowledgeBaseId } });
+  if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
+  const difySecrets = await readVaultKv(`platform/global/dify/${input.knowledgeBaseId}`);
+  const difyDatasetId = nonEmptyString(kb.difyDatasetId) ?? nonEmptyString(difySecrets.dataset_id);
+  const datasetApiKey = nonEmptyString(difySecrets.dataset_api_key);
+  if (!difyDatasetId) throw new Error("DIFY_DATASET_NOT_CONFIGURED");
+  if (!datasetApiKey) throw new Error("DIFY_DATASET_API_KEY_NOT_CONFIGURED");
+
+  for (let round = 0; round < retryDelaysMs.length && remaining.length > 0; round++) {
+    const delayMs = retryDelaysMs[round];
+    await (prisma as any).ragKbSyncJob.update({
+      where: { id: input.syncJobId },
+      data: {
+        status: "running",
+        completedAt: null,
+        errorMessage: `${remaining.length} files failed indexing. Waiting before retry...`
+      }
+    });
+    await updateSyncJobStep(input.syncJobId, {
+      task: "Dify Indexing",
+      stepName: "dify_indexing",
+      status: "running",
+      message: `${remaining.length} files failed indexing. Waiting before retry...`,
+      failedDocuments: [...nonRetryableFailures, ...remaining]
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const latestJob = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId } });
+    if (String(latestJob?.status ?? "") === "cancelled") return;
+
+    const session = await ensureDifyConsoleSession(String(kb.sourceType ?? "github"));
+    await updateSyncJobStep(input.syncJobId, {
+      task: "Dify Indexing",
+      stepName: "dify_indexing",
+      status: "running",
+      message: `Retrying ${remaining.length} failed files`,
+      failedDocuments: [...nonRetryableFailures, ...remaining]
+    });
+    await difyConsoleFetch(session.baseUrl, `/datasets/${difyDatasetId}/retry`, {
+      method: "POST",
+      token: session.token,
+      body: { document_ids: remaining.map((doc) => doc.difyDocId).filter(Boolean) },
+      ok: [204]
+    });
+
+    const result = await pollFailedDifyDocumentsAfterRetry({
+      difyAppUrl: String(kb.difyAppUrl ?? ""),
+      datasetId: difyDatasetId,
+      datasetApiKey,
+      failedDocuments: remaining
+    });
+    remaining = result.failed;
+
+    const job = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId } });
+    const total = Number(job?.filesTotal ?? 0);
+    const processed = total > 0 ? Math.max(0, total - remaining.length) : result.completed;
+    await (prisma as any).ragKbSyncJob.update({
+      where: { id: input.syncJobId },
+      data: {
+        filesProcessed: processed,
+        chunksProcessed: processed,
+        errorMessage: nonRetryableFailures.length + remaining.length
+          ? `${nonRetryableFailures.length + remaining.length} files failed indexing${remaining.length && round + 1 < retryDelaysMs.length ? ". Waiting before retry..." : ""}`
+          : null
+      }
+    });
+  }
+
+  const finalJob = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId } });
+  const total = Number(finalJob?.filesTotal ?? 0);
+  const finalFailures = [...nonRetryableFailures, ...remaining];
+  const finalStatus = finalFailures.length ? "failed" : "completed";
+  const first = finalFailures[0];
+  const errorMessage = finalFailures.length
+    ? `${finalFailures.length} files failed indexing: ${first?.filePath ?? first?.difyDocId ?? "unknown document"}${first?.error ? `: ${first.error}` : ""}`
+    : null;
+  const processed = total > 0 ? Math.max(0, total - finalFailures.length) : Number(finalJob?.filesProcessed ?? 0);
+
+  await (prisma as any).ragKbSyncJob.update({
+    where: { id: input.syncJobId },
+    data: {
+      status: finalStatus,
+      filesProcessed: processed,
+      chunksProcessed: processed,
+      errorMessage,
+      completedAt: new Date()
+    }
+  });
+  await updateSyncJobStep(input.syncJobId, {
+    task: "Dify Indexing",
+    stepName: "dify_indexing",
+    status: finalStatus,
+    completedAt: new Date().toISOString(),
+    message: finalFailures.length ? `${processed} / ${total || processed + finalFailures.length} indexed` : `${total || processed} / ${total || processed} indexed`,
+    errorMessage: errorMessage ?? undefined,
+    failedDocuments: finalFailures
+  });
+}
+
+async function retryFailedDifyIndexing(
+  kbId: string,
+  triggeredById: string,
+  options: RetryFailedDifyIndexingOptions = {}
+): Promise<string> {
+  let kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId } });
+  if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
+
+  await ensureDifyKnowledgeBaseProvisioned(kbId);
+  kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId } });
+  if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
+
+  const difySecrets = await readVaultKv(`platform/global/dify/${kbId}`);
+  const difyDatasetId = nonEmptyString(kb.difyDatasetId) ?? nonEmptyString(difySecrets.dataset_id);
+  const datasetApiKey = nonEmptyString(difySecrets.dataset_api_key);
+  if (!difyDatasetId) throw new Error("DIFY_DATASET_NOT_CONFIGURED");
+  if (!datasetApiKey) throw new Error("DIFY_DATASET_API_KEY_NOT_CONFIGURED");
+
+  const sourceJob = options.syncJobId
+    ? await (prisma as any).ragKbSyncJob.findFirst({
+      where: { id: options.syncJobId, knowledgeBaseId: kbId }
+    })
+    : (await (prisma as any).ragKbSyncJob.findMany({
+      where: { knowledgeBaseId: kbId, status: "failed" },
+      orderBy: { createdAt: "desc" },
+      take: 20
+    })).find((job: Record<string, any>) =>
+      Array.isArray(job.stepsJson) &&
+      (job.stepsJson as Record<string, unknown>[]).some((step) => step.stepName === "dify_indexing")
+    ) ?? null;
+  const documents = await listDifyDatasetDocuments(String(kb.difyAppUrl ?? ""), difyDatasetId, datasetApiKey);
+  const failedFromJob = sourceJob
+    ? await inferFailedDifyDocumentsForSyncJob({
+      job: sourceJob,
+      difyAppUrl: String(kb.difyAppUrl ?? ""),
+      datasetId: difyDatasetId,
+      datasetApiKey
+    })
+    : [];
+  if (sourceJob && failedFromJob.length) {
+    await updateSyncJobStep(sourceJob.id, {
+      task: "Dify Indexing",
+      stepName: "dify_indexing",
+      failedDocuments: failedFromJob
+    }).catch(() => undefined);
+  }
+  const requestedIds = new Set((options.documentIds ?? []).filter(Boolean));
+  const documentIdsFromJob = new Set(failedFromJob.map((doc) => doc.difyDocId).filter(Boolean) as string[]);
+  const failedDocuments = documents
+    .filter((doc) =>
+      doc.id &&
+      !doc.archived &&
+      String(doc.indexing_status ?? "") === "error" &&
+      (requestedIds.size > 0 ? requestedIds.has(doc.id) : documentIdsFromJob.size > 0 ? documentIdsFromJob.has(doc.id) : true)
+    );
+  const failedDocumentDetails = mergeFailedDifyDocumentDetails(
+    failedDocuments.map(failedDifyDocumentFromDatasetDocument),
+    documents
+  );
+
+  const syncJob = await (prisma as any).ragKbSyncJob.create({
+    data: {
+      knowledgeBaseId: kbId,
+      trigger: "retry_failed_indexing",
+      triggeredById,
+      status: failedDocuments.length ? "running" : "completed",
+      startedAt: new Date(),
+      completedAt: failedDocuments.length ? null : new Date(),
+      filesTotal: failedDocuments.length,
+      filesProcessed: 0,
+      chunksTotal: failedDocuments.length,
+      chunksProcessed: 0,
+      errorMessage: failedDocuments.length ? null : "No failed Dify documents to retry",
+      stepsJson: [
+        {
+          task: "Retry Failed Indexing",
+          stepName: "retry_failed_indexing",
+          status: failedDocuments.length ? "running" : "completed",
+          startedAt: new Date().toISOString(),
+          message: failedDocuments.length
+            ? `Retrying ${failedDocuments.length} failed documents`
+            : "No failed Dify documents to retry",
+          failedDocuments: failedDocumentDetails
+        }
+      ]
+    }
+  });
+
+  if (!failedDocuments.length) return syncJob.id;
+
+  const session = await ensureDifyConsoleSession(String(kb.sourceType ?? "github"));
+  const documentIds = failedDocuments.map((doc) => String(doc.id));
+  try {
+    await difyConsoleFetch(session.baseUrl, `/datasets/${difyDatasetId}/retry`, {
+      method: "POST",
+      token: session.token,
+      body: { document_ids: documentIds },
+      ok: [204]
+    });
+  } catch (error) {
+    await (prisma as any).ragKbSyncJob.update({
+      where: { id: syncJob.id },
+      data: {
+        status: "failed",
+        completedAt: new Date(),
+        errorMessage: error instanceof Error ? error.message : String(error),
+        stepsJson: [
+          {
+            task: "Retry Failed Indexing",
+            stepName: "retry_failed_indexing",
+            status: "failed",
+            completedAt: new Date().toISOString(),
+            errorMessage: error instanceof Error ? error.message : String(error)
+          }
+        ]
+      }
+    });
+    return syncJob.id;
+  }
+
+  void pollDifyRetryIndexingJob({
+    syncJobId: syncJob.id,
+    sourceSyncJobId: sourceJob?.id,
+    difyAppUrl: String(kb.difyAppUrl ?? ""),
+    datasetId: difyDatasetId,
+    datasetApiKey,
+    documentIds
+  }).catch(async (error) => {
+    await (prisma as any).ragKbSyncJob.update({
+      where: { id: syncJob.id },
+      data: {
+        status: "failed",
+        completedAt: new Date(),
+        errorMessage: error instanceof Error ? error.message : String(error)
+      }
+    }).catch(() => undefined);
+  });
+
+  return syncJob.id;
 }
 
 /**
@@ -1005,9 +1742,20 @@ async function appendRagDiscussionMessage(threadId: string, ownerId: string, con
     );
     assistantReply = result.answer;
     newDifyConversationId = result.conversationId || newDifyConversationId;
+    // Log token usage for cost observability — Dify includes this in every chat response
+    if (result.tokenUsage) {
+      logInfo("dify_chat_token_usage", {
+        service: "workflow-service",
+        threadId,
+        knowledgeBaseId: thread.knowledgeBaseId,
+        userId: ownerId,
+        promptTokens: result.tokenUsage.promptTokens,
+        completionTokens: result.tokenUsage.completionTokens,
+        totalTokens: result.tokenUsage.totalTokens
+      });
+    }
   } else {
-    // ── Flowise path: legacy thread with no knowledge base ──
-    assistantReply = await sendToFlowise(trimmed, thread.flowiseSessionId);
+    throw new Error("LEGACY_FLOWISE_THREAD_EXPIRED");
   }
 
   const persisted = await prisma.$transaction(async (tx) => {
@@ -1061,7 +1809,10 @@ async function buildIntegrationResponse(
     (await readGlobalDifyProvisioningDefaults(String(kb.sourceType ?? "github"))).workflowId;
   const credentialConfigured = sourceCredentialConfigured(String(kb.sourceType ?? "github"), sourceSecrets);
   const chatReady = Boolean(nonEmptyString(difySecrets.app_api_key) ?? nonEmptyString(difySecrets.api_key));
-  const syncProvisioned = chatReady && Boolean(nonEmptyString(difySecrets.dataset_api_key)) && Boolean(nonEmptyString(kb.difyDatasetId));
+  // syncProvisioned: requires dataset API key but NOT difyDatasetId — after cleanup, difyDatasetId is cleared
+  // but triggerKbSync will auto-provision a fresh Dify dataset when sync is triggered.
+  // So we allow sync as long as the dataset API key exists (or chatReady = app key exists).
+  const syncProvisioned = Boolean(nonEmptyString(difySecrets.dataset_api_key)) || chatReady;
   const syncReady =
     credentialConfigured &&
     syncProvisioned &&
@@ -1100,24 +1851,60 @@ async function buildIntegrationResponse(
 }
 
 async function getVisibleKnowledgeBases(userId: string, isPrivileged: boolean) {
-  // Users see platform-wide KBs + their own KBs
-  // Admins/useradmins see all KBs
+  // Admins see ALL KBs across all users.
+  // Regular users see: KBs they own + KBs explicitly shared with them via RagKbShare.
   if (isPrivileged) {
-    return prisma.ragKnowledgeBase.findMany({
-      include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 } },
+    return (prisma as any).ragKnowledgeBase.findMany({
+      include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }, shares: true },
       orderBy: { createdAt: "desc" }
     });
   }
-  return prisma.ragKnowledgeBase.findMany({
+  // Find KBs shared with this user
+  const sharedKbIds = await (prisma as any).ragKbShare.findMany({
+    where: { sharedWithId: userId },
+    select: { knowledgeBaseId: true }
+  });
+  const sharedIds = sharedKbIds.map((s: { knowledgeBaseId: string }) => s.knowledgeBaseId);
+  return (prisma as any).ragKnowledgeBase.findMany({
     where: {
       OR: [
-        { scope: "global" },
-        { ownerId: userId }
+        { ownerId: userId },
+        { id: { in: sharedIds } }
       ]
     },
-    include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 } },
+    include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }, shares: { where: { sharedWithId: userId } } },
     orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }]
   });
+}
+
+/**
+ * Check if a user can access a specific KB (owner, shared-with, or admin).
+ */
+async function canAccessKnowledgeBase(kbId: string, userId: string, isPrivileged: boolean): Promise<boolean> {
+  if (isPrivileged) return true;
+  const kb = await (prisma as any).ragKnowledgeBase.findFirst({
+    where: {
+      id: kbId,
+      OR: [
+        { ownerId: userId },
+        { shares: { some: { sharedWithId: userId } } }
+      ]
+    },
+    select: { id: true }
+  });
+  return Boolean(kb);
+}
+
+/**
+ * Check if a user is the owner of a specific KB (or an admin).
+ */
+async function isKbOwner(kbId: string, userId: string, isPrivileged: boolean): Promise<boolean> {
+  if (isPrivileged) return true;
+  const kb = await (prisma as any).ragKnowledgeBase.findFirst({
+    where: { id: kbId, ownerId: userId },
+    select: { id: true }
+  });
+  return Boolean(kb);
 }
 
 /**
@@ -1444,8 +2231,8 @@ app.post("/rag/integrations", async (request, reply) => {
         sourcePath: body.sourcePath ?? null,
         syncSchedule: body.syncSchedule ?? null,
         difyAppUrl: defaults.difyAppUrl,
-        scope: "user",
         ownerId: userId,
+        ownerUsername: requesterUserName(headers),
         isDefault: false,
         createdById: userId
       },
@@ -1738,6 +2525,8 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
         });
       }
 
+      // Every KB is owned by the creating user — no global scope.
+      // ownerUsername is the Keycloak preferred_username (same as userId in this system).
       return (tx as any).ragKnowledgeBase.create({
         data: {
           name,
@@ -1748,8 +2537,8 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
           sourcePath: body.sourcePath ?? null,
           syncSchedule: body.syncSchedule ?? null,
           difyAppUrl: body.difyAppUrl ?? defaults.difyAppUrl,
-          scope: body.scope ?? "global",
-          ownerId: body.scope === "user" ? userId : null,
+          ownerId: userId,
+          ownerUsername: userId,
           isDefault: body.isDefault ?? false,
           createdById: userId
         }
@@ -1804,14 +2593,16 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
   }
 });
 
-// Get a single knowledge base
+// Get a single knowledge base — checks ownership or share access
 app.get("/rag/knowledge-bases/:id", async (request, reply) => {
   const id = (request.params as { id: string }).id;
   const userId = requesterUserId(request.headers as Record<string, unknown>);
   const privileged = isAdminOrUserAdmin(request.headers as Record<string, unknown>);
-  const kb = await (prisma as any).ragKnowledgeBase.findFirst({
-    where: privileged ? { id } : { id, OR: [{ scope: "global" }, { ownerId: userId }] },
-    include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 5 } }
+  const hasAccess = await canAccessKnowledgeBase(id, userId, privileged);
+  if (!hasAccess) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+  const kb = await (prisma as any).ragKnowledgeBase.findUnique({
+    where: { id },
+    include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 5 }, shares: true }
   });
   if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
   return kb;
@@ -1881,6 +2672,27 @@ app.post("/rag/knowledge-bases/:id/sync", async (request, reply) => {
   }
 });
 
+// Retry Dify documents that uploaded successfully but failed during indexing.
+app.post("/rag/knowledge-bases/:id/retry-failed-indexing", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const body = (request.body ?? {}) as { syncJobId?: string; documentIds?: unknown };
+  const documentIds = Array.isArray(body.documentIds)
+    ? body.documentIds.map((value) => String(value ?? "").trim()).filter(Boolean)
+    : undefined;
+  try {
+    const syncJobId = await retryFailedDifyIndexing(id, userId, {
+      syncJobId: nonEmptyString(body.syncJobId),
+      documentIds
+    });
+    return reply.code(202).send({ accepted: true, syncJobId, knowledgeBaseId: id });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg === "KNOWLEDGE_BASE_NOT_FOUND") return reply.code(404).send({ error: msg });
+    return reply.code(500).send({ error: "DIFY_RETRY_FAILED_INDEXING_TRIGGER_FAILED", details: msg });
+  }
+});
+
 // Get latest sync status for a knowledge base (polled by UI for progress bar)
 app.get("/rag/knowledge-bases/:id/sync-status", async (request, reply) => {
   const id = (request.params as { id: string }).id;
@@ -1944,6 +2756,112 @@ app.post("/rag/knowledge-bases/:id/sync-cancel", async (request, reply) => {
   return { cancelled: true, syncJobId: latestJob.id, knowledgeBaseId: id };
 });
 
+// Cleanup: remove all Dify documents and vector index for a KB without deleting the KB record.
+// The integration stays — users can re-sync to rebuild the index afterwards.
+// Only deletion operations — no file fetch, no upload, no re-indexing.
+app.post("/rag/knowledge-bases/:id/cleanup", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  try {
+    const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id } });
+    if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+
+    const headers = request.headers as Record<string, unknown>;
+    const userId = requesterUserId(headers);
+
+    // Cancel any running sync job for this KB so it doesn't conflict with cleanup
+    const runningJob = await (prisma as any).ragKbSyncJob.findFirst({
+      where: { knowledgeBaseId: id, status: { in: ["pending", "running"] } },
+      orderBy: { createdAt: "desc" }
+    });
+    if (runningJob) {
+      await (prisma as any).ragKbSyncJob.update({
+        where: { id: runningJob.id },
+        data: { status: "cancelled", errorMessage: "Cancelled by cleanup operation", completedAt: new Date() }
+      });
+    }
+
+    // Delete all Dify resources (dataset / app) for this KB — leaves KB record intact
+    await deleteDifyKnowledgeBaseResources(kb);
+
+    // Clear Dify dataset ID from the KB record so re-sync will re-provision fresh resources.
+    // Note: chatReady is computed from Vault secrets, not stored in the DB.
+    await (prisma as any).ragKnowledgeBase.update({
+      where: { id },
+      data: { difyDatasetId: null }
+    });
+
+    // Also clear the old dataset_id and app_id from Vault so provisioning starts fresh.
+    // If we don't do this, ensureDifyKnowledgeBaseProvisioned will find the stale IDs
+    // and try to configure the deleted Dify resources, causing 404 errors on next sync.
+    const existingDifySecrets = await readVaultKv(`platform/global/dify/${id}`);
+    const cleanedSecrets = { ...existingDifySecrets };
+    delete cleanedSecrets.dataset_id;
+    delete cleanedSecrets.app_id;
+    // Keep API keys, workflow ID, and other config — only remove the resource IDs
+    await writeVaultKv(`platform/global/dify/${id}`, cleanedSecrets);
+
+    // Save a real completed cleanup job to the DB so it appears as "Latest" in the Sync Monitor.
+    // This makes the cleanup job visible in the history dropdown immediately after running cleanup.
+    const nowIso = new Date();
+    await (prisma as any).ragKbSyncJob.create({
+      data: {
+        knowledgeBaseId: id,
+        trigger: "cleanup",
+        triggeredById: userId,
+        status: "completed",
+        startedAt: nowIso,
+        completedAt: nowIso,
+        filesProcessed: 0,
+        filesTotal: 0,
+        stepsJson: [
+          {
+            task: "Cleanup: Remove documents from Dify knowledge base",
+            stepName: "cleanup_dify_documents",
+            status: "completed",
+            startedAt: nowIso.toISOString(),
+            completedAt: nowIso.toISOString(),
+            message: "All indexed documents deleted from Dify"
+          },
+          {
+            task: "Cleanup: Clear vector embeddings",
+            stepName: "cleanup_vector_embeddings",
+            status: "completed",
+            startedAt: nowIso.toISOString(),
+            completedAt: nowIso.toISOString(),
+            message: "All vector embeddings removed"
+          },
+          {
+            task: "Cleanup: Reset knowledge base state",
+            stepName: "cleanup_reset_state",
+            status: "completed",
+            startedAt: nowIso.toISOString(),
+            completedAt: nowIso.toISOString(),
+            message: "Sync status and counters reset"
+          }
+        ]
+      }
+    });
+
+    // Prune history to keep only the last 10 jobs per KB so the monitor stays clean
+    const allJobs = await (prisma as any).ragKbSyncJob.findMany({
+      where: { knowledgeBaseId: id },
+      orderBy: { createdAt: "desc" },
+      select: { id: true }
+    });
+    if (allJobs.length > 10) {
+      const idsToDelete = allJobs.slice(10).map((j: { id: string }) => j.id);
+      await (prisma as any).ragKbSyncJob.deleteMany({ where: { id: { in: idsToDelete } } });
+    }
+
+    logInfo("KB cleanup completed", { service: "workflow-service", kbId: id, userId });
+    return reply.code(200).send({ ok: true, message: "All indexed documents and Dify KB data removed. Re-sync to rebuild the index." });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logInfo("KB cleanup failed", { service: "workflow-service", kbId: id, error: message });
+    return reply.code(500).send({ error: "CLEANUP_FAILED", details: message });
+  }
+});
+
 // n8n progress callback — called by n8n sync workflows to report progress
 // This is an internal endpoint; n8n calls it during sync execution
 app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
@@ -1964,6 +2882,7 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
       completedAt?: string;
       message?: string;
       errorMessage?: string;
+      failedDocuments?: FailedDifyIndexingDocument[];
     };
     logMessage?: string;
     logSeverity?: string;
@@ -1980,12 +2899,88 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
     if (String(existingJob.status ?? "") === "completed" && body.status !== "completed") {
       return { updated: false, ignored: "SYNC_ALREADY_COMPLETED" };
     }
+    let failedDocuments = normalizeFailedDifyDocuments(body.step?.failedDocuments);
+    if (
+      body.status === "failed" &&
+      body.step?.stepName === "dify_indexing" &&
+      failedDocuments.length === 0
+    ) {
+      const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: existingJob.knowledgeBaseId } });
+      const difySecrets = await readVaultKv(`platform/global/dify/${existingJob.knowledgeBaseId}`);
+      const difyDatasetId = nonEmptyString(kb?.difyDatasetId) ?? nonEmptyString(difySecrets.dataset_id);
+      const datasetApiKey = nonEmptyString(difySecrets.dataset_api_key);
+      if (kb && difyDatasetId && datasetApiKey) {
+        failedDocuments = await inferFailedDifyDocumentsForSyncJob({
+          job: { ...existingJob, completedAt: new Date(), stepsJson: existingJob.stepsJson },
+          difyAppUrl: String(kb.difyAppUrl ?? ""),
+          datasetId: difyDatasetId,
+          datasetApiKey
+        });
+      }
+    }
+    const autoRetryableDocuments = failedDocuments.filter((doc) =>
+      doc.difyDocId &&
+      doc.retryable !== false &&
+      isRetryableDifyIndexingError(doc.error)
+    );
+    if (
+      body.status === "failed" &&
+      body.step?.stepName === "dify_indexing" &&
+      autoRetryableDocuments.length > 0
+    ) {
+      await (prisma as any).ragKbSyncJob.update({
+        where: { id: body.syncJobId },
+        data: {
+          status: "running",
+          filesProcessed: body.filesProcessed ?? undefined,
+          filesTotal: body.filesTotal ?? undefined,
+          chunksProcessed: body.chunksProcessed ?? undefined,
+          errorMessage: `${autoRetryableDocuments.length} files failed indexing. Waiting before retry...`,
+          completedAt: null
+        }
+      });
+      await updateSyncJobStep(body.syncJobId, {
+        ...body.step,
+        status: "running",
+        message: `${autoRetryableDocuments.length} files failed indexing. Waiting before retry...`,
+        failedDocuments
+      });
+      void autoRetryFailedDifyIndexingForJob({
+        syncJobId: body.syncJobId,
+        knowledgeBaseId: existingJob.knowledgeBaseId,
+        failedDocuments
+      }).catch(async (error) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        await (prisma as any).ragKbSyncJob.update({
+          where: { id: body.syncJobId },
+          data: {
+            status: "failed",
+            completedAt: new Date(),
+            errorMessage: `Dify retry failed: ${msg}`
+          }
+        }).catch(() => undefined);
+        await updateSyncJobStep(body.syncJobId!, {
+          task: "Dify Indexing",
+          stepName: "dify_indexing",
+          status: "failed",
+          completedAt: new Date().toISOString(),
+          errorMessage: `Dify retry failed: ${msg}`,
+          failedDocuments
+        }).catch(() => undefined);
+      });
+      return { updated: true, autoRetry: true };
+    }
+
+    const adjustedFilesProcessed =
+      body.status === "failed" && body.step?.stepName === "dify_indexing" && failedDocuments.length > 0
+        ? Math.max(0, Number(body.filesTotal ?? existingJob.filesTotal ?? 0) - failedDocuments.length)
+        : body.filesProcessed;
     const isCompleted = body.status === "completed" || body.status === "failed";
     await (prisma as any).ragKbSyncJob.update({
       where: { id: body.syncJobId },
       data: {
         status: body.status ?? "running",
-        filesProcessed: body.filesProcessed ?? undefined,
+        filesProcessed: adjustedFilesProcessed ?? undefined,
         filesTotal: body.filesTotal ?? undefined,
         chunksProcessed: body.chunksProcessed ?? undefined,
         errorMessage: body.errorMessage ?? null,
@@ -1995,12 +2990,15 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
 
     // Upsert step into stepsJson
     if (body.step) {
+      const stepToStore = body.step.stepName === "dify_indexing" && failedDocuments.length
+        ? { ...body.step, failedDocuments }
+        : { ...body.step };
       const existing = Array.isArray(existingJob.stepsJson)
         ? (existingJob.stepsJson as Record<string, unknown>[])
         : [];
       const idx = existing.findIndex((s) => s["stepName"] === body.step!.stepName);
-      if (idx >= 0) existing[idx] = { ...existing[idx], ...body.step };
-      else existing.push({ ...body.step });
+      if (idx >= 0) existing[idx] = { ...existing[idx], ...stepToStore };
+      else existing.push(stepToStore);
       await (prisma as any).ragKbSyncJob.update({
         where: { id: body.syncJobId },
         data: { stepsJson: existing }
@@ -2068,6 +3066,92 @@ app.delete("/rag/channels/:id", async (request, reply) => {
   });
   if (deleted.count === 0) return reply.code(404).send({ error: "CHANNEL_NOT_FOUND" });
   return { deleted: true };
+});
+
+// ─── KB Share Management Endpoints ───────────────────────────────────────────
+// Owner or platform admin can share a KB with specific users by their username.
+// Shared users get chat access only — they cannot edit, delete, or sync the KB.
+
+// POST /rag/knowledge-bases/:id/shares — share KB with a user
+app.post("/rag/knowledge-bases/:id/shares", async (request, reply) => {
+  const kbId = (request.params as { id: string }).id;
+  const headers = request.headers as Record<string, unknown>;
+  const requesterId = requesterUserId(headers);
+  const privileged = isAdminOrUserAdmin(headers);
+
+  // Verify requester is owner or admin
+  const ownerCheck = await isKbOwner(kbId, requesterId, privileged);
+  if (!ownerCheck) return reply.code(403).send({ error: "FORBIDDEN_KB_OWNER_OR_ADMIN_ONLY" });
+
+  const body = (request.body ?? {}) as { sharedWithUserId?: string };
+  const sharedWithId = String(body.sharedWithUserId ?? "").trim();
+  if (!sharedWithId) return reply.code(400).send({ error: "SHARED_WITH_USER_ID_REQUIRED" });
+
+  // Prevent sharing with self
+  if (sharedWithId === requesterId && !privileged) {
+    return reply.code(400).send({ error: "CANNOT_SHARE_WITH_SELF" });
+  }
+
+  // Check KB exists
+  const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId }, select: { id: true } });
+  if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+
+  try {
+    const share = await (prisma as any).ragKbShare.create({
+      data: {
+        id: randomUUID(),
+        knowledgeBaseId: kbId,
+        sharedWithId,
+        sharedById: requesterId,
+        permission: "chat"
+      }
+    });
+    logInfo("KB shared", { service: "workflow-service", kbId, sharedWithId, sharedById: requesterId });
+    return reply.code(201).send(share);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    // Unique constraint violation = already shared
+    if (msg.includes("Unique constraint") || msg.includes("unique")) {
+      return reply.code(409).send({ error: "ALREADY_SHARED_WITH_USER" });
+    }
+    return reply.code(500).send({ error: "SHARE_CREATE_FAILED", details: msg });
+  }
+});
+
+// GET /rag/knowledge-bases/:id/shares — list who has access to this KB
+app.get("/rag/knowledge-bases/:id/shares", async (request, reply) => {
+  const kbId = (request.params as { id: string }).id;
+  const headers = request.headers as Record<string, unknown>;
+  const requesterId = requesterUserId(headers);
+  const privileged = isAdminOrUserAdmin(headers);
+
+  const ownerCheck = await isKbOwner(kbId, requesterId, privileged);
+  if (!ownerCheck) return reply.code(403).send({ error: "FORBIDDEN_KB_OWNER_OR_ADMIN_ONLY" });
+
+  const shares = await (prisma as any).ragKbShare.findMany({
+    where: { knowledgeBaseId: kbId },
+    orderBy: { createdAt: "asc" }
+  });
+  return { shares };
+});
+
+// DELETE /rag/knowledge-bases/:id/shares/:shareId — revoke a share
+// No request body needed — all info is in URL params and auth headers.
+app.delete("/rag/knowledge-bases/:id/shares/:shareId", { config: { rawBody: false } }, async (request, reply) => {
+  const { id: kbId, shareId } = request.params as { id: string; shareId: string };
+  const headers = request.headers as Record<string, unknown>;
+  const requesterId = requesterUserId(headers);
+  const privileged = isAdminOrUserAdmin(headers);
+
+  const ownerCheck = await isKbOwner(kbId, requesterId, privileged);
+  if (!ownerCheck) return reply.code(403).send({ error: "FORBIDDEN_KB_OWNER_OR_ADMIN_ONLY" });
+
+  const deleted = await (prisma as any).ragKbShare.deleteMany({
+    where: { id: shareId, knowledgeBaseId: kbId }
+  });
+  if (deleted.count === 0) return reply.code(404).send({ error: "SHARE_NOT_FOUND" });
+  logInfo("KB share revoked", { service: "workflow-service", kbId, shareId, revokedBy: requesterId });
+  return reply.code(204).send();
 });
 
 // ─── RAG Discussion Routes ─────────────────────────────────────────────────────
@@ -2175,6 +3259,19 @@ app.get("/admin/secrets/catalog", async (request, reply) => {
   try {
     const [globalPaths, userPaths] = await Promise.all([listVaultLeafPaths("platform/global"), listVaultLeafPaths("platform/users")]);
     const paths = [...new Set([...globalPaths, ...userPaths])].sort().slice(0, limit);
+    const sourcePathMatches = paths
+      .map((path) => path.match(/^platform\/users\/([^/]+)\/sources\/([^/]+)$/))
+      .filter((match): match is RegExpMatchArray => Boolean(match));
+    const sourceKbIds = [...new Set(sourcePathMatches.map((match) => match[2]))];
+    const sourceKbs = sourceKbIds.length > 0
+      ? await (prisma as any).ragKnowledgeBase.findMany({
+          where: { id: { in: sourceKbIds } },
+          select: { id: true, name: true, sourceType: true }
+        })
+      : [];
+    const sourceKbById = new Map<string, { name?: string | null; sourceType?: string | null }>(
+      sourceKbs.map((kb: { id: string; name?: string | null; sourceType?: string | null }) => [kb.id, kb])
+    );
     const items: Array<{
       path: string;
       key: string;
@@ -2186,24 +3283,29 @@ app.get("/admin/secrets/catalog", async (request, reply) => {
       resourceType: string;
       resourceId: string | null;
       resourceName: string | null;
+      valueMasked: boolean;
     }> = [];
 
     for (const path of paths) {
       const [data, metadata] = await Promise.all([readVaultKv(path), readVaultKvMetadata(path)]);
       const userMatch = path.match(/^platform\/users\/([^/]+)\//);
+      const sourceMatch = path.match(/^platform\/users\/([^/]+)\/sources\/([^/]+)$/);
       const isGlobal = path.startsWith("platform/global/");
+      const sourceKb = sourceMatch ? sourceKbById.get(sourceMatch[2]) : undefined;
       for (const key of Object.keys(data).sort()) {
+        const valueMasked = isSensitiveSecretKey(key);
         items.push({
           path,
           key,
-          value: "***",
+          value: valueMasked ? "***" : String(data[key] ?? ""),
           version: metadata.version,
           updatedAt: metadata.updatedAt,
-          purpose: isGlobal ? "Global platform secret" : "User platform secret",
+          purpose: isGlobal ? "Global platform secret" : sourceMatch ? "Integration credential" : "User platform secret",
           ownerId: userMatch?.[1] ?? null,
-          resourceType: isGlobal ? "global" : "user",
-          resourceId: null,
-          resourceName: null
+          resourceType: sourceMatch ? "integration" : isGlobal ? "global" : "user",
+          resourceId: sourceMatch?.[2] ?? null,
+          resourceName: sourceKb?.name ?? sourceKb?.sourceType ?? null,
+          valueMasked
         });
       }
     }

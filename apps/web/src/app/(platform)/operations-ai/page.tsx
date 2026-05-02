@@ -1,6 +1,6 @@
-import type { ReactElement } from "react";
-import { OperationsAiChat } from "../../operations-ai-chat";
+import { redirect } from "next/navigation";
 
-export default function OperationsAiPage(): ReactElement {
-  return <OperationsAiChat />;
+// Redirect old URL to new branded URL
+export default function OldOperationsAiRedirect(): never {
+  redirect("/rag-assistant");
 }

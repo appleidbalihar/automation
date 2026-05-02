@@ -1,15 +1,15 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ReactElement } from "react";
 import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
 import { resolveApiBase } from "./api-base";
-
 
 type SecretItem = {
   path: string;
   key: string;
   value: string;
+  valueMasked?: boolean;
   version: number;
   updatedAt: string | null;
   purpose?: string;
@@ -23,6 +23,16 @@ type SecretCatalog = {
   totalPaths: number;
   totalSecrets: number;
   items: SecretItem[];
+};
+
+type SecretModalMode = "view" | "edit" | "create";
+
+type SecretModalState = {
+  mode: SecretModalMode;
+  item?: SecretItem;
+  path: string;
+  keyName: string;
+  value: string;
 };
 
 function formatTs(value?: string | null): string {
@@ -48,17 +58,19 @@ function describeUsage(item: SecretItem): string {
   return item.resourceId ? `${item.resourceType ?? "resource"} #${item.resourceId}` : "General platform secret";
 }
 
+function modalTitle(mode: SecretModalMode): string {
+  if (mode === "create") return "New Secret";
+  if (mode === "edit") return "Edit Secret";
+  return "View Secret";
+}
+
 export function AdminSecretsPanel(): ReactElement {
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [items, setItems] = useState<SecretItem[]>([]);
   const [error, setError] = useState<string>("");
   const [status, setStatus] = useState<string>("");
-
-  const [path, setPath] = useState<string>("");
-  const [keyName, setKeyName] = useState<string>("");
-  const [value, setValue] = useState<string>("");
-
+  const [modal, setModal] = useState<SecretModalState | null>(null);
 
   async function requestJson<T>(pathValue: string, options?: RequestInit): Promise<T> {
     const auth = authHeaderFromStoredToken();
@@ -101,9 +113,14 @@ export function AdminSecretsPanel(): ReactElement {
     loadPage().catch(() => undefined);
   }, []);
 
-  async function upsertSecret(): Promise<void> {
-    if (!path.trim() || !keyName.trim() || !value) {
-      setError("Path, key, and value are required.");
+  async function saveSecret(): Promise<void> {
+    if (!modal) return;
+    if (!modal.path.trim() || !modal.keyName.trim()) {
+      setError("Path and key are required.");
+      return;
+    }
+    if (!modal.value) {
+      setError("Value is required. Masked secrets must be replaced with a new value.");
       return;
     }
     setStatus("Saving secret...");
@@ -112,12 +129,12 @@ export function AdminSecretsPanel(): ReactElement {
       await requestJson("/admin/secrets/by-path", {
         method: "POST",
         body: JSON.stringify({
-          path: path.trim(),
-          key: keyName.trim(),
-          value
+          path: modal.path.trim(),
+          key: modal.keyName.trim(),
+          value: modal.value
         })
       });
-      setValue("");
+      setModal(null);
       setStatus("Secret saved.");
       await loadCatalog();
     } catch (saveError) {
@@ -126,28 +143,111 @@ export function AdminSecretsPanel(): ReactElement {
     }
   }
 
-  async function deleteSecret(): Promise<void> {
-    if (!path.trim()) {
-      setError("Path is required.");
-      return;
-    }
-    setStatus("Deleting...");
+  async function deleteSecretKey(pathValue: string, key: string): Promise<void> {
+    const ok = window.confirm(`Delete ${pathValue}#${key} from Vault?`);
+    if (!ok) return;
+    setStatus("Deleting secret key...");
     setError("");
     try {
       await requestJson("/admin/secrets/by-path", {
         method: "DELETE",
-        body: JSON.stringify({
-          path: path.trim(),
-          key: keyName.trim() || undefined
-        })
+        body: JSON.stringify({ path: pathValue, key })
       });
-      setStatus("Deleted.");
+      setModal(null);
+      setStatus("Secret key deleted.");
       await loadCatalog();
     } catch (deleteError) {
       setStatus("");
-      setError(deleteError instanceof Error ? deleteError.message : "Failed to delete secret");
+      setError(deleteError instanceof Error ? deleteError.message : "Failed to delete secret key");
     }
   }
+
+  async function deleteSecretPath(pathValue: string): Promise<void> {
+    const ok = window.confirm(`Delete the entire Vault path ${pathValue}?`);
+    if (!ok) return;
+    setStatus("Deleting secret path...");
+    setError("");
+    try {
+      await requestJson("/admin/secrets/by-path", {
+        method: "DELETE",
+        body: JSON.stringify({ path: pathValue })
+      });
+      setModal(null);
+      setStatus("Secret path deleted.");
+      await loadCatalog();
+    } catch (deleteError) {
+      setStatus("");
+      setError(deleteError instanceof Error ? deleteError.message : "Failed to delete secret path");
+    }
+  }
+
+  function openCreateModal(): void {
+    setModal({
+      mode: "create",
+      path: "",
+      keyName: "",
+      value: ""
+    });
+    setError("");
+  }
+
+  function openViewModal(item: SecretItem): void {
+    setModal({
+      mode: "view",
+      item,
+      path: item.path,
+      keyName: item.key,
+      value: item.valueMasked ? "" : item.value
+    });
+    setError("");
+  }
+
+  function openEditModal(item: SecretItem): void {
+    setModal({
+      mode: "edit",
+      item,
+      path: item.path,
+      keyName: item.key,
+      value: item.valueMasked ? "" : item.value
+    });
+    setError("");
+  }
+
+  const integrationRows = useMemo(() => {
+    type IntegrationRow = {
+      userId: string;
+      kbId: string;
+      kbName: string | null;
+      provider: string;
+      hasClientId: boolean;
+      hasClientSecret: boolean;
+      authMethod: string | null;
+    };
+    const rowMap = new Map<string, IntegrationRow>();
+    for (const item of items) {
+      if (item.resourceType !== "integration" || !item.ownerId || !item.resourceId) continue;
+      const rowKey = `${item.ownerId}:${item.resourceId}`;
+      if (!rowMap.has(rowKey)) {
+        rowMap.set(rowKey, {
+          userId: item.ownerId,
+          kbId: item.resourceId,
+          kbName: item.resourceName ?? null,
+          provider: "",
+          hasClientId: false,
+          hasClientSecret: false,
+          authMethod: null
+        });
+      }
+      const row = rowMap.get(rowKey)!;
+      if (item.key === "oauth_client_id") row.hasClientId = true;
+      if (item.key === "oauth_client_secret") row.hasClientSecret = true;
+      if (item.key === "auth_method") row.authMethod = item.valueMasked ? null : item.value;
+      if (item.key === "github_token") row.provider = "github";
+      if (item.key === "gitlab_token") row.provider = "gitlab";
+      if (item.key === "gdrive_token" || item.key === "googledrive_access_token") row.provider = "googledrive";
+    }
+    return Array.from(rowMap.values());
+  }, [items]);
 
   if (!isAdmin && !loading) {
     return (
@@ -170,90 +270,51 @@ export function AdminSecretsPanel(): ReactElement {
       <section className="card">
         <h3 style={{ marginTop: 0 }}>Integration OAuth Credentials</h3>
         <p style={{ marginTop: 0, fontSize: "0.88rem", color: "#475569" }}>
-          Per-integration OAuth App credentials (Client ID / Client Secret). Each knowledge source stores its own credentials in Vault.
-          To update credentials, open the integration in <a href="/integrations">Operations AI Setup</a> and edit the OAuth tab.
+          Per-integration OAuth App credentials are stored in Vault. To update OAuth details, open the integration in{" "}
+          <a href="/integrations">Operations AI Setup</a> and edit the OAuth tab.
         </p>
-        {(() => {
-          // Group by (ownerId, resourceId) — find unique integrations that have oauth_client_id or oauth_client_secret
-          type IntegrationRow = { userId: string; kbId: string; kbName: string | null; provider: string; hasClientId: boolean; hasClientSecret: boolean; authMethod: string | null };
-          const rowMap = new Map<string, IntegrationRow>();
-          for (const item of items) {
-            if (item.resourceType !== "integration" || !item.ownerId || !item.resourceId) continue;
-            const rowKey = `${item.ownerId}:${item.resourceId}`;
-            if (!rowMap.has(rowKey)) {
-              rowMap.set(rowKey, { userId: item.ownerId, kbId: item.resourceId, kbName: item.resourceName ?? null, provider: "", hasClientId: false, hasClientSecret: false, authMethod: null });
-            }
-            const row = rowMap.get(rowKey)!;
-            if (item.key === "oauth_client_id") row.hasClientId = true;
-            if (item.key === "oauth_client_secret") row.hasClientSecret = true;
-            if (item.key === "auth_method") row.authMethod = item.value;
-            // Infer provider from github_token / auth_method path etc.
-            if (item.key === "github_token") row.provider = "github";
-            if (item.key === "gitlab_token") row.provider = "gitlab";
-            if (item.key === "googledrive_access_token") row.provider = "googledrive";
-          }
-          const rows = Array.from(rowMap.values());
-          if (rows.length === 0) {
-            return <p style={{ fontSize: "0.88rem", color: "#64748b" }}>No integrations with stored credentials found.</p>;
-          }
-          return (
-            <div className="ops-table-wrap">
-              <table className="ops-table">
-                <thead>
-                  <tr>
-                    <th>User</th>
-                    <th>Integration</th>
-                    <th>Provider</th>
-                    <th>OAuth App</th>
-                    <th>Auth Method</th>
+        {integrationRows.length === 0 ? (
+          <p style={{ fontSize: "0.88rem", color: "#64748b" }}>No integrations with stored credentials found.</p>
+        ) : (
+          <div className="ops-table-wrap">
+            <table className="ops-table">
+              <thead>
+                <tr>
+                  <th>User</th>
+                  <th>Integration</th>
+                  <th>Provider</th>
+                  <th>OAuth App</th>
+                  <th>Auth Method</th>
+                </tr>
+              </thead>
+              <tbody>
+                {integrationRows.map((row) => (
+                  <tr key={`${row.userId}:${row.kbId}`}>
+                    <td>{row.userId}</td>
+                    <td>{row.kbName ?? row.kbId}</td>
+                    <td>{row.provider || "-"}</td>
+                    <td>{row.hasClientId ? "Configured" : "Not set"}</td>
+                    <td>{row.authMethod === "oauth" ? "OAuth" : row.authMethod === "pat" ? "PAT" : "-"}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {rows.map((row) => (
-                    <tr key={`${row.userId}:${row.kbId}`}>
-                      <td>{row.userId}</td>
-                      <td>{row.kbName ?? row.kbId}</td>
-                      <td>{row.provider || "—"}</td>
-                      <td>{row.hasClientId ? "✓ Configured" : "✗ Not set"}</td>
-                      <td>{row.authMethod === "oauth" ? "🔗 OAuth" : row.authMethod === "pat" ? "🔑 PAT" : "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-        })()}
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       <section className="card">
-        <h3 style={{ marginTop: 0 }}>Edit Secret</h3>
-        <div className="ops-grid">
-          <label>
-            Path
-            <input value={path} onChange={(event) => setPath(event.target.value)} placeholder="platform/users/<user>/<group>" />
-          </label>
-          <label>
-            Key
-            <input value={keyName} onChange={(event) => setKeyName(event.target.value)} placeholder="apiKey" />
-          </label>
-          <label>
-            Value
-            <input value={value} onChange={(event) => setValue(event.target.value)} type="password" placeholder="new value" />
-          </label>
-          <button type="button" onClick={() => upsertSecret().catch(() => undefined)}>
-            Create/Update
-          </button>
-          <button type="button" onClick={() => deleteSecret().catch(() => undefined)}>
-            Delete Key
-          </button>
-          <button type="button" onClick={() => loadCatalog().catch(() => undefined)}>
-            Refresh
-          </button>
+        <div className="ops-section-heading">
+          <h3 style={{ margin: 0 }}>All Secrets</h3>
+          <div className="ops-row-actions">
+            <button type="button" onClick={openCreateModal}>
+              New Secret
+            </button>
+            <button type="button" onClick={() => loadCatalog().catch(() => undefined)}>
+              Refresh
+            </button>
+          </div>
         </div>
-      </section>
-
-      <section className="card">
-        <h3 style={{ marginTop: 0 }}>All Secrets</h3>
         <div className="ops-table-wrap">
           <table className="ops-table">
             <thead>
@@ -265,12 +326,13 @@ export function AdminSecretsPanel(): ReactElement {
                 <th>Value</th>
                 <th>Version</th>
                 <th>Updated</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               {items.length === 0 ? (
                 <tr>
-                  <td colSpan={7}>{loading ? "Loading..." : "No secrets found."}</td>
+                  <td colSpan={8}>{loading ? "Loading..." : "No secrets found."}</td>
                 </tr>
               ) : (
                 items.map((item) => (
@@ -279,9 +341,25 @@ export function AdminSecretsPanel(): ReactElement {
                     <td>{item.key}</td>
                     <td>{item.purpose ?? "Platform Secret"}</td>
                     <td>{describeUsage(item)}</td>
-                    <td>{item.value}</td>
+                    <td>{item.valueMasked ? "***" : item.value}</td>
                     <td>{item.version}</td>
                     <td>{formatTs(item.updatedAt)}</td>
+                    <td>
+                      <div className="ops-row-actions">
+                        <button type="button" onClick={() => openViewModal(item)}>
+                          View
+                        </button>
+                        <button type="button" onClick={() => openEditModal(item)}>
+                          Edit
+                        </button>
+                        <button type="button" onClick={() => deleteSecretKey(item.path, item.key).catch(() => undefined)}>
+                          Delete Key
+                        </button>
+                        <button type="button" onClick={() => deleteSecretPath(item.path).catch(() => undefined)}>
+                          Delete Path
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))
               )}
@@ -289,6 +367,93 @@ export function AdminSecretsPanel(): ReactElement {
           </table>
         </div>
       </section>
+
+      {modal ? (
+        <div className="ops-modal-overlay" role="presentation" onClick={() => setModal(null)}>
+          <div className="ops-modal-panel ops-modal-narrow" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+            <div className="ops-modal-panel-header">
+              <h2>{modalTitle(modal.mode)}</h2>
+              <button type="button" className="ops-modal-close" onClick={() => setModal(null)} aria-label="Close">
+                x
+              </button>
+            </div>
+            <p className="ops-modal-lead">
+              {modal.item?.valueMasked
+                ? "This value is sensitive and remains masked. Enter a replacement value to update it."
+                : "Non-sensitive values such as URLs, workflow IDs, and model names can be viewed and edited here."}
+            </p>
+            <div className="integrations-form-grid ops-modal-form">
+              <label className="integrations-form-span-2">
+                Path
+                <input
+                  value={modal.path}
+                  disabled={modal.mode === "view"}
+                  onChange={(event) => setModal((current) => current ? { ...current, path: event.target.value } : current)}
+                  placeholder="platform/global/dify/config"
+                />
+              </label>
+              <label>
+                Key
+                <input
+                  value={modal.keyName}
+                  disabled={modal.mode === "view"}
+                  onChange={(event) => setModal((current) => current ? { ...current, keyName: event.target.value } : current)}
+                  placeholder="model_api_base"
+                />
+              </label>
+              <label>
+                Version
+                <input value={modal.item?.version ?? "-"} disabled />
+              </label>
+              <label className="integrations-form-span-2">
+                Value
+                <input
+                  value={modal.item?.valueMasked && modal.mode === "view" ? "***" : modal.value}
+                  disabled={modal.mode === "view"}
+                  type={modal.item?.valueMasked ? "password" : "text"}
+                  onChange={(event) => setModal((current) => current ? { ...current, value: event.target.value } : current)}
+                  placeholder={modal.item?.valueMasked ? "Enter replacement value" : "value"}
+                />
+              </label>
+              <label>
+                Updated
+                <input value={formatTs(modal.item?.updatedAt)} disabled />
+              </label>
+              <label>
+                Purpose
+                <input value={modal.item?.purpose ?? (modal.mode === "create" ? "New platform secret" : "Platform Secret")} disabled />
+              </label>
+            </div>
+            <div className="ops-modal-footer-nav ops-modal-footer-nav-spread" style={{ marginTop: 14 }}>
+              <button type="button" className="ops-modal-back-btn" onClick={() => setModal(null)}>
+                Close
+              </button>
+              <div className="ops-row-actions">
+                {modal.mode === "view" && modal.item ? (
+                  <button type="button" onClick={() => openEditModal(modal.item!)}>
+                    Edit
+                  </button>
+                ) : null}
+                {modal.mode !== "view" ? (
+                  <button type="button" onClick={() => saveSecret().catch(() => undefined)}>
+                    Save
+                  </button>
+                ) : null}
+                {modal.item ? (
+                  <>
+                    <button type="button" onClick={() => deleteSecretKey(modal.item!.path, modal.item!.key).catch(() => undefined)}>
+                      Delete Key
+                    </button>
+                    <button type="button" onClick={() => deleteSecretPath(modal.item!.path).catch(() => undefined)}>
+                      Delete Path
+                    </button>
+                  </>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </>
   );
 }

@@ -23,9 +23,10 @@ model PlatformLog {
 }
 
 // ─── RAG Knowledge Base ──────────────────────────────────────────────────────
-// Represents a user-configured knowledge source. Each KB maps to one Dify App.
+// Every KB is owned by a specific user (ownerId = Keycloak preferred_username).
+// There is no "global" scope — admins own their KBs and share them explicitly.
 // The Dify API key is stored in Vault at:
-//   secret/data/platform/global/dify/{id}  →  api_key
+//   secret/data/platform/global/dify/{id}  →  app_api_key
 // Source credentials (GitHub token, GitLab token, Google Drive OAuth) are stored
 // in Vault at:
 //   secret/data/platform/users/{ownerId}/sources/{id}
@@ -45,11 +46,12 @@ model RagKnowledgeBase {
   difyAppUrl    String   @default("http://dify-api:5001")
   difyDatasetId String?  // Dify Knowledge Base dataset ID (set after first sync)
 
-  // Scope and ownership
-  scope         String   @default("global") // "global" | "user"
-  ownerId       String?  // null = platform-wide KB; set = user-scoped KB
-  isDefault     Boolean  @default(false)    // Platform default KB for new threads
-  createdById   String
+  // Ownership — every KB has an owner (Keycloak preferred_username)
+  // No global scope: admins own KBs and share them explicitly via RagKbShare
+  ownerId       String   // Keycloak preferred_username of the creator
+  ownerUsername String   // Display username (matches ownerId; kept separate for auditability)
+  isDefault     Boolean  @default(false)   // User's personal default KB for new threads
+  createdById   String   // Same as ownerId at creation time
 
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -58,10 +60,30 @@ model RagKnowledgeBase {
   config        RagKnowledgeBaseConfig?
   syncJobs      RagKbSyncJob[]
   deployments   RagChannelDeployment[]
+  shares        RagKbShare[]           // Users this KB is shared with
 
-  @@index([ownerId, scope])
+  @@index([ownerId])
   @@index([isDefault])
   @@index([createdById])
+}
+
+// ─── KB Share Records ─────────────────────────────────────────────────────────
+// Tracks which users a KB owner (or platform admin) has granted chat access to.
+// Shared users can query the KB but cannot edit, delete, or trigger syncs.
+model RagKbShare {
+  id                String           @id @default(cuid())
+  knowledgeBaseId   String
+  knowledgeBase     RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  sharedWithId      String           // Keycloak preferred_username of the recipient
+  sharedById        String           // Keycloak preferred_username of the granter (owner or admin)
+  permission        String           @default("chat")  // "chat" — extensible for future "write"
+
+  createdAt         DateTime         @default(now())
+
+  @@unique([knowledgeBaseId, sharedWithId])  // one share record per user per KB
+  @@index([sharedWithId])
+  @@index([knowledgeBaseId])
 }
 
 // Per-KB configuration: admin sets platform defaults, users can override selectively.
@@ -145,27 +167,30 @@ model RagChannelDeployment {
 }
 
 // ─── RAG Discussion Threads and Messages ─────────────────────────────────────
-// Threads persist conversation context. flowiseSessionId is kept for backward
-// compatibility with legacy Flowise-backed threads. New Dify threads use
-// difyConversationId which Dify manages for session continuity.
+// Threads are strictly private: only the ownerId user can see their own threads.
+// Sharing a KB does NOT share thread history — each user has their own sessions.
+// Multi-KB threads use RagDiscussionKbSession to track per-KB Dify conversation IDs.
 model RagDiscussionThread {
-  id                 String                 @id @default(cuid())
-  ownerId            String
+  id                 String                   @id @default(cuid())
+  ownerId            String                   // Strict: only this user sees this thread
 
-  // Optional link to a knowledge base (null = legacy Flowise thread)
+  // Optional link to a single knowledge base (kept for legacy compatibility)
   knowledgeBaseId    String?
-  knowledgeBase      RagKnowledgeBase?      @relation(fields: [knowledgeBaseId], references: [id], onDelete: SetNull)
+  knowledgeBase      RagKnowledgeBase?        @relation(fields: [knowledgeBaseId], references: [id], onDelete: SetNull)
+
+  // Multi-KB sessions: one entry per KB selected for this thread
+  kbSessions         RagDiscussionKbSession[]
 
   title              String
   // Legacy: Flowise session ID for pre-Dify threads
-  flowiseSessionId   String                 @unique
-  // Dify: conversation_id returned by Dify API (enables follow-up context)
+  flowiseSessionId   String                   @unique
+  // Legacy single-KB Dify conversation ID (kept for backward compat)
   difyConversationId String?
 
   lastMessageAt      DateTime
   expiresAt          DateTime
-  createdAt          DateTime               @default(now())
-  updatedAt          DateTime               @updatedAt
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
 
   messages           RagDiscussionMessage[]
 
@@ -174,13 +199,31 @@ model RagDiscussionThread {
   @@index([knowledgeBaseId])
 }
 
+// Per-KB Dify session within a multi-KB discussion thread.
+// Each selected KB has its own Dify conversation_id for follow-up context continuity.
+model RagDiscussionKbSession {
+  id                  String              @id @default(cuid())
+  threadId            String
+  thread              RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  knowledgeBaseId     String
+  knowledgeBaseName   String              // Snapshot of KB name at session creation time
+  difyConversationId  String?             // Dify's conversation_id for this KB in this thread
+
+  @@unique([threadId, knowledgeBaseId])
+  @@index([threadId])
+}
+
+// Discussion messages — stores both user questions and assistant answers.
+// For multi-KB responses, kbResults holds the per-KB labeled answers as JSON.
 model RagDiscussionMessage {
-  id        String              @id @default(cuid())
-  threadId  String
-  role      String              // "user" | "assistant"
-  content   String
-  createdAt DateTime            @default(now())
-  thread    RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  id         String              @id @default(cuid())
+  threadId   String
+  role       String              // "user" | "assistant"
+  content    String              // Combined/formatted content (all KBs merged for display)
+  kbResults  Json?               // Array: [{knowledgeBaseId, knowledgeBaseName, ownerUsername, answer}]
+  createdAt  DateTime            @default(now())
+  thread     RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 
   @@index([threadId, createdAt])
 }

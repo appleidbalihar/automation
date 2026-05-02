@@ -27,10 +27,6 @@ export interface AppConfig {
   temporalAddress: string;
   temporalNamespace: string;
   temporalTaskQueue: string;
-  // Flowise (legacy — kept for backward compat with existing threads)
-  flowisePlannerUrl: string;
-  flowiseOperationsChatUrl: string;
-  flowiseApiKey?: string;
   // Dify RAG engine — API keys are stored in Vault, never in env
   difyApiBaseUrl: string;
   // n8n sync orchestrator — API keys are stored in Vault, never in env
@@ -96,12 +92,6 @@ export function loadConfig(serviceName: string, fallbackPort: number): AppConfig
     temporalAddress: required("TEMPORAL_ADDRESS", "temporal:7233"),
     temporalNamespace: required("TEMPORAL_NAMESPACE", "default"),
     temporalTaskQueue: required("TEMPORAL_TASK_QUEUE", "automation-task-queue"),
-    flowisePlannerUrl: required("FLOWISE_PLANNER_URL", "http://flowise:3000"),
-    flowiseOperationsChatUrl: required(
-      "FLOWISE_OPERATIONS_CHAT_URL",
-      "http://flowise:3000/api/v1/prediction/4b37e62c-da5c-43e5-ba10-8a1cfc9d06f1"
-    ),
-    flowiseApiKey: process.env.FLOWISE_API_KEY,
     // Dify — base URL only; per-KB API keys are fetched from Vault at runtime
     difyApiBaseUrl: required("DIFY_API_BASE_URL", "http://dify-api:5001"),
     // n8n — base URL only; credentials are fetched from Vault at runtime
