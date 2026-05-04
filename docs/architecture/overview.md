@@ -1,173 +1,171 @@
 # Platform Architecture Overview
 
-## System Purpose
+## What Is RapidRAG
 
-RapidRAG is a self-hosted RAG operations platform. Operators connect document sources, sync supported files into Dify knowledge bases, chat through the RAG Assistant, and administer users, secrets, logs, and certificate health from the web UI.
+RapidRAG is a self-hosted RAG (Retrieval-Augmented Generation) operations platform. Operators connect document sources (GitHub, GitLab, Google Drive, or web URLs), sync supported files into Dify knowledge bases, and chat through the RAG Assistant. Administrators manage users, secrets, logs, and certificate health from the web UI.
 
-## Current Runtime Topology
+## Quick Reference: Services and Ports
 
-```
-Browser
-  |
-  | HTTPS :3443
-  v
-web-ingress (Nginx)
-  |
-  v
-web (Next.js :3000)
-  |
-  | /gateway/* proxy
-  v
-api-gateway (Fastify :4000, HTTPS/mTLS)
-  |                         |
-  |                         v
-  |                   logging-service (:4005)
-  v
-workflow-service (:4001)
-  |
-  +-- PostgreSQL + pgvector
-  +-- RabbitMQ
-  +-- Vault
-  +-- Dify API/worker/web
-  +-- n8n
-```
+The RapidRAG platform runs these services:
 
-## Service Inventory
-
-| Service | Port | Current role |
-|---------|------|--------------|
-| `web-ingress` | host `3443` -> container `443` | TLS entrypoint for the platform web app |
-| `web` | `3000` | Next.js app, auth gate, landing page, platform UI, `/gateway/*` proxy |
-| `api-gateway` | `4000` | JWT/RBAC enforcement, service proxy, OAuth flow, certificate monitor, sync callback entrypoint |
-| `workflow-service` | `4001` | RAG source lifecycle, Dify provisioning/chat, n8n sync triggering, Vault-backed source secrets |
-| `logging-service` | `4005` | Log ingest/query/timeline APIs, PostgreSQL persistence, optional OpenSearch shipping |
-| `postgres` | `5432` | Platform database and pgvector store used by Dify |
-| `redis` | `6379` | Redis endpoint for platform/OAuth nonce use |
+| Service | Host Port | Purpose |
+|---------|-----------|---------|
+| `web-ingress` | `3443` | HTTPS ingress (Nginx TLS entrypoint) |
+| `web` | `3000` | Next.js platform UI and `/gateway/*` API proxy |
+| `api-gateway` | `4000` | JWT/RBAC enforcement, OAuth flow, certificate monitor |
+| `workflow-service` | `4001` | RAG source lifecycle, Dify provisioning and chat |
+| `logging-service` | `4005` | Log ingest, query, and timeline APIs |
+| `postgres` | `5432` | Platform database with pgvector extension |
+| `redis` | `6379` | Cache and OAuth nonce storage |
 | `rabbitmq` | `5671`, `15671` | AMQPS event bus and management UI |
-| `opensearch` | `9200`, `9600` | Search backend for platform logs |
+| `opensearch` | `9200`, `9600` | Log search backend |
 | `minio` | `9000`, `9001` | S3-compatible object storage |
 | `keycloak` | `8443` | Identity provider and JWT issuer |
-| `vault` | `8200` | PKI CA plus KV secret storage |
-| `dify-api` | `5001` | Dify API used for datasets, apps, chat, and document indexing |
-| `dify-web` | `3002` | Dify admin console for setup/admin tasks |
-| `dify-worker` | internal | Dify async indexing worker |
+| `vault` | `8200` | PKI certificate authority and secret storage |
+| `dify-api` | `5001` | Dify API for datasets, apps, chat, and document indexing |
+| `dify-web` | `3002` | Dify admin console |
+| `dify-worker` | internal | Dify async indexing and embedding worker |
 | `dify-sandbox` | internal | Dify code execution sandbox |
-| `n8n` | host `5679` -> container `5678` | Document sync workflow runner |
+| `n8n` | `5679` | Document sync workflow runner |
 
-Flowise is no longer part of `docker-compose.yml`. Some database fields remain only for legacy discussion-thread compatibility.
+For full container details (images, env vars, dependencies), see `docs/architecture/containers.md`.
 
-## Web UI Routes
+## System Architecture (Request Flow)
 
-The authenticated platform shell lives under `apps/web/src/app/(platform)`.
+How a browser request flows through the platform:
 
-| Route | Component | Notes |
-|-------|-----------|-------|
-| `/dashboard` | `DashboardOverview` | Platform summary and quick links |
-| `/knowledge-connector` | `IntegrationsPage` | Primary source/KB management route |
-| `/rag-assistant` | `OperationsAiDifyChat` | Primary Dify-backed chat route |
-| `/profile` | `ProfilePage` | Current user profile/password |
-| `/logs` | `LogsExplorer` | Admin-only platform logs |
-| `/users` | `UsersAdminPanel` | Admin/useradmin user management |
-| `/secrets` | `AdminSecretsPanel` | Admin-only Vault secret management |
-| `/security` | `SecurityHealthPanel` | Admin-only certificate health |
+```
+Browser → HTTPS :3443 → web-ingress (Nginx)
+                              ↓
+                         web (Next.js :3000)
+                              ↓ /gateway/* proxy
+                         api-gateway (Fastify :4000, mTLS)
+                         ↙                    ↘
+            workflow-service (:4001)    logging-service (:4005)
+                         ↓
+              ┌─ PostgreSQL + pgvector
+              ├─ RabbitMQ (events)
+              ├─ Vault (secrets + PKI)
+              ├─ Dify API/worker/web (RAG)
+              └─ n8n (sync workflows)
+```
 
-Compatibility routes still exist:
+## Web UI Pages and Routes
 
-| Legacy route | Current behavior |
-|--------------|------------------|
-| `/integrations` | Renders the same `IntegrationsPage` as `/knowledge-connector` |
+The authenticated platform UI lives at `https://<host>:3443` under these routes:
+
+| Route | Page | Who Can Access |
+|-------|------|---------------|
+| `/dashboard` | Platform summary and quick links | All roles |
+| `/knowledge-connector` | Source and knowledge base management | admin, useradmin, operator |
+| `/rag-assistant` | Dify-backed RAG chat | All roles |
+| `/profile` | User profile and password change | All roles |
+| `/logs` | Platform log explorer | admin only |
+| `/users` | User management | admin, useradmin |
+| `/secrets` | Vault secret management | admin only |
+| `/security` | Certificate health panel | admin only |
+
+Legacy compatibility routes:
+
+| Legacy Route | Current Behavior |
+|--------------|-----------------|
+| `/integrations` | Same as `/knowledge-connector` |
 | `/operations-ai` | Redirects to `/rag-assistant` |
 | `/operations-ai-dify` | Redirects to `/rag-assistant` |
 | `/operations-ai/setup` | Redirects to `/knowledge-connector` |
 
-## Authentication And Roles
+## User Roles and Permissions
 
-The web app uses Keycloak-backed platform sessions and sends bearer tokens to the API. The API gateway verifies JWTs and applies role checks per route.
+RapidRAG uses Keycloak-issued JWTs with these platform roles:
 
-| Role | Current UI/API meaning |
-|------|------------------------|
-| `admin` | Full platform administration, including logs, users, secrets, security, and KB operations |
-| `useradmin` | User administration plus KB/source operations allowed by gateway routes |
-| `operator` | Source sync, RAG operations, and sync-job logs |
-| `approver` | Read/chat access where gateway routes allow it |
-| `viewer` | Read/chat access where gateway routes allow it |
+| Role | Permissions |
+|------|-------------|
+| `admin` | Full access: logs, users, secrets, certificates, all KB operations |
+| `useradmin` | User management plus KB and source operations |
+| `operator` | Source sync, RAG chat, sync-job logs |
+| `approver` | Read and chat access |
+| `viewer` | Read and chat access |
 
-System-wide `/logs` and `/logs/timeline` are admin-only. `/logs/sync-job` is available to admin, useradmin, and operator because it is scoped by sync job.
+**Admin-only routes:** `/logs`, `/logs/timeline`
+**Operator and above:** `/logs/sync-job` (scoped by sync job ID)
 
-## Data Model
+## Database Models (Prisma)
 
-Current Prisma models are in `packages/db/prisma/schema.prisma`.
+The platform database schema (`packages/db/prisma/schema.prisma`) contains these tables:
 
-| Model | Purpose |
-|-------|---------|
+| Table | What It Stores |
+|-------|---------------|
 | `PlatformLog` | Sanitized platform log events |
-| `RagKnowledgeBase` | Source configuration, Dify dataset reference, ownership, default flag |
-| `RagKbShare` | Explicit chat access grants to other users |
-| `RagKnowledgeBaseConfig` | Prompt/model/retrieval and response-style configuration |
-| `RagKbFileTracker` | Per-file SHA and Dify document ID for incremental sync |
-| `RagKbSyncJob` | Sync/cleanup/retry job lifecycle and step JSON |
+| `RagKnowledgeBase` | Knowledge base configuration, Dify dataset ID, ownership |
+| `RagKbShare` | Access grants sharing a KB with other users |
+| `RagKnowledgeBaseConfig` | Prompt, model, retrieval, and response-style settings |
+| `RagKbFileTracker` | Per-file SHA hash and Dify document ID for incremental sync |
+| `RagKbSyncJob` | Sync job lifecycle, steps, progress, and error state |
 | `RagChannelDeployment` | Channel deployment metadata |
-| `RagDiscussionThread`, `RagDiscussionKbSession`, `RagDiscussionMessage` | RAG chat history and Dify conversation sessions |
+| `RagDiscussionThread` | RAG chat thread records |
+| `RagDiscussionMessage` | Individual messages in a chat thread |
 
-The old `RagKbSourcePath` model has been replaced by `sourcePaths` on `RagKnowledgeBase` plus `RagKbFileTracker`.
+Note: These are **database tables**, not Docker containers. Docker containers are listed in the Service table above and in `containers.md`.
 
-## Main Data Flows
+## How Source Sync Works
 
-### Source Sync
-
-```
-Operator -> Knowledge Connector -> POST /gateway/rag/knowledge-bases/:id/sync
-  -> api-gateway
-  -> workflow-service creates/updates RagKbSyncJob
-  -> workflow-service triggers n8n
-  -> n8n fetches source files and calls sync-diff
-  -> changed supported files are uploaded/indexed in Dify
-  -> n8n posts sync-progress callbacks
-  -> UI polls sync-status/history and sync-job logs
-```
-
-### RAG Chat
+When an operator triggers a knowledge base sync:
 
 ```
-Operator -> RAG Assistant -> /gateway/rag/discussions/*
-  -> api-gateway
-  -> workflow-service
-  -> Dify chat API
-  -> response stored in RagDiscussionMessage
+1. Operator clicks "Sync" in Knowledge Connector UI
+2. POST /gateway/rag/knowledge-bases/:id/sync → api-gateway → workflow-service
+3. workflow-service creates a RagKbSyncJob record
+4. workflow-service triggers n8n webhook (rag-sync-github / rag-sync-gitlab / etc.)
+5. n8n fetches source files from GitHub/GitLab/Google Drive
+6. n8n calls sync-diff endpoint to find changed files
+7. Changed/new files are uploaded and indexed in Dify
+8. n8n posts progress callbacks → workflow-service updates sync job steps
+9. UI polls sync-status endpoint and displays progress
 ```
 
-### Logs
+## How RAG Chat Works
 
-Services publish sanitized platform events. `logging-service` stores them in PostgreSQL and attempts non-blocking OpenSearch indexing. The admin logs page queries `/gateway/logs`; step log drawers query `/gateway/logs/sync-job`.
+When an operator sends a message in the RAG Assistant:
 
-## Security
+```
+1. User types message in /rag-assistant UI
+2. POST /gateway/rag/discussions/:threadId/messages → api-gateway → workflow-service
+3. workflow-service retrieves the Dify app API key from Vault
+4. workflow-service calls Dify chat API with the user's message
+5. Dify retrieves relevant document chunks from the knowledge base
+6. Dify sends chunks + message to the configured LLM (e.g. gemini-3.1-pro via fuelix.ai)
+7. LLM response is returned to workflow-service
+8. Response is stored in RagDiscussionMessage and returned to the UI
+```
 
-- Service TLS certificates are issued by Vault PKI and mounted from `/tls`.
-- App services use the shared `@platform/tls-runtime` package for HTTPS server setup and outgoing TLS fetches.
-- Source tokens, OAuth tokens, OAuth app credentials, and Dify API keys are stored in Vault, not in platform tables.
-- The API gateway is the browser-facing API boundary. Workflow and logging services are called through the gateway from the UI.
-- n8n sync callbacks use `X-Rag-Sync-Token` or `X-N8N-Webhook-Token`, backed by `N8N_WEBHOOK_TOKEN`.
+## Security Architecture
 
-## Monorepo Layout
+- **TLS certificates** are issued by Vault PKI and mounted into each service from `/tls`
+- **Service-to-service** communication uses mTLS (mutual TLS)
+- **Secrets** (API keys, OAuth tokens, Dify credentials) are stored in Vault, never in the database
+- **JWT verification** is done at the api-gateway for all browser-facing requests
+- **n8n sync callbacks** are authenticated with `X-Rag-Sync-Token` or `X-N8N-Webhook-Token`
+
+## Monorepo Code Layout
 
 ```
 apps/
-  api-gateway/       Fastify gateway, RBAC, OAuth, cert monitor
-  logging-service/   log ingest/query service
+  api-gateway/       JWT/RBAC gateway, OAuth flow, cert monitor
+  logging-service/   Log ingest and query service
   web/               Next.js RapidRAG UI
-  workflow-service/  RAG orchestration and Dify/n8n integration
+  workflow-service/  RAG orchestration, Dify/n8n integration
 packages/
-  auth/              auth hook and role utilities
-  config/            shared env loader
-  contracts/         event names/contracts
-  db/                Prisma schema/client
-  observability/     logging helpers
-  tls-runtime/       TLS/mTLS helper runtime
-  ui-kit/            shared React UI primitives
+  auth/              Auth hooks and role utilities
+  config/            Shared environment config loader
+  contracts/         Shared event names and type contracts
+  db/                Prisma schema and database client
+  observability/     Structured logging helpers
+  tls-runtime/       TLS/mTLS server and fetch helpers
+  ui-kit/            Shared React UI components
 infra/
-  docker/            app image Dockerfiles
-  keycloak/          realm export and seed helpers
-  nginx/             web ingress config
-  n8n/               workflow templates/helpers
-  postgres/ redis/ rabbitmq/ vault/
+  docker/            Dockerfiles for app images
+  keycloak/          Realm export and seed scripts
+  nginx/             Nginx ingress configuration
+  n8n/               Sync workflow templates
+  postgres/ redis/ rabbitmq/ vault/   Infrastructure config
 ```

@@ -1,12 +1,16 @@
 # OAuth2 Connect Integration
 
-## Overview
+## What Is OAuth2 Integration
 
-Knowledge sources can be connected with OAuth or with a personal access token (PAT). OAuth is the preferred UI path for GitHub, GitLab, and Google Drive. Web URL sources do not require OAuth.
+OAuth2 integration allows operators to connect knowledge sources (GitHub, GitLab, Google Drive) to RapidRAG using secure OAuth authorization instead of manually entering personal access tokens. The platform supports both OAuth and PAT (Personal Access Token) authentication for knowledge sources.
 
-The current implementation stores OAuth app credentials and provider tokens in Vault. Database rows keep only non-secret source metadata.
+- **OAuth** is the preferred UI path for GitHub, GitLab, and Google Drive
+- **PAT** (Personal Access Token) is supported as an alternative for all three providers
+- **Web URL sources** do not require any authentication
 
-## Supported Providers
+All OAuth tokens and credentials are stored in **Vault** (not in the database). Database rows store only non-secret source metadata.
+
+## Supported OAuth Providers
 
 | Source type | OAuth provider route | Provider scopes |
 |-------------|----------------------|-----------------|
