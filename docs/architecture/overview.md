@@ -116,6 +116,58 @@ Operator → /integrations (web) → POST /rag/knowledge-bases/:id/sync
 
 ---
 
+## Data Flow: Knowledge Base Sync (Smart Diff)
+
+```
+Operator → POST /rag/knowledge-bases/:id/sync  (JWT Bearer)
+  → api-gateway → workflow-service
+  → workflow-service POSTs to n8n webhook
+
+n8n Webhook (async, 200 returned immediately):
+  → Parse Sync Params (extract owner/repo from sourceUrl)
+  → Init Step Callback → /sync-progress: fetch_file_tree: running
+  → Get Repo File Tree  (GitHub/GitLab API, recursive=1)
+    ↓ continueOnFail: true
+  → Handle Tree Error
+      if error: POST /sync-progress fetch_file_tree: failed → throw → Error Trigger
+      if ok:    continue
+  → POST /sync-diff (workflow-service smart diff)
+      workflow-service:
+        1. Filter to supported extensions (.md .pdf .docx .csv …)
+        2. Compare SHA against RagKbSourcePath table
+        3. Return only new/changed files
+  → Map Diff Files
+      if 0 files: send fetch_file_tree:completed + skip_sync:completed → end
+      if files:   send fetch_file_tree:completed + upload_files:running → continue
+  → For each changed file (loop):
+      Fetch raw file content (GitHub/GitLab raw endpoint)
+      Upload to Dify (create_by_text or create_by_file)
+      Report File Progress → /sync-progress upload_files:running (filesProcessed++)
+  → Aggregate Doc IDs
+  → Indexing Start Callback → /sync-progress upload_files:completed|failed
+  → Dify Indexing Start CB → /sync-progress dify_indexing:running
+  → Poll Dify Indexing (every 5 s, max 24 attempts / ~2 min)
+  → Report Final Status → /sync-progress dify_indexing:completed|failed
+      workflow-service: upserts RagKbSourcePath with new SHAs
+
+Error path (any unhandled throw):
+  n8n Error Trigger → POST /rag/sync-error-handler
+    workflow-service: marks job failed, sets running steps to failed
+
+Stale detection (server-side):
+  sweepStaleJobs() runs every 60 s in workflow-service
+  Jobs with lastProgressAt older than 15 min → status: timed_out
+
+UI monitoring:
+  SyncProcessMonitor.tsx polls GET /sync-status every 3 s while job is active
+  Shows step table (fetch_file_tree | skip_sync | upload_files | dify_indexing)
+  Shows progress bar: filesProcessed / filesTotal
+```
+
+See `docs/developer/rag-kb-sync.md` for node-by-node workflow detail and `docs/operations/rag-kb-sync.md` for the operations runbook.
+
+---
+
 ## Data Flow: Operations AI Chat
 
 ```

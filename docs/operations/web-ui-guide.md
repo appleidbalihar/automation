@@ -140,6 +140,64 @@ Each GitHub / GitLab / Google Drive integration row shows a credential panel wit
 
 Click the **Cancel** button on the progress bar row. The n8n execution is stopped and the sync job is marked `cancelled`.
 
+### Sync Process Monitor
+
+When a sync is running (or after it completes), click the **Monitor** button on the integration row to open the Sync Process Monitor panel. This panel is the primary observability tool for sync jobs.
+
+#### KB selector and job history
+- Use the **KB selector** dropdown to switch between knowledge bases.
+- Use the **Job history** dropdown to select any of the last 10 sync jobs for the current KB. The monitor auto-switches to whichever KB just started an active sync.
+
+#### Progress bar
+- Shows `filesProcessed / filesTotal` (e.g. `3 / 8 files`).
+- Only counts files in the smart diff — unchanged files are excluded from the total.
+- If the repository was unchanged, the total is 0 and no progress bar appears.
+
+#### Step table
+
+Each sync shows up to four steps in order:
+
+| Step | What it means |
+|------|--------------|
+| **Fetch File Tree** | n8n is retrieving the complete list of files from GitHub or GitLab. |
+| **Skip Sync** | No files changed since the last sync. Upload and indexing were skipped. |
+| **Upload Files** | Changed files are being fetched from the source and uploaded to Dify. |
+| **Dify Indexing** | Dify is chunking, embedding, and indexing the uploaded documents. |
+
+#### Status badges
+
+| Badge | Meaning |
+|-------|---------|
+| Blue / pulsing | Running — step is currently active |
+| Green | Completed successfully |
+| Red | Failed — see the error message or log drawer |
+| Grey | Not yet reached |
+
+#### Smart diff behaviour — "Only changed files are re-uploaded"
+The sync compares each file's SHA hash against the value stored from the previous sync. Files whose content has not changed are excluded before any download or upload begins. This means:
+- A repository with 500 files where only 3 changed will show `filesTotal: 3`.
+- Processing time is proportional to changes, not repository size.
+- Re-triggering a sync immediately after a completed sync usually results in Skip Sync.
+
+#### What "Skip Sync" means
+When all files in the repository match the previously stored SHAs, the workflow sends a `skip_sync: completed` callback and ends immediately. The step table shows `Fetch File Tree: completed` and `Skip Sync: completed`. **This is normal and expected** — it means the repository content is unchanged. No documents were re-uploaded or re-indexed.
+
+#### Log drill-down
+Each step row has a log icon button. Clicking it opens a drawer showing the raw log messages emitted by n8n during that step. This is the fastest way to see error details without accessing n8n directly.
+
+#### Retrying failed Dify indexing
+If the **Dify Indexing** step shows `failed` (or completed but with some documents in error state), a **Retry** button appears in the monitor. Clicking it calls `POST /rag/knowledge-bases/:id/retry-failed-indexing`, which re-submits only the failed documents to Dify without re-downloading or re-uploading the full file set.
+
+#### Interpreting common error messages
+
+| Error message | Cause | Action |
+|--------------|-------|--------|
+| `HTTP 401: Bad credentials` | Source token is invalid or expired | Reconnect OAuth or update PAT in the credential panel |
+| `HTTP 404: Not Found` | Repository URL or branch does not exist | Check the sourceUrl and sourceBranch on the integration |
+| `HTTP 403: Forbidden` | Token lacks `repo` read scope | Generate a new token with the correct permissions |
+| `Dify API error: dataset not found` | Dify dataset ID mismatch | Recreate the KB integration or verify Dify dataset ID |
+| `Timed out` (job-level) | n8n stopped sending progress for 15+ minutes | Check n8n execution logs; trigger a new sync after resolving the root cause |
+
 ### Viewing sync history
 
 Click the **History** icon on any integration row to see a list of past sync jobs with:

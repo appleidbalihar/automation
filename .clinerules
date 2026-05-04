@@ -1,0 +1,25 @@
+# .clinerules
+# These rules apply to every code modification request.
+
+## Rule 1: Update container & restart service after code changes
+Whenever you modify any source code, configuration, or dependency file, you MUST ensure:
+1. The changes are copied/updated into the running container (e.g., via `docker cp`, rebuild, or volume sync).
+2. The service inside the container is restarted (or the container itself is recreated) so it runs the latest code.
+3. Briefly confirm that the container is up and the service is reachable (e.g., `docker ps`, health check endpoint).
+
+Do NOT assume the old container process will automatically pick up new code. Always explicitly apply the update and restart the service.
+
+## Rule 2: Verify the fix via API test & flow/code review
+After applying the change, you MUST verify that the reported issue is resolved by:
+1. Initiating an **API test** that exercises the modified endpoint or feature (e.g., using `curl`, `httpie`, or a test script in the project).
+2. Checking the response, status codes, and side effects to confirm the intended behaviour.
+3. Walking through the **execution flow** of the changed code path (mentally or by adding temporary logging) to ensure the logic is correctly implemented.
+4. If the verification fails, go back to fixing and repeat steps.
+
+Include in your final answer:
+- What was changed and how it was deployed.
+- The API request/response used for verification.
+- Confirmation that the service is running the latest code.
+
+## Additional defaults (optional but helpful)
+- Prefer `docker compose` commands if the project uses it.

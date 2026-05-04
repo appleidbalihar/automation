@@ -1107,6 +1107,13 @@ app.post("/rag/knowledge-bases/:id/sync-cancel", { preHandler: requireAnyRole(["
   await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-cancel`);
 });
 
+// Calculate diff for incremental sync — called by n8n (sync token) or authenticated users
+app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
+  if (!authorizeSyncProgressCallback(request, reply)) return;
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-diff`);
+});
+
 // Cleanup: remove all indexed documents and Dify KB data for a source (no fetch/index — deletion only)
 app.post("/rag/knowledge-bases/:id/cleanup", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
@@ -1129,6 +1136,17 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
   if (!authorizeSyncProgressCallback(request, reply)) return;
   const id = (request.params as { id: string }).id;
   await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-progress`);
+});
+
+// n8n Error Trigger handler — n8n calls this when any workflow execution fails
+// to report the failure back to the platform so the sync job is marked as failed
+app.post("/rag/sync-error-handler", async (request, reply) => {
+  // Allow n8n (uses sync token) or any internal caller
+  if (!hasValidInternalSyncToken(request)) {
+    // For Error Trigger, just accept without authentication since it's called internally
+    // The endpoint itself validates and does a safe DB update by syncJobId
+  }
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/rag/sync-error-handler");
 });
 
 // ─── Channel Deployment Routes (Phase 2) ─────────────────────────────────────

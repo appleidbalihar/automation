@@ -220,7 +220,7 @@ function normalizeSourceType(sourceType: string, sourceUrl?: string): string {
 
 function supportedDocumentPath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase();
-  return Boolean(ext && ["md", "txt", "rst", "mdx"].includes(ext));
+  return Boolean(ext && ["md", "markdown", "txt", "html", "htm", "xml", "csv", "pdf", "docx", "xlsx", "xls", "pptx", "ppt", "eml", "msg", "epub", "rst", "mdx"].includes(ext));
 }
 
 function sourceAccessError(sourceType: string, status: number, details: string): string {
@@ -1833,9 +1833,10 @@ async function buildIntegrationResponse(
     sourceType: kb.sourceType,
     sourceUrl: kb.sourceUrl,
     sourceBranch: kb.sourceBranch ?? null,
-    sourcePath: kb.sourcePath ?? null,
-    syncSchedule: kb.syncSchedule ?? null,
-    ownerId: kb.ownerId ?? null,
+      sourcePath: kb.sourcePath ?? null,
+      sourcePaths: kb.sourcePaths ?? [],
+      syncSchedule: kb.syncSchedule ?? null,
+      ownerId: kb.ownerId ?? null,
     createdAt: kb.createdAt instanceof Date ? kb.createdAt.toISOString() : kb.createdAt,
     updatedAt: kb.updatedAt instanceof Date ? kb.updatedAt.toISOString() : kb.updatedAt,
     credentialConfigured,
@@ -2101,7 +2102,7 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
   if (n8nWorkflowId) {
     const progressCallbackUrl = `${ragSyncProgressCallbackBaseUrl()}/rag/knowledge-bases/${kbId}/sync-progress`;
     const webhookUrl = `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}`;
-    void fetch(webhookUrl, {
+    void tlsFetch(tlsRuntime, new URL(webhookUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -2109,8 +2110,9 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
         syncJobId: syncJob.id,
         sourceUrl: kb.sourceUrl,
         sourceBranch: kb.sourceBranch,
-        sourcePath: kb.sourcePath,
-        sourceType: kb.sourceType,
+      sourcePath: kb.sourcePath,
+      sourcePaths: (kb as any).sourcePaths ?? [],
+      sourceType: kb.sourceType,
         difyDatasetId,
         difyApiUrl: kb.difyAppUrl,
         difyApiKey,
@@ -2203,6 +2205,7 @@ app.post("/rag/integrations", async (request, reply) => {
     sourceUrl?: string;
     sourceBranch?: string;
     sourcePath?: string;
+    sourcePaths?: string[];
     syncSchedule?: string;
     setDefault?: boolean;
     credentials?: Record<string, unknown>;
@@ -2493,6 +2496,7 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
     sourceUrl?: string;
     sourceBranch?: string;
     sourcePath?: string;
+    sourcePaths?: string[];
     syncSchedule?: string;
     difyAppUrl?: string;
     difyApiKey?: string;
@@ -2535,6 +2539,7 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
           sourceUrl,
           sourceBranch: body.sourceBranch ?? null,
           sourcePath: body.sourcePath ?? null,
+          sourcePaths: Array.isArray(body.sourcePaths) ? body.sourcePaths : (body.sourcePath ? [body.sourcePath] : []),
           syncSchedule: body.syncSchedule ?? null,
           difyAppUrl: body.difyAppUrl ?? defaults.difyAppUrl,
           ownerId: userId,
@@ -2756,6 +2761,150 @@ app.post("/rag/knowledge-bases/:id/sync-cancel", async (request, reply) => {
   return { cancelled: true, syncJobId: latestJob.id, knowledgeBaseId: id };
 });
 
+// Helper to evaluate if a path matches the configured sourcePaths
+function matchesSourcePaths(path: string, basePathStr: string | null, sourcePathsArr: string[]): boolean {
+  if (!sourcePathsArr || sourcePathsArr.length === 0) {
+    if (!basePathStr) return true;
+    const basePath = basePathStr.replace(/^\/+|\/+$/g, "");
+    return !basePath || path.startsWith(basePath + "/") || path === basePath;
+  }
+
+  return sourcePathsArr.some((p) => {
+    const cleanPath = p.replace(/^\/+|\/+$/g, "");
+    if (!cleanPath) return true;
+    return path.startsWith(cleanPath + "/") || path === cleanPath;
+  });
+}
+
+// Calculate the sync diff, clear obsolete files from Dify and DB, return list of files to upload
+app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const body = (request.body ?? {}) as {
+    tree?: Array<{ path?: string; type?: string; sha?: string }>;
+    syncJobId?: string;
+  };
+
+  if (!body.syncJobId) return reply.code(400).send({ error: "SYNC_JOB_ID_REQUIRED" });
+
+  const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id } });
+  if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+
+  try {
+    const difySecrets = await readVaultKv(`platform/global/dify/${id}`);
+    const difyDatasetId = nonEmptyString(kb.difyDatasetId) ?? nonEmptyString(difySecrets.dataset_id);
+    const datasetApiKey = nonEmptyString(difySecrets.dataset_api_key);
+
+    if (!difyDatasetId || !datasetApiKey) {
+      throw new Error("Dify dataset not configured");
+    }
+
+    const session = await ensureDifyConsoleSession(String(kb.sourceType ?? "github"));
+
+    // 1. Filter valid current files from Git tree
+    const tree = body.tree ?? [];
+    const basePathStr = kb.sourcePath;
+    const sourcePathsArr = kb.sourcePaths ?? [];
+
+    const validCurrentFiles = new Map<string, { path: string; sha: string }>();
+
+    for (const item of tree) {
+      const path = String(item.path ?? "");
+      const sha = String(item.sha ?? "");
+
+      if (item.type !== "blob" || !supportedDocumentPath(path) || !matchesSourcePaths(path, basePathStr, sourcePathsArr)) {
+        continue;
+      }
+      validCurrentFiles.set(path, { path, sha });
+    }
+
+    await updateSyncJobStep(body.syncJobId, {
+      task: "Calculating Diff",
+      stepName: "calculate_diff",
+      status: "running",
+      startedAt: new Date().toISOString(),
+      message: `Analyzing ${validCurrentFiles.size} matching files against existing tracker`
+    });
+
+    // 2. Fetch tracked files from database
+    const trackedFiles = await (prisma as any).ragKbFileTracker.findMany({
+      where: { knowledgeBaseId: id }
+    });
+
+    // 3. Compare to find obsolete files (in tracker but not in valid current files)
+    const obsoleteFiles = trackedFiles.filter((tracked: any) => !validCurrentFiles.has(tracked.filePath));
+
+    if (obsoleteFiles.length > 0) {
+      await updateSyncJobStep(body.syncJobId, {
+        task: "Cleanup Removed Paths",
+        stepName: "cleanup_removed_paths",
+        status: "running",
+        startedAt: new Date().toISOString(),
+        message: `Removing ${obsoleteFiles.length} obsolete documents from Dify`
+      });
+
+      let deleteErrors = 0;
+      for (const obs of obsoleteFiles) {
+        try {
+          await deleteDifyResourceIfPresent(session, `/datasets/${difyDatasetId}/documents/${obs.difyDocumentId}`);
+          await (prisma as any).ragKbFileTracker.delete({ where: { id: obs.id } });
+        } catch (err) {
+          console.warn(`Failed to delete document ${obs.difyDocumentId} from Dify`, err);
+          deleteErrors++;
+        }
+      }
+
+      await updateSyncJobStep(body.syncJobId, {
+        task: "Cleanup Removed Paths",
+        stepName: "cleanup_removed_paths",
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        message: `Removed ${obsoleteFiles.length} obsolete documents${deleteErrors > 0 ? ` (${deleteErrors} errors)` : ""}`
+      });
+    }
+
+    // 4. Find new and modified files to upload
+    const filesToUpload: Array<{ path: string; sha: string; difyDocumentId?: string; isUpdate: boolean }> = [];
+
+    for (const [path, current] of validCurrentFiles.entries()) {
+      const tracked = trackedFiles.find((t: any) => t.filePath === path);
+      if (!tracked) {
+        // New file
+        filesToUpload.push({ path: current.path, sha: current.sha, isUpdate: false });
+      } else if (tracked.fileSha !== current.sha) {
+        // Modified file
+        filesToUpload.push({ path: current.path, sha: current.sha, difyDocumentId: tracked.difyDocumentId, isUpdate: true });
+      }
+    }
+
+    await updateSyncJobStep(body.syncJobId, {
+      task: "Calculating Diff",
+      stepName: "calculate_diff",
+      status: "completed",
+      completedAt: new Date().toISOString(),
+      message: `Found ${filesToUpload.length} files to sync (${filesToUpload.filter(f => f.isUpdate).length} updates, ${filesToUpload.filter(f => !f.isUpdate).length} new)`
+    });
+
+    // Update job file totals
+    await (prisma as any).ragKbSyncJob.update({
+      where: { id: body.syncJobId },
+      data: { filesTotal: filesToUpload.length }
+    });
+
+    return { ok: true, files: filesToUpload };
+
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    await updateSyncJobStep(body.syncJobId, {
+      task: "Calculating Diff",
+      stepName: "calculate_diff",
+      status: "failed",
+      completedAt: new Date().toISOString(),
+      errorMessage: msg
+    });
+    return reply.code(500).send({ error: "SYNC_DIFF_FAILED", details: msg });
+  }
+});
+
 // Cleanup: remove all Dify documents and vector index for a KB without deleting the KB record.
 // The integration stays — users can re-sync to rebuild the index afterwards.
 // Only deletion operations — no file fetch, no upload, no re-indexing.
@@ -2837,9 +2986,22 @@ app.post("/rag/knowledge-bases/:id/cleanup", async (request, reply) => {
             startedAt: nowIso.toISOString(),
             completedAt: nowIso.toISOString(),
             message: "Sync status and counters reset"
+          },
+          {
+            task: "Cleanup: Clear file tracker database",
+            stepName: "cleanup_file_tracker",
+            status: "completed",
+            startedAt: nowIso.toISOString(),
+            completedAt: nowIso.toISOString(),
+            message: "Cleared all synced file records"
           }
         ]
       }
+    });
+
+    // Clear file tracker database records
+    await (prisma as any).ragKbFileTracker.deleteMany({
+      where: { knowledgeBaseId: id }
     });
 
     // Prune history to keep only the last 10 jobs per KB so the monitor stays clean
@@ -2899,6 +3061,38 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
     if (String(existingJob.status ?? "") === "completed" && body.status !== "completed") {
       return { updated: false, ignored: "SYNC_ALREADY_COMPLETED" };
     }
+    // Handle successful file sync - populate file tracker
+    if (body.step?.stepName === "upload_files" && body.step.status === "completed") {
+       // if we have specific success records attached to body.step we'd process them here,
+       // but typically the n8n webhook reports progress per file or at end.
+    }
+
+    if (body.status === "running" && body.step?.stepName === "upload_file_success") {
+        // Custom payload from n8n when a file successfully uploads
+        const payload = body as any;
+        if (payload.difyDocumentId && payload.filePath && payload.fileSha) {
+             await (prisma as any).ragKbFileTracker.upsert({
+                 where: {
+                     knowledgeBaseId_filePath: {
+                         knowledgeBaseId: existingJob.knowledgeBaseId,
+                         filePath: payload.filePath
+                     }
+                 },
+                 create: {
+                     knowledgeBaseId: existingJob.knowledgeBaseId,
+                     filePath: payload.filePath,
+                     fileSha: payload.fileSha,
+                     difyDocumentId: payload.difyDocumentId
+                 },
+                 update: {
+                     fileSha: payload.fileSha,
+                     difyDocumentId: payload.difyDocumentId,
+                     syncedAt: new Date()
+                 }
+             });
+        }
+    }
+
     let failedDocuments = normalizeFailedDifyDocuments(body.step?.failedDocuments);
     if (
       body.status === "failed" &&
@@ -2984,6 +3178,7 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
         filesTotal: body.filesTotal ?? undefined,
         chunksProcessed: body.chunksProcessed ?? undefined,
         errorMessage: body.errorMessage ?? null,
+        lastProgressAt: new Date(),
         ...(isCompleted ? { completedAt: new Date() } : {})
       }
     });
@@ -3604,7 +3799,120 @@ app.patch("/rag/integrations/:id/oauth-app-credentials", async (request, reply) 
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.listen({ host: "0.0.0.0", port: config.port }).catch((error) => {
+// Dedicated error handler endpoint for n8n Error Trigger
+// n8n calls this with the full execution context, and we extract syncJobId from it
+app.post("/rag/sync-error-handler", async (request, reply) => {
+  const body = (request.body ?? {}) as any;
+  const errMsg = String(
+    body?.execution?.error?.message ||
+    body?.execution?.error?.description ||
+    body?.error?.message ||
+    "Workflow execution failed"
+  );
+
+  // Extract syncJobId from execution run data - try Parse Sync Params first, then Webhook Trigger body
+  let syncJobId = "";
+  let progressCallbackUrl = "";
+  let progressCallbackToken = "";
+
+  try {
+    const runData = body?.execution?.data?.resultData?.runData || {};
+    const parseParamsData = runData["Parse Sync Params"]?.[0]?.data?.main?.[0]?.[0]?.json;
+    if (parseParamsData?.syncJobId) {
+      syncJobId = parseParamsData.syncJobId;
+      progressCallbackUrl = parseParamsData.progressCallbackUrl || "";
+      progressCallbackToken = parseParamsData.progressCallbackToken || "";
+    } else {
+      // Try from webhook trigger
+      const webhookData = runData["Webhook Trigger"]?.[0]?.data?.main?.[0]?.[0]?.json;
+      const webhookBody = webhookData?.body || webhookData || {};
+      syncJobId = webhookBody.syncJobId || "";
+      progressCallbackUrl = webhookBody.progressCallbackUrl || "";
+      progressCallbackToken = webhookBody.progressCallbackToken || "";
+    }
+  } catch {}
+
+  if (!syncJobId) {
+    return reply.code(200).send({ ok: false, reason: "syncJobId not found in execution data" });
+  }
+
+  // Mark the sync job as failed in the database
+  try {
+    await (prisma as any).ragKbSyncJob.updateMany({
+      where: { id: syncJobId, status: { in: ["running", "pending"] } },
+      data: {
+        status: "failed",
+        errorMessage: errMsg,
+        completedAt: new Date()
+      }
+    });
+
+    // Safety net: mark any step still showing 'running' as failed with the error message.
+    // This covers cases where the inline step callback in n8n never fired (e.g. the node
+    // crashed before it could send the callback).
+    const currentJob = await (prisma as any).ragKbSyncJob.findUnique({
+      where: { id: syncJobId },
+      select: { stepsJson: true }
+    });
+    if (currentJob?.stepsJson) {
+      const steps = Array.isArray(currentJob.stepsJson) ? currentJob.stepsJson : [];
+      const updatedSteps = steps.map((s: any) =>
+        s.status === "running"
+          ? { ...s, status: "failed", errorMessage: errMsg, completedAt: new Date().toISOString() }
+          : s
+      );
+      await (prisma as any).ragKbSyncJob.update({
+        where: { id: syncJobId },
+        data: { stepsJson: updatedSteps }
+      });
+    }
+
+    logInfo("Sync job marked failed via error handler", { service: "workflow-service", syncJobId, errMsg });
+    return reply.code(200).send({ ok: true, syncJobId });
+  } catch (error) {
+    return reply.code(500).send({ error: "Failed to update sync job", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Auto-fail stale sync jobs that have received no progress callback for 15 minutes.
+// Uses lastProgressAt (set on every n8n callback) falling back to createdAt for jobs
+// that never sent a single callback (e.g. n8n crashed at startup).
+async function sweepStaleJobs(): Promise<void> {
+  const staleThresholdMs = 15 * 60 * 1000; // 15 minutes
+  const staleThresholdDate = new Date(Date.now() - staleThresholdMs);
+  try {
+    const activeJobs = await (prisma as any).ragKbSyncJob.findMany({
+      where: { status: { in: ["running", "pending"] } },
+      select: { id: true, lastProgressAt: true, createdAt: true }
+    });
+    const staleIds = activeJobs
+      .filter((j: any) => (j.lastProgressAt ?? j.createdAt) <= staleThresholdDate)
+      .map((j: any) => j.id);
+    if (staleIds.length > 0) {
+      await (prisma as any).ragKbSyncJob.updateMany({
+        where: { id: { in: staleIds } },
+        data: {
+          status: "failed",
+          errorMessage: "Sync timed out — no progress received for 15 minutes. Please retry.",
+          completedAt: new Date()
+        }
+      });
+    }
+  } catch {
+    // Ignore errors during sweep
+  }
+}
+
+app.listen({ host: "0.0.0.0", port: config.port }).then(() => {
+  // Sweep stale jobs every 30 seconds for fast failure feedback
+  setInterval(() => {
+    sweepStaleJobs().catch(() => undefined);
+  }, 30_000);
+  // Run once on startup after 10 seconds
+  setTimeout(() => {
+    sweepStaleJobs().catch(() => undefined);
+  }, 10_000);
+}).catch((error) => {
   process.stderr.write(`[workflow-service] failed to start: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);
 });

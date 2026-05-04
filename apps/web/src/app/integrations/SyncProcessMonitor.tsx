@@ -85,6 +85,20 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
   const visible = hasAnyLatest || showForHistory;
 
   const pollActive = Boolean(effectiveJob && isActiveSyncStatus(effectiveJob.status));
+
+  // Auto-switch monitor to whichever KB just started an active sync.
+  // This means clicking Sync on any KB immediately shows its progress here.
+  const anyActiveSyncKbId = useMemo(
+    () => integrations.find((i) => i.latestSyncJob && isActiveSyncStatus(i.latestSyncJob.status))?.id ?? null,
+    [integrations]
+  );
+  useEffect(() => {
+    if (anyActiveSyncKbId && anyActiveSyncKbId !== kbId) {
+      setKbId(anyActiveSyncKbId);
+      setSelectedHistoryJobId("latest");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [anyActiveSyncKbId]);
   const viewingJobId = effectiveJob?.id ?? null;
 
   useEffect(() => {
@@ -116,38 +130,8 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
   const filesProcessed = effectiveJob?.filesProcessed ?? 0;
   const progressPct = filesTotal > 0 ? Math.min(100, Math.round((filesProcessed / filesTotal) * 100)) : 0;
 
-  // Check if ANY integration currently has an active sync (for the background banner)
-  const anyActiveSyncKbId = integrations.find((i) => {
-    const job = i.latestSyncJob;
-    return job && isActiveSyncStatus(job.status);
-  })?.id ?? null;
-
-  // If the currently viewed KB is not the one with an active sync,
-  // and the monitor is showing a different (non-active) KB, show a banner.
-  const backgroundSyncRunning = anyActiveSyncKbId !== null && anyActiveSyncKbId !== kbId;
-  const backgroundSyncKb = backgroundSyncRunning
-    ? integrations.find((i) => i.id === anyActiveSyncKbId) ?? null
-    : null;
-
   return (
     <section className="integrations-panel ops-sync-monitor">
-      {/* Banner: a sync is running in background on a different KB */}
-      {backgroundSyncRunning && backgroundSyncKb ? (
-        <div className="ops-bg-sync-banner">
-          <span className="ops-bg-sync-spinner">🔄</span>
-          <span>
-            Sync running in background for <strong>{backgroundSyncKb.name}</strong>
-            {backgroundSyncKb.projectName ? ` (${backgroundSyncKb.projectName})` : ""} —
-            <button
-              type="button"
-              className="ops-bg-sync-switch-btn"
-              onClick={() => { setKbId(anyActiveSyncKbId); setSelectedHistoryJobId("latest"); }}
-            >
-              Switch to view progress
-            </button>
-          </span>
-        </div>
-      ) : null}
 
       <div className="integrations-panel-header ops-sync-monitor-header">
         <div>
@@ -237,6 +221,7 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
               // Detect smart-sync / cleanup operation type for visual differentiation
               const isCleanupStep = step.logStepName.startsWith("cleanup_") || step.task.startsWith("Cleanup:");
               const isIndexStep = step.logStepName.startsWith("index_path_") || step.task.startsWith("Index:");
+              const isDiffStep = step.logStepName === "calculate_diff" || step.task.startsWith("Calculating Diff");
               const isProjectNameStep = step.logStepName === "update_project_name";
 
               return (
@@ -244,6 +229,8 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
                   <td>
                     <div className="ops-sync-task-cell">
                       <div className="ops-sync-task-name-row">
+                        {isDiffStep ? <span className="ops-step-op-badge ops-step-op-index">🔍 Compare</span> : null}
+                        {step.logStepName === "skip_sync" ? <span className="ops-step-op-badge ops-step-op-meta">⏩ Skip</span> : null}
                         {isCleanupStep ? <span className="ops-step-op-badge ops-step-op-cleanup">🗑 Cleanup</span> : null}
                         {isIndexStep ? <span className="ops-step-op-badge ops-step-op-index">📥 Index</span> : null}
                         {isProjectNameStep ? <span className="ops-step-op-badge ops-step-op-meta">🏷 Metadata</span> : null}

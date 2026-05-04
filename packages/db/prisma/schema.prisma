@@ -38,9 +38,10 @@ model RagKnowledgeBase {
   // Document source configuration (non-secret — credentials go in Vault)
   sourceType    String   // "github" | "gitlab" | "googledrive" | "web" | "upload"
   sourceUrl     String   // Repo URL, Drive folder URL, web URL, or "manual"
-  sourceBranch  String?  // For git sources: "main", "master"
-  sourcePath    String?  // Optional subfolder filter: "docs/"
-  syncSchedule  String?  // Cron expression or null (manual only). e.g. "0 */6 * * *"
+  sourceBranch  String?   // For git sources: "main", "master"
+  sourcePath    String?   // Optional subfolder filter: "docs/" (legacy, kept for compat)
+  sourcePaths   String[]  @default([]) // Array of subfolder filters (e.g. ["docs/operations", "docs/architecture"])
+  syncSchedule  String?   // Cron expression or null (manual only). e.g. "0 */6 * * *"
 
   // Dify app config (non-secret — API key goes in Vault)
   difyAppUrl    String   @default("http://dify-api:5001")
@@ -61,6 +62,7 @@ model RagKnowledgeBase {
   syncJobs      RagKbSyncJob[]
   deployments   RagChannelDeployment[]
   shares        RagKbShare[]           // Users this KB is shared with
+  trackedFiles  RagKbFileTracker[]     // Files successfully synced to Dify
 
   @@index([ownerId])
   @@index([isDefault])
@@ -109,6 +111,23 @@ model RagKnowledgeBaseConfig {
   @@index([knowledgeBaseId])
 }
 
+// Tracks individual files that have been successfully synced to Dify.
+// Used for incremental syncing (skip unchanged, update changed, delete removed).
+model RagKbFileTracker {
+  id                String           @id @default(cuid())
+  knowledgeBaseId   String
+  knowledgeBase     RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  filePath          String           // Path in the repository (e.g. "docs/operations/runbook.md")
+  fileSha           String           // Git blob SHA (to detect modifications)
+  difyDocumentId    String           // The document ID in Dify (to perform update_by_text or delete)
+
+  syncedAt          DateTime         @default(now())
+
+  @@unique([knowledgeBaseId, filePath])
+  @@index([knowledgeBaseId])
+}
+
 // Tracks each document sync job — used to show progress in the UI.
 // Created when a sync is triggered; updated by n8n webhook callbacks.
 model RagKbSyncJob {
@@ -138,6 +157,7 @@ model RagKbSyncJob {
   startedAt         DateTime?
   completedAt       DateTime?
   createdAt         DateTime         @default(now())
+  lastProgressAt    DateTime?
 
   @@index([knowledgeBaseId, createdAt])
   @@index([status])
