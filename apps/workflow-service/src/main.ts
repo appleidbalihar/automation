@@ -223,6 +223,24 @@ function supportedDocumentPath(path: string): boolean {
   return Boolean(ext && ["md", "markdown", "txt", "html", "htm", "xml", "csv", "pdf", "docx", "xlsx", "xls", "pptx", "ppt", "eml", "msg", "epub", "rst", "mdx"].includes(ext));
 }
 
+function normalizeSourcePath(value: unknown): string | null {
+  const normalized = String(value ?? "").trim().replace(/^\/+|\/+$/g, "");
+  return normalized || null;
+}
+
+function normalizeSourcePaths(sourcePaths: unknown, fallbackSourcePath?: unknown): string[] {
+  const rawPaths = Array.isArray(sourcePaths) ? sourcePaths : fallbackSourcePath ? [fallbackSourcePath] : [];
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const raw of rawPaths) {
+    const path = normalizeSourcePath(raw);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    normalized.push(path);
+  }
+  return normalized;
+}
+
 function sourceAccessError(sourceType: string, status: number, details: string): string {
   const suffix = details ? ` Provider response: ${details.slice(0, 240)}` : "";
   if (status === 401 || status === 403 || status === 404) {
@@ -235,6 +253,7 @@ async function preflightGitHubSource(input: {
   sourceUrl: string;
   sourceBranch: string;
   sourcePath: string;
+  sourcePaths?: string[];
   token?: string;
 }): Promise<number> {
   const match = input.sourceUrl.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
@@ -255,10 +274,9 @@ async function preflightGitHubSource(input: {
     throw new Error(sourceAccessError("GitHub", response.status, await response.text().catch(() => "")));
   }
   const payload = (await response.json()) as { tree?: Array<{ path?: string; type?: string }> };
-  const basePath = input.sourcePath.replace(/^\/+|\/+$/g, "");
   return (payload.tree ?? []).filter((item) => {
     const path = String(item.path ?? "");
-    return item.type === "blob" && supportedDocumentPath(path) && (!basePath || path.startsWith(basePath));
+    return item.type === "blob" && supportedDocumentPath(path) && matchesSourcePaths(path, input.sourcePath, input.sourcePaths ?? []);
   }).length;
 }
 
@@ -266,13 +284,13 @@ async function preflightGitLabSource(input: {
   sourceUrl: string;
   sourceBranch: string;
   sourcePath: string;
+  sourcePaths?: string[];
   token?: string;
 }): Promise<number> {
   const match = input.sourceUrl.match(/gitlab\.com\/([^?#]+?)(?:\/-\/.*)?$/i);
   if (!match) throw new Error("Invalid GitLab repository URL");
   const projectPath = match[1].replace(/\.git$/i, "").replace(/\/+$/g, "");
   const encodedProjectPath = encodeURIComponent(projectPath);
-  const basePath = input.sourcePath.replace(/^\/+|\/+$/g, "");
   let page = 1;
   let total = 0;
 
@@ -296,7 +314,7 @@ async function preflightGitLabSource(input: {
     const files = (await response.json()) as Array<{ path?: string; type?: string }>;
     total += files.filter((item) => {
       const path = String(item.path ?? "");
-      return item.type === "blob" && supportedDocumentPath(path) && (!basePath || path.startsWith(basePath));
+      return item.type === "blob" && supportedDocumentPath(path) && matchesSourcePaths(path, input.sourcePath, input.sourcePaths ?? []);
     }).length;
 
     const nextPage = response.headers.get("x-next-page");
@@ -314,6 +332,7 @@ async function preflightSourceDocumentCount(
     sourceUrl: string | null;
     sourceBranch: string | null;
     sourcePath: string | null;
+    sourcePaths?: string[] | null;
   },
   sourceSecrets: Record<string, unknown>
 ): Promise<number | null> {
@@ -322,12 +341,14 @@ async function preflightSourceDocumentCount(
   if (!sourceUrl) return null;
   const sourceBranch = nonEmptyString(kb.sourceBranch) ?? "main";
   const sourcePath = String(kb.sourcePath ?? "").trim();
+  const sourcePaths = normalizeSourcePaths(kb.sourcePaths, kb.sourcePath);
 
   if (sourceType === "github") {
     return preflightGitHubSource({
       sourceUrl,
       sourceBranch,
       sourcePath,
+      sourcePaths,
       token: nonEmptyString(sourceSecrets.github_token)
     });
   }
@@ -336,6 +357,7 @@ async function preflightSourceDocumentCount(
       sourceUrl,
       sourceBranch,
       sourcePath,
+      sourcePaths,
       token: nonEmptyString(sourceSecrets.gitlab_token)
     });
   }
@@ -738,10 +760,16 @@ async function configureDifyApp(session: DifyConsoleSession, appId: string, data
       },
       prompt_type: "simple",
       pre_prompt:
-        "You are Operations AI. Answer using the connected knowledge source when it is relevant. " +
-        "If the answer is not present in the user's configured documents, say what is missing and suggest the next operational step.",
+        "You are Operations AI, an expert assistant that answers questions using the connected knowledge base documents.\n\n" +
+        "Instructions:\n" +
+        "1. Base every answer on the retrieved document chunks provided in context. Do not invent facts.\n" +
+        "2. For questions about Docker containers or services, look for service names, port numbers, and purpose descriptions in the chunks.\n" +
+        "3. Database tables (PlatformLog, RagKnowledgeBase, etc.) are DIFFERENT from Docker containers — do not confuse them.\n" +
+        "4. For external documents (PDFs, DOCX, XLSX, PPTX, CSV, HTML, or any uploaded file): extract and quote the relevant facts directly from the retrieved chunks, even if the chunk is not perfectly structured.\n" +
+        "5. Always cite which document name your answer comes from.\n" +
+        "6. If the exact answer is not present in the retrieved chunks, clearly state what is missing and suggest syncing additional source paths or adding a companion index document for that file.",
       dataset_configs: {
-        retrieval_model: "single",
+        retrieval_model: "multiple",
         datasets: {
           strategy: "router",
           datasets: [
@@ -1949,7 +1977,9 @@ async function buildIntegrationResponse(
     nonEmptyString(sourceSecrets.gdrive_token) ? "pat" : null
   );
 
-  const oauthAppConfigured = !!nonEmptyString(sourceSecrets.oauth_client_id);
+  const oauthClientId = nonEmptyString(sourceSecrets.oauth_client_id);
+  const oauthAppConfigured = !!oauthClientId;
+  const oauthClientIdLast4 = oauthClientId ? oauthClientId.slice(-4) : null;
 
   return {
     id: kb.id,
@@ -1972,7 +2002,8 @@ async function buildIntegrationResponse(
     latestSyncJob: Array.isArray(kb.syncJobs) ? kb.syncJobs[0] ?? null : null,
     config: kb.config ?? null,
     authMethod,
-    oauthAppConfigured
+    oauthAppConfigured,
+    oauthClientIdLast4
   };
 }
 
@@ -2116,7 +2147,8 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
         sourceType: kb.sourceType,
         sourceUrl: kb.sourceUrl,
         sourceBranch: kb.sourceBranch,
-        sourcePath: kb.sourcePath
+        sourcePath: kb.sourcePath,
+        sourcePaths: (kb as any).sourcePaths ?? []
       },
       sourceSecrets
     );
@@ -2347,6 +2379,7 @@ app.post("/rag/integrations", async (request, reply) => {
 
   const sourceSecrets = buildSourceSecretPayload(sourceType, body.credentials);
   const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
+  const sourcePaths = normalizeSourcePaths(body.sourcePaths, body.sourcePath);
 
   try {
     const kb = await (prisma as any).ragKnowledgeBase.create({
@@ -2356,7 +2389,8 @@ app.post("/rag/integrations", async (request, reply) => {
         sourceType,
         sourceUrl,
         sourceBranch: body.sourceBranch ?? null,
-        sourcePath: body.sourcePath ?? null,
+        sourcePath: sourcePaths[0] ?? null,
+        sourcePaths,
         syncSchedule: body.syncSchedule ?? null,
         difyAppUrl: defaults.difyAppUrl,
         ownerId: userId,
@@ -2436,6 +2470,7 @@ app.patch("/rag/integrations/:id", async (request, reply) => {
     sourceUrl?: string;
     sourceBranch?: string;
     sourcePath?: string;
+    sourcePaths?: string[];
     syncSchedule?: string;
     setDefault?: boolean;
     credentials?: Record<string, unknown>;
@@ -2454,6 +2489,10 @@ app.patch("/rag/integrations/:id", async (request, reply) => {
   if (!existingKb) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
 
   try {
+    const pathUpdate =
+      body.sourcePaths !== undefined || body.sourcePath !== undefined
+        ? normalizeSourcePaths(body.sourcePaths, body.sourcePath)
+        : null;
     const updatedKb = await (prisma as any).ragKnowledgeBase.update({
       where: { id },
       data: {
@@ -2461,7 +2500,7 @@ app.patch("/rag/integrations/:id", async (request, reply) => {
         ...(body.description !== undefined ? { description: body.description || null } : {}),
         ...(body.sourceUrl !== undefined ? { sourceUrl: body.sourceUrl } : {}),
         ...(body.sourceBranch !== undefined ? { sourceBranch: body.sourceBranch || null } : {}),
-        ...(body.sourcePath !== undefined ? { sourcePath: body.sourcePath || null } : {}),
+        ...(pathUpdate ? { sourcePath: pathUpdate[0] ?? null, sourcePaths: pathUpdate } : {}),
         ...(body.syncSchedule !== undefined ? { syncSchedule: body.syncSchedule || null } : {})
       },
       include: {
@@ -2500,7 +2539,8 @@ app.patch("/rag/integrations/:id", async (request, reply) => {
               sourceType: String(updatedKb.sourceType ?? ""),
               sourceUrl: String(updatedKb.sourceUrl ?? ""),
               sourceBranch: String(updatedKb.sourceBranch ?? ""),
-              sourcePath: String(updatedKb.sourcePath ?? "")
+              sourcePath: String(updatedKb.sourcePath ?? ""),
+              sourcePaths: (updatedKb as any).sourcePaths ?? []
             },
             mergedSecrets
           );
@@ -2648,6 +2688,7 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
 
   try {
     const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
+    const sourcePaths = normalizeSourcePaths(body.sourcePaths, body.sourcePath);
     // 1. Create the DB record (no API key stored here)
     const kb = await (prisma as any).$transaction(async (tx: typeof prisma) => {
       if (body.isDefault) {
@@ -2666,8 +2707,8 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
           sourceType,
           sourceUrl,
           sourceBranch: body.sourceBranch ?? null,
-          sourcePath: body.sourcePath ?? null,
-          sourcePaths: Array.isArray(body.sourcePaths) ? body.sourcePaths : (body.sourcePath ? [body.sourcePath] : []),
+          sourcePath: sourcePaths[0] ?? null,
+          sourcePaths,
           syncSchedule: body.syncSchedule ?? null,
           difyAppUrl: body.difyAppUrl ?? defaults.difyAppUrl,
           ownerId: userId,
@@ -2891,17 +2932,29 @@ app.post("/rag/knowledge-bases/:id/sync-cancel", async (request, reply) => {
 
 // Helper to evaluate if a path matches the configured sourcePaths
 function matchesSourcePaths(path: string, basePathStr: string | null, sourcePathsArr: string[]): boolean {
-  if (!sourcePathsArr || sourcePathsArr.length === 0) {
+  const normalizedPaths = normalizeSourcePaths(sourcePathsArr, basePathStr);
+  if (normalizedPaths.length === 0) {
     if (!basePathStr) return true;
-    const basePath = basePathStr.replace(/^\/+|\/+$/g, "");
+    const basePath = normalizeSourcePath(basePathStr) ?? "";
     return !basePath || path.startsWith(basePath + "/") || path === basePath;
   }
 
-  return sourcePathsArr.some((p) => {
-    const cleanPath = p.replace(/^\/+|\/+$/g, "");
+  return normalizedPaths.some((cleanPath) => {
     if (!cleanPath) return true;
     return path.startsWith(cleanPath + "/") || path === cleanPath;
   });
+}
+
+function folderDiffSummary(files: Array<{ path: string; isUpdate?: boolean; skipped?: boolean }>, sourcePathsArr: string[], basePathStr: string | null): string {
+  const normalizedPaths = normalizeSourcePaths(sourcePathsArr, basePathStr);
+  const labels = normalizedPaths.length > 0 ? normalizedPaths : ["<all>"];
+  return labels.map((label) => {
+    const matching = files.filter((file) => label === "<all>" || file.path === label || file.path.startsWith(label + "/"));
+    const uploads = matching.filter((file) => !file.skipped).length;
+    const updates = matching.filter((file) => file.isUpdate && !file.skipped).length;
+    const skipped = matching.filter((file) => file.skipped).length;
+    return `${label}: ${uploads} to sync (${updates} updates), ${skipped} skipped`;
+  }).join("; ");
 }
 
 // Calculate the sync diff, clear obsolete files from Dify and DB, return list of files to upload
@@ -2931,7 +2984,7 @@ app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
     // 1. Filter valid current files from Git tree
     const tree = body.tree ?? [];
     const basePathStr = kb.sourcePath;
-    const sourcePathsArr = kb.sourcePaths ?? [];
+    const sourcePathsArr = normalizeSourcePaths(kb.sourcePaths, basePathStr);
 
     const validCurrentFiles = new Map<string, { path: string; sha: string }>();
 
@@ -2954,9 +3007,57 @@ app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
     });
 
     // 2. Fetch tracked files from database
-    const trackedFiles = await (prisma as any).ragKbFileTracker.findMany({
+    let trackedFiles = await (prisma as any).ragKbFileTracker.findMany({
       where: { knowledgeBaseId: id }
     });
+    const trackedByPath = new Map<string, any>(trackedFiles.map((file: any) => [file.filePath, file]));
+
+    // Recover older uploads: if Dify already has a same-path document but the tracker
+    // missed it, backfill the current SHA and skip a duplicate upload.
+    const difyDocuments = await listDifyDatasetDocuments(String(kb.difyAppUrl ?? ""), difyDatasetId, datasetApiKey);
+    const difyDocumentsByName = new Map(
+      difyDocuments
+        .filter((doc) => !doc.archived)
+        .map((doc) => [String(doc.name ?? ""), doc] as const)
+        .filter(([name]) => name.length > 0)
+    );
+    const recoveredFiles: Array<{ path: string; isUpdate: false; skipped: true }> = [];
+    for (const [path, current] of validCurrentFiles.entries()) {
+      if (trackedByPath.has(path)) continue;
+      const existingDifyDocument = difyDocumentsByName.get(path);
+      if (!existingDifyDocument?.id) continue;
+      const recovered = await (prisma as any).ragKbFileTracker.upsert({
+        where: {
+          knowledgeBaseId_filePath: {
+            knowledgeBaseId: id,
+            filePath: path
+          }
+        },
+        create: {
+          knowledgeBaseId: id,
+          filePath: path,
+          fileSha: current.sha,
+          difyDocumentId: existingDifyDocument.id
+        },
+        update: {
+          fileSha: current.sha,
+          difyDocumentId: existingDifyDocument.id,
+          syncedAt: new Date()
+        }
+      });
+      trackedByPath.set(path, recovered);
+      recoveredFiles.push({ path, isUpdate: false, skipped: true });
+    }
+    if (recoveredFiles.length > 0) {
+      trackedFiles = [...trackedByPath.values()];
+      await updateSyncJobStep(body.syncJobId, {
+        task: "Recover Existing Dify Documents",
+        stepName: "recover_existing_dify_documents",
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        message: `Backfilled tracker for ${recoveredFiles.length} existing Dify documents; ${folderDiffSummary(recoveredFiles, sourcePathsArr, basePathStr)}`
+      });
+    }
 
     // 3. Compare to find obsolete files (in tracker but not in valid current files)
     const obsoleteFiles = trackedFiles.filter((tracked: any) => !validCurrentFiles.has(tracked.filePath));
@@ -2994,7 +3095,7 @@ app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
     const filesToUpload: Array<{ path: string; sha: string; difyDocumentId?: string; isUpdate: boolean }> = [];
 
     for (const [path, current] of validCurrentFiles.entries()) {
-      const tracked = trackedFiles.find((t: any) => t.filePath === path);
+      const tracked = trackedByPath.get(path);
       if (!tracked) {
         // New file
         filesToUpload.push({ path: current.path, sha: current.sha, isUpdate: false });
@@ -3009,7 +3110,7 @@ app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
       stepName: "calculate_diff",
       status: "completed",
       completedAt: new Date().toISOString(),
-      message: `Found ${filesToUpload.length} files to sync (${filesToUpload.filter(f => f.isUpdate).length} updates, ${filesToUpload.filter(f => !f.isUpdate).length} new)`
+      message: `Found ${filesToUpload.length} files to sync (${filesToUpload.filter(f => f.isUpdate).length} updates, ${filesToUpload.filter(f => !f.isUpdate).length} new). ${folderDiffSummary([...filesToUpload, ...recoveredFiles], sourcePathsArr, basePathStr)}`
     });
 
     // Update job file totals
@@ -3176,6 +3277,9 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
     };
     logMessage?: string;
     logSeverity?: string;
+    difyDocumentId?: string;
+    filePath?: string;
+    fileSha?: string;
   };
   if (!body.syncJobId) return reply.code(400).send({ error: "SYNC_JOB_ID_REQUIRED" });
   try {
@@ -3189,36 +3293,33 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
     if (String(existingJob.status ?? "") === "completed" && body.status !== "completed") {
       return { updated: false, ignored: "SYNC_ALREADY_COMPLETED" };
     }
-    // Handle successful file sync - populate file tracker
-    if (body.step?.stepName === "upload_files" && body.step.status === "completed") {
-       // if we have specific success records attached to body.step we'd process them here,
-       // but typically the n8n webhook reports progress per file or at end.
-    }
+    const uploadStepName = String(body.step?.stepName ?? "");
+    const uploadErrored = Boolean(body.step?.errorMessage);
+    const successfulUploadProgress =
+      (uploadStepName === "upload_file_success" || uploadStepName === "upload_files") &&
+      !uploadErrored &&
+      Boolean(body.difyDocumentId && body.filePath && body.fileSha);
 
-    if (body.status === "running" && body.step?.stepName === "upload_file_success") {
-        // Custom payload from n8n when a file successfully uploads
-        const payload = body as any;
-        if (payload.difyDocumentId && payload.filePath && payload.fileSha) {
-             await (prisma as any).ragKbFileTracker.upsert({
-                 where: {
-                     knowledgeBaseId_filePath: {
-                         knowledgeBaseId: existingJob.knowledgeBaseId,
-                         filePath: payload.filePath
-                     }
-                 },
-                 create: {
-                     knowledgeBaseId: existingJob.knowledgeBaseId,
-                     filePath: payload.filePath,
-                     fileSha: payload.fileSha,
-                     difyDocumentId: payload.difyDocumentId
-                 },
-                 update: {
-                     fileSha: payload.fileSha,
-                     difyDocumentId: payload.difyDocumentId,
-                     syncedAt: new Date()
-                 }
-             });
+    if (successfulUploadProgress) {
+      await (prisma as any).ragKbFileTracker.upsert({
+        where: {
+          knowledgeBaseId_filePath: {
+            knowledgeBaseId: existingJob.knowledgeBaseId,
+            filePath: body.filePath!
+          }
+        },
+        create: {
+          knowledgeBaseId: existingJob.knowledgeBaseId,
+          filePath: body.filePath!,
+          fileSha: body.fileSha!,
+          difyDocumentId: body.difyDocumentId!
+        },
+        update: {
+          fileSha: body.fileSha!,
+          difyDocumentId: body.difyDocumentId!,
+          syncedAt: new Date()
         }
+      });
     }
 
     let failedDocuments = normalizeFailedDifyDocuments(body.step?.failedDocuments);

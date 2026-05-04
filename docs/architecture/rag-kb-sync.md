@@ -14,22 +14,47 @@ RAG (Retrieval-Augmented Generation) works by:
 
 ---
 
-## Solution 1: Companion Index Documents (for PDFs and External Docs)
+## Supported File Types
 
-When you add an external PDF or document that **you cannot modify**, create a companion `.md` file in the same source folder. This companion doc acts as a **search-friendly index** that guides the RAG retriever to the right PDF and section.
+The platform indexes all of these file types from your source (GitHub, GitLab, Google Drive, or upload):
+
+| Extension | Format |
+|-----------|--------|
+| `.md`, `.markdown`, `.mdx`, `.rst` | Markdown / reStructuredText |
+| `.txt` | Plain text |
+| `.html`, `.htm` | Web pages |
+| `.xml` | XML |
+| `.csv` | CSV spreadsheets |
+| `.pdf` | PDF documents |
+| `.docx` | Word documents |
+| `.xlsx`, `.xls` | Excel spreadsheets |
+| `.pptx`, `.ppt` | PowerPoint presentations |
+| `.eml`, `.msg` | Email files |
+| `.epub` | eBooks |
+
+**The chunking problem applies to ALL of these** — not just PDFs. A poorly structured Excel table, a scanned PDF, a PowerPoint with bullet-only slides, or a DOCX with no headings all produce low-quality chunks that confuse the retriever.
+
+---
+
+## Solution 1: Companion Index Documents (for Any External File You Cannot Modify)
+
+When you add an external file (PDF, DOCX, XLSX, PPTX, CSV, HTML, or any other format) that **you cannot modify**, create a companion `.md` file in the same source folder. This companion doc acts as a **search-friendly index** that guides the RAG retriever to the right file and section.
+
+**Why this works:** Markdown is the best format for RAG retrieval. The companion file gets chunked cleanly while the original file's raw chunks fill in the actual content details.
 
 ### Companion Document Template
 
-Create a file named `<pdf-name>-index.md` alongside your PDF:
+Create a file named `<filename>-index.md` alongside your file:
 
 ```markdown
 # Index: [Document Title]
 
 ## Document Reference
-- **File**: [filename.pdf]
+- **File**: [filename.ext] (e.g. manual.pdf, report.xlsx, slides.pptx)
 - **Source**: [e.g. GitHub repo path, or "uploaded manually"]
 - **Version**: [version or date]
 - **Purpose**: [one-sentence description of what this document covers]
+- **File type notes**: [e.g. "This is a scanned PDF — text quality may vary" or "This Excel has 3 sheets: Summary, Data, Charts"]
 
 ## Topics Covered in This Document
 
@@ -131,13 +156,19 @@ This gives the LLM more context per retrieved chunk.
 
 ---
 
-## Solution 3: Structured Dify System Prompt (Already Applied)
+## Solution 3: Improved Dify App System Prompt (Applied in Code)
 
-The Dify app system prompt has been updated to:
-1. Cite which document each answer comes from
-2. Distinguish Docker containers from database tables
-3. Extract facts even from imperfectly structured PDF chunks
-4. Tell the user when more source paths need to be synced
+**Where it is:** `apps/workflow-service/src/main.ts` → `configureDifyApp()` function → `pre_prompt` field.
+
+Every time a new knowledge base is provisioned (created or re-synced), the platform sets this system prompt on the Dify chat app. This is the source of truth — changing it here affects all new KBs automatically.
+
+**The prompt instructs the LLM to:**
+1. Base every answer on retrieved chunks — never invent facts
+2. For Docker container questions: look for service names, ports, and purpose descriptions
+3. Distinguish database tables from Docker containers (a common confusion)
+4. For **any external file** (PDF, DOCX, XLSX, PPTX, CSV, HTML, etc.): extract and quote facts directly from retrieved chunks even if the chunk is not perfectly structured
+5. Always cite which document the answer comes from
+6. When the answer is not in the chunks: tell the user what is missing and suggest syncing more source paths or adding a companion index document
 
 ---
 
