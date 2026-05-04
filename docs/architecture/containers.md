@@ -2,6 +2,37 @@
 
 This reference matches the current `docker-compose.yml`.
 
+## Container Summary
+
+The platform runs the following Docker containers:
+
+| Container | Category | Port(s) | Purpose |
+|-----------|----------|---------|---------|
+| `web` | App | 3000 | Next.js platform UI |
+| `web-ingress` | App | host 3443 | HTTPS ingress (Nginx) |
+| `api-gateway` | App | 4000 | JWT/RBAC API gateway (Fastify) |
+| `workflow-service` | App | 4001 | RAG orchestration, Dify/n8n integration |
+| `logging-service` | App | 4005 | Log ingest and query |
+| `postgres` | Infra | 5432 | Platform database + pgvector |
+| `redis` | Infra | 6379 | Cache and nonce store |
+| `rabbitmq` | Infra | 5671, 15671 | AMQPS event bus |
+| `opensearch` | Infra | 9200, 9600 | Log search backend |
+| `minio` | Infra | 9000, 9001 | S3-compatible object storage |
+| `keycloak` | Infra | 8443 | Identity provider, JWT issuer |
+| `vault` | Infra | 8200 | PKI CA and secret storage |
+| `dify-api` | Dify | 5001 | Dify API for datasets/apps/chat |
+| `dify-worker` | Dify | internal | Async indexing worker |
+| `dify-web` | Dify | host 3002 | Dify admin console |
+| `dify-sandbox` | Dify | internal | Code execution sandbox |
+| `dify-db` | Dify | internal | Dify application database |
+| `dify-redis` | Dify | internal | Dify worker queue/cache |
+| `n8n` | n8n | host 5679 | Document sync workflow runner |
+| `n8n-db` | n8n | internal | n8n state database |
+| `vault-bootstrap` | Sidecar | — | Vault init/unseal job |
+| `db-migrate` | Sidecar | — | Prisma migration job |
+| `cert-rotation-controller` | Sidecar | — | TLS cert rotation controller |
+| `*-vault-agent` | Sidecar | — | Per-service Vault agents for TLS certs |
+
 ## Application Containers
 
 ### `web`
