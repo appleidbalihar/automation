@@ -346,8 +346,8 @@ services:
       PORT: 4000
       SERVICE_NAME: api-gateway
       PLATFORM_OAUTH_SECRET: ${PLATFORM_OAUTH_SECRET:-change-me-in-production}
-      OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/ap}
-      OAUTH_POST_CONNECT_REDIRECT: ${OAUTH_POST_CONNECT_REDIRECT:-https://dev.eclassmanager.com/integrations}
+      OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/rapidrag/connect}
+      OAUTH_POST_CONNECT_REDIRECT: ${OAUTH_POST_CONNECT_REDIRECT:-https://dev.eclassmanager.com/rapidrag/integrations}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
       GITLAB_CLIENT_ID: ${GITLAB_CLIENT_ID:-}
@@ -374,8 +374,8 @@ services:
       dockerfile: infra/docker/Dockerfile.web
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${WEB_NEXT_PUBLIC_API_BASE_URL:-}
-      NEXT_PUBLIC_PLATFORM_URL: ${PLATFORM_URL:-https://dev.eclassmanager.com}
-      NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/ap}
+      NEXT_PUBLIC_PLATFORM_URL: ${NEXT_PUBLIC_PLATFORM_URL:-https://dev.eclassmanager.com/rapidrag}
+      NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/rapidrag/connect}
       WEB_INTERNAL_API_BASE_URL: ${WEB_INTERNAL_API_BASE_URL:-https://api-gateway:4000}
       PORT: 3000
       KEYCLOAK_URL: ${WEB_KEYCLOAK_URL:-https://keycloak:8443}

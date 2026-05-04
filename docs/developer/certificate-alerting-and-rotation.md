@@ -27,7 +27,8 @@
   - `cert.rotation.completed`
   - `cert.webhook.delivery.failed`
 - Writes certificate control logs to logging-service with:
-  - `orderId=cert-control-global`
+  - `payload.orderId=cert-control-global`
+  - generated `correlationId`
   - `source=cert-control`
 
 ## Manual/API trigger contract
@@ -35,4 +36,3 @@ Queued line format in `/rotation-control/requests.jsonl`:
 `requestId|service|trigger|requestedBy|queuedAt|target1,target2,...`
 
 The rotation controller consumes this queue and restarts mapped compose services (usually `*-vault-agent`, plus selected infra service where needed).
-

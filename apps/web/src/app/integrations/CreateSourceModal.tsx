@@ -9,8 +9,12 @@ type AuthMode = "choose" | "oauth" | "pat";
 type OAuthStep = "provider" | "details";
 type Provider = "github" | "gitlab" | "googledrive";
 
-const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.eclassmanager.com").replace(/\/$/, "");
-const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/ap").replace(/\/$/, "");
+// PLATFORM_URL and OAUTH_CALLBACK_BASE are driven by env vars set in .env / .env.production.
+// Fallbacks use the /rapidrag path prefix so they're correct even without env vars.
+// Dev:  NEXT_PUBLIC_PLATFORM_URL=https://dev.eclassmanager.com/rapidrag
+// Prod: NEXT_PUBLIC_PLATFORM_URL=https://theaitools.ca/rapidrag
+const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.eclassmanager.com/rapidrag").replace(/\/$/, "");
+const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/rapidrag/connect").replace(/\/$/, "");
 
 type ProviderMeta = {
   label: string;
@@ -191,8 +195,8 @@ export function CreateSourceModal(props: Props): ReactElement | null {
 
           <div className="ops-oauth-instructions">
             <div className="ops-oauth-setup-section">
-              <strong className="ops-oauth-setup-title">First-time setup — register an OAuth App with {meta.label}</strong>
-              <p className="ops-oauth-setup-note">If your admin has already done this, skip to the form below.</p>
+              <strong className="ops-oauth-setup-title">One-time setup — register your own OAuth App with {meta.label}</strong>
+              <p className="ops-oauth-setup-note">Each user registers their own OAuth App. If you have already done this before, skip to the credentials fields below.</p>
               <ol className="ops-oauth-setup-steps">
                 {meta.setupSteps.map(({ step, text }) => (
                   <li key={step}>{text}</li>
@@ -291,26 +295,34 @@ export function CreateSourceModal(props: Props): ReactElement | null {
             <div className="ops-oauth-app-creds-fields">
               <label>
                 <span>Client ID</span>
+                {/* Use autoComplete="new-password" to prevent ALL browser autofill/password-manager injection.
+                    The name attribute is intentionally generic to avoid browser heuristics. */}
                 <input
+                  id="oauth-app-client-id"
+                  name="oauth-app-client-id"
                   value={appClientId}
                   onChange={(e) => setAppClientId(e.target.value)}
                   placeholder={`${meta.label} Client ID`}
-                  autoComplete="off"
+                  autoComplete="new-password"
+                  data-form-type="other"
                 />
               </label>
               <label>
                 <span>Client Secret</span>
                 <input
+                  id="oauth-app-client-secret"
+                  name="oauth-app-client-secret"
                   type="password"
                   value={appClientSecret}
                   onChange={(e) => setAppClientSecret(e.target.value)}
                   placeholder={`${meta.label} Client Secret`}
-                  autoComplete="off"
+                  autoComplete="new-password"
+                  data-form-type="other"
                 />
               </label>
             </div>
             <p className="ops-oauth-app-creds-note">
-              Already configured by your admin? Leave these blank — the platform will use the existing credentials.
+              Already registered your OAuth App previously? Leave these blank to reuse your existing credentials stored in Vault.
             </p>
           </div>
 

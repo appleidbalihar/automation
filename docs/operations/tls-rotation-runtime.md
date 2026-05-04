@@ -27,7 +27,7 @@
   - `x-security-token: <SECURITY_DIAGNOSTICS_TOKEN>` (if configured)
 - Compose check: `docker compose config`
 - Endpoint checks:
-  - `https://<host-ip>:443` (web ingress)
+  - `https://<host-ip>:3443` (web ingress)
   - `https://<host-ip>:4000/health` (api-gateway)
   - `https://<host-ip>:8443` (keycloak)
 

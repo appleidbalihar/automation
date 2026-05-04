@@ -1,221 +1,116 @@
-# RAG Knowledge Base Sync — Architecture
+# RAG Knowledge Base Sync - Architecture
 
-This document describes the architectural design of the GitHub/GitLab → Dify knowledge-base sync feature: component topology, key design decisions, data model, security boundaries, and polling strategies.
+## Scope
 
----
+This document describes the current source sync architecture for GitHub/GitLab/Google Drive/Web source records into Dify-backed knowledge bases. The active code is in `apps/workflow-service/src/main.ts`, `apps/api-gateway/src/main.ts`, and `apps/web/src/app/integrations/*`.
 
-## Component Diagram
+## Component Flow
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Browser / Operator                                             │
-│  SyncProcessMonitor.tsx                                         │
-│  - Polls sync-status every 3 s while job is active             │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │  JWT Bearer (HTTPS/443 via Nginx)
-                            ▼
-                    ┌───────────────┐
-                    │  api-gateway  │  :4000  (Fastify, mTLS)
-                    │               │
-                    │  - JWT verify │
-                    │  - Sync token │
-                    │    verify     │
-                    └──────┬────────┘
-                           │  mTLS  :4001
-                           ▼
-                    ┌───────────────────┐
-                    │  workflow-service  │  (Fastify, mTLS)
-                    │                   │
-                    │  - Triggers n8n   │
-                    │  - sync-diff      │
-                    │  - sync-progress  │
-                    │  - sync-error-    │
-                    │    handler        │
-                    │  - sweepStaleJobs │
-                    └──────┬────────────┘
-                           │  HTTP POST (webhook)
-                           ▼
-              ┌────────────────────────┐
-              │         n8n            │  :5678
-              │  17-node sync workflow  │
-              └────┬──────────┬────────┘
-                   │          │
-     ┌─────────────┘          └──────────────────┐
-     ▼                                           ▼
-┌──────────────────┐                   ┌─────────────────┐
-│  GitHub / GitLab │                   │  Dify RAG       │
-│  REST API        │                   │  :5001          │
-│  - git trees     │                   │  - create_by_   │
-│  - raw files     │                   │    text/file    │
-└──────────────────┘                   │  - poll index   │
-                                       └─────────────────┘
-                   │
-                   │  X-Rag-Sync-Token (progress callbacks)
-                   └──────────────────────────────────────►
-                                  api-gateway → workflow-service
-                                        │
-                                        ▼
-                                  ┌─────────────┐
-                                  │  PostgreSQL  │
-                                  │  RagKbSyncJob│
-                                  │  RagKbSource │
-                                  │  Path        │
-                                  └─────────────┘
+```text
+Knowledge Connector UI
+  |
+  | POST /gateway/rag/knowledge-bases/:id/sync
+  v
+api-gateway
+  |
+  | proxy to workflow-service
+  v
+workflow-service
+  |
+  | create RagKbSyncJob and trigger n8n webhook
+  v
+n8n workflow
+  |
+  | fetch source tree/files
+  | POST /rag/knowledge-bases/:id/sync-diff
+  | upload/update documents in Dify
+  | POST /rag/knowledge-bases/:id/sync-progress
+  v
+workflow-service updates PostgreSQL
+  |
+  v
+SyncProcessMonitor polls status/history and reads sync-job logs
 ```
 
----
+## Current Data Model
 
-## Design Decisions
+| Model | Role in sync |
+|-------|--------------|
+| `RagKnowledgeBase` | Source URL, source type, branch, `sourcePaths`, Dify dataset reference, owner/default/share relations |
+| `RagKbFileTracker` | One row per indexed file: `filePath`, `fileSha`, `difyDocumentId` |
+| `RagKbSyncJob` | Job status, counters, n8n execution metadata, `stepsJson`, `lastProgressAt` |
+| `PlatformLog` | Sanitized sync log lines queried by `/logs/sync-job` |
 
-### Async webhook with immediate 200 response (Node 1)
-**Decision**: The n8n Webhook Trigger returns HTTP 200 immediately; all 16 remaining nodes run asynchronously.
+Removed/stale name: `RagKbSourcePath` is not current. Use `RagKbFileTracker`.
 
-**Rationale**: Sync jobs can take minutes (large repos, slow Dify indexing). If the webhook held the connection open, workflow-service would time out waiting. The immediate-ack pattern decouples trigger latency from job duration and lets the UI poll for status rather than waiting on the HTTP response.
+## Smart Diff
 
-### continueOnFail on Get Repo File Tree (Node 4)
-**Decision**: The tree-fetch node has `continueOnFail: true` instead of letting n8n's default error routing take over.
+`POST /rag/knowledge-bases/:id/sync-diff` receives a source tree from n8n and returns only files that need work.
 
-**Rationale**: Without `continueOnFail`, an HTTP 401 from GitHub would route directly to the Error Trigger (Node 17), which sends a generic error callback. With `continueOnFail`, execution flows to Node 5 (Handle Tree Error), which can inspect the actual HTTP status code and message and send a human-readable `fetch_file_tree: failed` callback (e.g. `"HTTP 401: Bad credentials"`). This gives operators actionable information in the Sync Process Monitor without needing to inspect n8n logs.
+The workflow-service:
 
-### Smart diff via sync-diff (Nodes 6–7)
-**Decision**: Introduce a backend `sync-diff` endpoint that filters the full git tree to only changed files before any content is fetched or uploaded.
+1. Loads the KB.
+2. Filters to supported document extensions.
+3. Applies `sourcePaths` filters, falling back to legacy `sourcePath` only when needed.
+4. Loads existing `RagKbFileTracker` rows.
+5. Deletes tracker rows and Dify documents that no longer exist in the configured paths.
+6. Returns new files and modified files. Modified files include the previous `difyDocumentId` so n8n can update rather than create where supported.
 
-**Rationale**: A large repository may have thousands of files, but a typical commit touches only a few. Re-uploading every file on every sync would:
-- Waste API quota on Dify's document creation endpoint
-- Cause unnecessary re-indexing delays
-- Accumulate duplicate document versions in the Dify dataset
+Supported extensions in code:
 
-The SHA-based comparison in `RagKbSourcePath` ensures only genuinely new or modified files are processed. If nothing changed, the workflow skips all upload and indexing steps entirely (`skip_sync` path).
-
-### stepName as upsert key in stepsJson
-**Decision**: `RagKbSyncJob.stepsJson` is keyed by `stepName`, so each new callback for the same step overwrites the previous entry.
-
-**Rationale**: The `upload_files` step sends many callbacks during its lifecycle (one per file). Storing every callback as a separate row would require a separate `SyncJobStep` table with pagination. The upsert-by-stepName approach keeps the data model simple: the UI always sees the latest state per named step, and the per-file progress information is carried in the `filesProcessed` counter rather than individual rows. The tradeoff is that detailed per-file history is not retained after the step completes.
-
-### lastProgressAt for stale detection
-**Decision**: Update `lastProgressAt` on every progress callback and sweep for staleness server-side rather than relying on a client-visible timeout.
-
-**Rationale**: Network partitions or n8n crashes can leave jobs in `running` state with no further callbacks arriving. A client-side timeout (in the web UI) would only help the user who happens to have the monitor open. A server-side sweep at 15-minute inactivity marks the job `timed_out` regardless of UI state and unblocks future syncs that may be queued behind a hung job. The 15-minute window is generous enough to cover the 2-minute Dify polling loop plus network variability.
-
-### Separate sync token (not JWT) for n8n callbacks
-**Decision**: n8n uses a pre-shared `X-Rag-Sync-Token` header rather than a Keycloak JWT for its machine-to-machine calls.
-
-**Rationale**: Keycloak JWT issuance requires a registered client with client credentials flow. n8n's HTTP Request nodes do not natively support Keycloak's token-exchange flow without a custom code node. A static pre-shared token (rotatable via Vault KV and `docker compose up -d`) achieves the same protection with no extra complexity. The sync endpoints that accept this token are never exposed to end-user browsers — only n8n's internal network address can reach them.
-
----
-
-## Data Model Overview
-
-### RagKnowledgeBase
-Represents a single configured sync source. Holds the Dify dataset ID and source repo coordinates.
-
-```
-RagKnowledgeBase
-  id             UUID PK
-  name           String
-  isDefault      Boolean
-  difyDatasetId  String          — Dify's internal dataset identifier
-  sourceType     String          — "github" | "gitlab"
-  sourceUrl      String          — e.g. https://github.com/org/repo
-  sourceBranch   String          — e.g. "main"
-  sourcePath     String?         — optional sub-directory filter
-  difyApiUrl     String          — Dify API base URL
+```text
+md, markdown, txt, html, htm, xml, csv, pdf, docx, xlsx, xls,
+pptx, ppt, eml, msg, epub, rst, mdx
 ```
 
-### RagKbSyncJob
-One row per sync execution. Tracks lifecycle from creation through completion or failure.
+## Step Storage
 
-```
-RagKbSyncJob
-  id               UUID PK
-  knowledgeBaseId  UUID FK
-  trigger          String          — "manual" | "scheduled" | "webhook"
-  status           String          — "pending" | "running" | "completed"
-                                  —  "failed" | "timed_out" | "cancelled"
-  filesTotal       Int             — set by sync-diff response
-  filesProcessed   Int             — incremented by per-file callbacks
-  stepsJson        Json            — { [stepName]: StepEntry }
-  errorMessage     String?
-  lastProgressAt   DateTime?       — updated on every callback (stale detection)
-  createdAt        DateTime
-  startedAt        DateTime?
-  completedAt      DateTime?
-```
+`RagKbSyncJob.stepsJson` is an array of step objects. The service upserts by `stepName`: the latest callback for a step replaces the existing object with the same `stepName`.
 
-### RagKbSourcePath
-One row per file in the repo as of the last successful sync. Used exclusively by the smart-diff comparison.
+Common step names:
 
-```
-RagKbSourcePath
-  id               UUID PK
-  knowledgeBaseId  UUID FK
-  filePath         String          — "docs/setup.md" (repo-relative)
-  fileSha          String          — Git blob SHA from last sync
-```
+| Step | Meaning |
+|------|---------|
+| `fetch_file_tree` | Source tree/list retrieval |
+| `calculate_diff` | Backend diff against `RagKbFileTracker` |
+| `cleanup_removed_paths` | Delete obsolete Dify documents and tracker rows |
+| `skip_sync` | No changed files were returned by diff |
+| `upload_files` | Upload or update source files in Dify |
+| `upload_file_success` | Per-file success callback that upserts `RagKbFileTracker` |
+| `dify_indexing` | Dify indexing status/polling |
+| `retry_failed_indexing` | Retry failed Dify documents |
+| `cleanup_dify_documents`, `cleanup_vector_embeddings`, `cleanup_reset_state`, `cleanup_file_tracker` | Full cleanup operation |
 
----
-
-## Security Boundaries
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Public zone (via Nginx :3443)                              │
-│  Browser → JWT Bearer → api-gateway                        │
-│  Endpoints: /rag/knowledge-bases/*, /rag/*/sync-status, …  │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│  Machine-to-machine zone (internal network only)            │
-│  n8n → X-Rag-Sync-Token → api-gateway                      │
-│  Endpoints: /sync-progress, /sync-diff, /sync-error-handler │
-│  NOT reachable via browser (same-origin checks + no CORS)   │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│  Service mesh (mTLS, internal Docker network only)          │
-│  api-gateway ↔ workflow-service ↔ PostgreSQL               │
-│  Vault-issued leaf certs, 72-hour TTL, auto-renew          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Endpoint auth matrix
+## Auth Boundaries
 
 | Endpoint group | Caller | Auth |
 |----------------|--------|------|
-| `/rag/knowledge-bases` (CRUD) | Browser / API client | Keycloak JWT, role `operator+` |
-| `/rag/*/sync` (trigger) | Browser / API client | Keycloak JWT, role `operator+` |
-| `/rag/*/sync-status` | Browser (poll) | Keycloak JWT |
-| `/rag/*/sync-progress` | n8n | `X-Rag-Sync-Token` |
-| `/rag/*/sync-diff` | n8n | `X-Rag-Sync-Token` |
-| `/rag/sync-error-handler` | n8n | `X-Rag-Sync-Token` |
-| `/rag/*/retry-failed-indexing` | Browser | Keycloak JWT, role `operator+` |
+| `/rag/integrations*` | Web UI/API client | JWT role checks in api-gateway |
+| `/rag/knowledge-bases/:id/sync` | Web UI/API client | `admin`, `useradmin`, `operator` |
+| `/rag/knowledge-bases/:id/sync-status` | Web UI/API client | authenticated platform roles |
+| `/rag/knowledge-bases/:id/sync-history` | Web UI/API client | `admin`, `useradmin`, `operator` |
+| `/rag/knowledge-bases/:id/sync-diff` | n8n | sync token |
+| `/rag/knowledge-bases/:id/sync-progress` | n8n | sync token |
+| `/rag/sync-error-handler` | n8n | internal/sync-error flow |
+| `/logs/sync-job` | Web UI | `admin`, `useradmin`, `operator` |
 
----
+n8n callbacks use `X-Rag-Sync-Token` or `X-N8N-Webhook-Token`, checked against `N8N_WEBHOOK_TOKEN`.
 
-## Polling Architecture
+## Polling Model
 
-### Web UI polling (3-second interval)
-`SyncProcessMonitor.tsx` polls `GET /rag/knowledge-bases/:id/sync-status` every 3 seconds while the job status is `running` or `pending`. Polling stops when status transitions to `completed`, `failed`, `timed_out`, or `cancelled`. The 3-second cadence is a balance between UI responsiveness and API load; for large repos with many files, the `filesProcessed` counter updates are visible in near-real-time.
+`SyncProcessMonitor.tsx` polls:
 
-### n8n Dify indexing poll (5-second interval, max 24 attempts)
-Node 15 (Poll Dify Indexing) polls Dify's document status API after upload. Dify's indexing pipeline is asynchronous — documents may take seconds to minutes depending on size and configured chunking strategy. The 5-second interval × 24 attempts gives a 2-minute window, which covers the vast majority of normal indexing scenarios. If indexing does not complete within 2 minutes, the poll exits and the final status reflects whichever documents did or did not finish.
+- `GET /rag/knowledge-bases/:id/sync-status`
+- `GET /rag/knowledge-bases/:id/sync-history`
+- `GET /logs/sync-job?syncJobId=...&stepName=...` for drawer logs
 
-### Why not WebSockets or SSE?
-The sync workflow is orchestrated by n8n (an external service) that pushes callbacks to the API. Bridging those callbacks to long-lived browser connections would require a message bus or SSE proxy layer. Short-interval polling over standard HTTP is simpler to operate, easier to debug, and sufficient for the 3–60 second timescale of sync steps.
+Polling is simple HTTP polling rather than WebSockets/SSE. It matches the n8n callback model and keeps the runtime small.
 
----
+## Failure And Recovery
 
-## Supported File Extensions
-
-The sync-diff filter accepts only these extensions:
-
-| Category | Extensions |
-|----------|-----------|
-| Markdown / text | `.md` `.markdown` `.txt` |
-| Web | `.html` `.htm` `.xml` |
-| Data | `.csv` |
-| Documents | `.pdf` `.docx` `.epub` `.eml` `.msg` |
-| Spreadsheets | `.xlsx` `.xls` |
-| Presentations | `.pptx` `.ppt` |
-
-All other extensions (images, code files, binaries) are silently excluded from the diff and never uploaded to Dify.
+- Failed source access appears on `fetch_file_tree` or `calculate_diff`.
+- Failed Dify indexing can include `failedDocuments`.
+- Retry calls `POST /rag/knowledge-bases/:id/retry-failed-indexing`.
+- Cleanup calls `POST /rag/knowledge-bases/:id/cleanup`.
+- Cancel calls `POST /rag/knowledge-bases/:id/sync-cancel`; if `N8N_API_KEY` and execution ID are present, workflow-service also asks n8n to stop the execution.
+- Stale jobs are tracked with `lastProgressAt` and swept by workflow-service.

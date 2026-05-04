@@ -780,8 +780,45 @@ async function createDifyAppApiKey(session: DifyConsoleSession, appId: string): 
 
 async function createDifyDatasetApiKey(session: DifyConsoleSession): Promise<string> {
   // Dify 0.6.x validates dataset service API keys by tenant/type, not by
-  // dataset_id. Its per-dataset console route exists but raises a 500 because
-  // ApiToken has no dataset_id column in this version.
+  // dataset_id. Dataset API keys are TENANT-WIDE — one key works for all datasets
+  // in the Dify installation regardless of which knowledge base owns it.
+  //
+  // The platform uses a SINGLE GLOBAL shared dataset API key stored in
+  // platform/global/dify/config → dataset_api_key. This is called as a last
+  // resort when the global key is not yet stored in Vault. We list existing keys
+  // first and reuse the first available one to avoid the 10-key Dify limit.
+  try {
+    const listResult = await difyConsoleFetch(session.baseUrl, "/datasets/api-keys", {
+      method: "GET",
+      token: session.token,
+      ok: [200]
+    });
+    const existingKeys: Array<{ id: string; token: string; created_at?: number }> = Array.isArray(listResult.payload.keys)
+      ? listResult.payload.keys
+      : Array.isArray(listResult.payload.data)
+        ? listResult.payload.data
+        : [];
+
+    // Reuse the first available key — all tenant dataset keys are functionally identical
+    if (existingKeys.length > 0) {
+      const reusable = existingKeys.find((k) => nonEmptyString(k.token));
+      if (reusable?.token) {
+        logInfo("Reusing existing Dify dataset API key as global shared key", {
+          service: "workflow-service",
+          keyId: reusable.id,
+          totalKeys: existingKeys.length
+        });
+        return reusable.token;
+      }
+    }
+  } catch (listErr) {
+    // If listing fails, fall through to create — the create will surface its own error
+    logInfo("Dify dataset API key list failed — proceeding to create", {
+      service: "workflow-service",
+      error: listErr instanceof Error ? listErr.message : String(listErr)
+    });
+  }
+
   const created = await difyConsoleFetch(session.baseUrl, "/datasets/api-keys", {
     method: "POST",
     token: session.token,
@@ -832,6 +869,7 @@ async function ensureDifyKnowledgeBaseProvisioned(kbId: string): Promise<void> {
 
   const sourceType = String(kb.sourceType ?? "github");
   const existingSecrets = await readVaultKv(`platform/global/dify/${kbId}`);
+  const globalConfig = await readVaultKv("platform/global/dify/config");
   const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
   const session = await ensureDifyConsoleSession(sourceType);
 
@@ -857,10 +895,30 @@ async function ensureDifyKnowledgeBaseProvisioned(kbId: string): Promise<void> {
     nonEmptyString(existingSecrets.app_api_key) ??
     (legacyApiKey?.startsWith("app-") ? legacyApiKey : undefined) ??
     await createDifyAppApiKey(session, appId);
-  const datasetApiKey =
-    nonEmptyString(existingSecrets.dataset_api_key) ??
-    (legacyApiKey?.startsWith("ds-") || legacyApiKey?.startsWith("dataset-") ? legacyApiKey : undefined) ??
-    await createDifyDatasetApiKey(session);
+
+  // Dataset API key is SHARED GLOBALLY across all knowledge bases in the same Dify tenant.
+  // Resolution order:
+  //   1. Per-KB Vault entry (backward compat for existing KBs that already have one)
+  //   2. Global config Vault entry (the single shared key for the whole platform)
+  //   3. Legacy per-KB api_key field
+  //   4. Create/reuse one from Dify (and save to global config so all future KBs share it)
+  const perKbDatasetKey = nonEmptyString(existingSecrets.dataset_api_key);
+  const globalDatasetKey = nonEmptyString(globalConfig.dataset_api_key);
+  const legacyDatasetKey = legacyApiKey?.startsWith("ds-") || legacyApiKey?.startsWith("dataset-") ? legacyApiKey : undefined;
+  let datasetApiKey = perKbDatasetKey ?? globalDatasetKey ?? legacyDatasetKey;
+  if (!datasetApiKey) {
+    // Create/reuse one from Dify and persist it globally so all future KBs share it
+    datasetApiKey = await createDifyDatasetApiKey(session);
+    await writeVaultKv("platform/global/dify/config", {
+      ...globalConfig,
+      dataset_api_key: datasetApiKey
+    });
+    logInfo("Global Dify dataset API key created and stored in platform/global/dify/config", {
+      service: "workflow-service",
+      kbId
+    });
+  }
+
   await writeVaultKv(`platform/global/dify/${kbId}`, {
     ...existingSecrets,
     api_key: appApiKey,
@@ -909,13 +967,16 @@ async function listRagDiscussionSummaries(ownerId: string): Promise<RagDiscussio
 /**
  * Resolve a visible knowledge base for starting or continuing a discussion.
  * Uses the new ownership model: ownerId or shared-with, no scope field.
+ * Only platform admins (role: "admin") can see all KBs.
+ * useradmin users follow the same ownership + sharing rules as regular users.
  */
 async function resolveVisibleKnowledgeBaseForDiscussion(
   ownerId: string,
   headers: Record<string, unknown>,
   requestedKnowledgeBaseId?: string
 ): Promise<{ id: string } | null> {
-  const privileged = isAdminOrUserAdmin(headers);
+  // Use isPlatformAdmin so useradmin users only see their own/shared KBs
+  const privileged = isPlatformAdmin(headers);
 
   if (requestedKnowledgeBaseId) {
     // Check if the user can access this specific KB
@@ -1037,9 +1098,16 @@ async function sendToDify(
   kbId: string,
   difyAppUrl: string,
   userId: string
-): Promise<{ answer: string; conversationId: string; tokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | null }> {
+): Promise<{
+  answer: string;
+  conversationId: string;
+  tokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
+  timingMs: { vaultFetchMs: number; difyCallMs: number };
+}> {
   // Fetch the Dify API key from Vault — never from env vars
+  const vaultStart = Date.now();
   const secrets = await readVaultKv(`platform/global/dify/${kbId}`);
+  const vaultFetchMs = Date.now() - vaultStart;
   const apiKey = String(secrets.app_api_key ?? secrets.api_key ?? "").trim();
   if (!apiKey) throw new Error(`DIFY_API_KEY_NOT_CONFIGURED:${kbId}`);
 
@@ -1063,7 +1131,10 @@ async function sendToDify(
     });
   };
 
+  // Time the Dify API call — this is the vector DB retrieval + LLM summarization combined
+  const difyStart = Date.now();
   let response = await doRequest(apiKey);
+  let difyCallMs = Date.now() - difyStart;
 
   // Auto-recover stale API key: Dify wipes api_tokens on DB reset/container restart.
   // On 401 → login to Dify console, create fresh key, update Vault, retry once.
@@ -1096,8 +1167,10 @@ async function sendToDify(
         userId
       });
 
-      // Retry once with the fresh key
+      // Retry once with the fresh key (reset difyCallMs to measure only the retry)
+      const retryStart = Date.now();
       response = await doRequest(freshAppApiKey);
+      difyCallMs = Date.now() - retryStart;
 
       if (response.status === 401) {
         throw new Error(`DIFY_AUTH_RECOVERY_FAILED:${kbId}`);
@@ -1120,7 +1193,7 @@ async function sendToDify(
   const conversationId = typeof payload.conversation_id === "string" ? payload.conversation_id : "";
   // Extract token usage from Dify's metadata — used for observability/cost tracking
   const tokenUsage = extractDifyTokenUsage(payload);
-  return { answer, conversationId, tokenUsage };
+  return { answer, conversationId, tokenUsage, timingMs: { vaultFetchMs, difyCallMs } };
 }
 
 async function difyDatasetFetch(
@@ -1733,6 +1806,8 @@ async function appendRagDiscussionMessage(threadId: string, ownerId: string, con
 
   if (thread.knowledgeBaseId && thread.knowledgeBase) {
     // ── Dify path: thread is linked to a knowledge base ──
+    // Track total end-to-end time for the entire RAG pipeline call
+    const pipelineStart = Date.now();
     const result = await sendToDify(
       trimmed,
       thread.difyConversationId ?? null,
@@ -1740,8 +1815,48 @@ async function appendRagDiscussionMessage(threadId: string, ownerId: string, con
       thread.knowledgeBase.difyAppUrl,
       ownerId
     );
+    const totalPipelineMs = Date.now() - pipelineStart;
     assistantReply = result.answer;
     newDifyConversationId = result.conversationId || newDifyConversationId;
+
+    // Write timing data directly to PlatformLog DB so the /rag/stats endpoint can aggregate it.
+    // logInfo() only writes to stdout — not the DB. We must persist to PlatformLog explicitly.
+    // Fire-and-forget: timing persistence must not block the chat response.
+    void (prisma as any).platformLog.create({
+      data: {
+        severity: "INFO",
+        source: "workflow-service",
+        message: "rag_chat_timing",
+        maskedPayload: {
+          vaultFetchMs: result.timingMs.vaultFetchMs,
+          difyCallMs: result.timingMs.difyCallMs,
+          totalPipelineMs,
+          knowledgeBaseId: thread.knowledgeBaseId,
+          userId: ownerId,
+          promptLen: trimmed.length,
+          answerLen: assistantReply.length
+        }
+      }
+    }).catch((err: unknown) => {
+      logInfo("rag_chat_timing_log_failed", {
+        service: "workflow-service",
+        error: err instanceof Error ? err.message : String(err)
+      });
+    });
+
+    // Also log to stdout for container log visibility
+    logInfo("rag_chat_timing", {
+      service: "workflow-service",
+      threadId,
+      knowledgeBaseId: thread.knowledgeBaseId,
+      userId: ownerId,
+      vaultFetchMs: result.timingMs.vaultFetchMs,
+      difyCallMs: result.timingMs.difyCallMs,
+      totalPipelineMs,
+      promptLen: trimmed.length,
+      answerLen: assistantReply.length
+    });
+
     // Log token usage for cost observability — Dify includes this in every chat response
     if (result.tokenUsage) {
       logInfo("dify_chat_token_usage", {
@@ -1792,6 +1907,16 @@ async function appendRagDiscussionMessage(threadId: string, ownerId: string, con
 function isAdminOrUserAdmin(headers: Record<string, unknown>): boolean {
   const roles = requesterRoles(headers);
   return roles.includes("admin") || roles.includes("useradmin");
+}
+
+/**
+ * Returns true only for the "admin" role (platform admin).
+ * Used to determine whether a user can see ALL knowledge bases across all owners.
+ * useradmin users are NOT considered privileged for KB visibility — they follow
+ * the same ownership + sharing rules as regular users.
+ */
+function isPlatformAdmin(headers: Record<string, unknown>): boolean {
+  return requesterRoles(headers).includes("admin");
 }
 
 async function buildIntegrationResponse(
@@ -2476,10 +2601,13 @@ app.delete("/rag/integrations/:id", async (request, reply) => {
   }
 });
 
-// List knowledge bases visible to the requesting user
+// List knowledge bases visible to the requesting user.
+// Only platform admins (role: "admin") can see all KBs across all owners.
+// useradmin users see only their own KBs + KBs explicitly shared with them.
 app.get("/rag/knowledge-bases", async (request) => {
   const userId = requesterUserId(request.headers as Record<string, unknown>);
-  const privileged = isAdminOrUserAdmin(request.headers as Record<string, unknown>);
+  // Use isPlatformAdmin: useradmin role does NOT grant cross-user KB visibility
+  const privileged = isPlatformAdmin(request.headers as Record<string, unknown>);
   return getVisibleKnowledgeBases(userId, privileged);
 });
 
@@ -3871,6 +3999,143 @@ app.post("/rag/sync-error-handler", async (request, reply) => {
     return reply.code(200).send({ ok: true, syncJobId });
   } catch (error) {
     return reply.code(500).send({ error: "Failed to update sync job", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// ─── RAG Performance Stats Endpoint ──────────────────────────────────────────
+// Reads rag_chat_timing logs from PlatformLog to surface average response times.
+// Breaks down: vault fetch (secret lookup), Dify call (vector DB + LLM), and total.
+// This helps identify whether slowness is in Vault or in Dify (embedding/LLM).
+
+app.get("/rag/stats", async (request, reply) => {
+  const query = request.query as { days?: string; kbId?: string };
+  const days = Math.min(Math.max(Number(query.days ?? "7"), 1), 90);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  try {
+    // Fetch recent rag_chat_timing log entries from PlatformLog
+    const logs = await (prisma as any).platformLog.findMany({
+      where: {
+        source: "workflow-service",
+        message: "rag_chat_timing",
+        createdAt: { gte: since }
+      },
+      select: {
+        maskedPayload: true,
+        createdAt: true
+      },
+      orderBy: { createdAt: "desc" },
+      take: 500
+    });
+
+    // Parse timing data from log payload JSON
+    // Each log entry has: { vaultFetchMs, difyCallMs, totalPipelineMs, knowledgeBaseId, ... }
+    type TimingEntry = {
+      vaultFetchMs: number;
+      difyCallMs: number;
+      totalPipelineMs: number;
+      knowledgeBaseId?: string;
+      promptLen?: number;
+      answerLen?: number;
+      createdAt: string;
+    };
+
+    const entries: TimingEntry[] = [];
+    for (const log of logs) {
+      const payload = log.maskedPayload;
+      if (!payload || typeof payload !== "object") continue;
+      const p = payload as Record<string, unknown>;
+      const vaultFetchMs = Number(p.vaultFetchMs ?? 0);
+      const difyCallMs = Number(p.difyCallMs ?? 0);
+      const totalPipelineMs = Number(p.totalPipelineMs ?? 0);
+      if (!difyCallMs && !totalPipelineMs) continue; // skip malformed entries
+      if (query.kbId && String(p.knowledgeBaseId ?? "") !== query.kbId) continue;
+      entries.push({
+        vaultFetchMs,
+        difyCallMs,
+        totalPipelineMs,
+        knowledgeBaseId: String(p.knowledgeBaseId ?? ""),
+        promptLen: typeof p.promptLen === "number" ? p.promptLen : undefined,
+        answerLen: typeof p.answerLen === "number" ? p.answerLen : undefined,
+        createdAt: log.createdAt instanceof Date ? log.createdAt.toISOString() : String(log.createdAt)
+      });
+    }
+
+    if (entries.length === 0) {
+      return {
+        periodDays: days,
+        totalRequests: 0,
+        message: "No timing data yet — send a chat message to start collecting metrics.",
+        averages: null,
+        percentiles: null,
+        slowestQueries: [],
+        breakdown: null
+      };
+    }
+
+    // Compute averages
+    const avg = (arr: number[]) => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
+    const percentile = (arr: number[], p: number) => {
+      const sorted = [...arr].sort((a, b) => a - b);
+      const idx = Math.floor((p / 100) * sorted.length);
+      return sorted[Math.min(idx, sorted.length - 1)] ?? 0;
+    };
+
+    const vaultTimes = entries.map((e) => e.vaultFetchMs);
+    const difyTimes = entries.map((e) => e.difyCallMs);
+    const totalTimes = entries.map((e) => e.totalPipelineMs);
+
+    // Group by knowledge base for per-KB breakdown
+    const byKb = new Map<string, TimingEntry[]>();
+    for (const entry of entries) {
+      const kbId = entry.knowledgeBaseId ?? "unknown";
+      if (!byKb.has(kbId)) byKb.set(kbId, []);
+      byKb.get(kbId)!.push(entry);
+    }
+
+    const kbBreakdown = Array.from(byKb.entries()).map(([kbId, kbEntries]) => ({
+      knowledgeBaseId: kbId,
+      requestCount: kbEntries.length,
+      avgVaultFetchMs: avg(kbEntries.map((e) => e.vaultFetchMs)),
+      avgDifyCallMs: avg(kbEntries.map((e) => e.difyCallMs)),
+      avgTotalMs: avg(kbEntries.map((e) => e.totalPipelineMs))
+    })).sort((a, b) => b.requestCount - a.requestCount);
+
+    // Get slowest 5 queries
+    const slowest = [...entries]
+      .sort((a, b) => b.totalPipelineMs - a.totalPipelineMs)
+      .slice(0, 5)
+      .map((e) => ({
+        totalPipelineMs: e.totalPipelineMs,
+        difyCallMs: e.difyCallMs,
+        vaultFetchMs: e.vaultFetchMs,
+        promptLen: e.promptLen,
+        createdAt: e.createdAt
+      }));
+
+    return {
+      periodDays: days,
+      totalRequests: entries.length,
+      message: `Based on ${entries.length} requests over the last ${days} day(s). The Dify call includes both vector DB retrieval and LLM generation time.`,
+      averages: {
+        vaultFetchMs: avg(vaultTimes),
+        difyCallMs: avg(difyTimes),
+        totalPipelineMs: avg(totalTimes),
+        overheadMs: avg(totalTimes.map((t, i) => t - difyTimes[i] - vaultTimes[i]))
+      },
+      percentiles: {
+        p50: { vaultFetchMs: percentile(vaultTimes, 50), difyCallMs: percentile(difyTimes, 50), totalMs: percentile(totalTimes, 50) },
+        p90: { vaultFetchMs: percentile(vaultTimes, 90), difyCallMs: percentile(difyTimes, 90), totalMs: percentile(totalTimes, 90) },
+        p99: { vaultFetchMs: percentile(vaultTimes, 99), difyCallMs: percentile(difyTimes, 99), totalMs: percentile(totalTimes, 99) }
+      },
+      slowestQueries: slowest,
+      byKnowledgeBase: kbBreakdown
+    };
+  } catch (error) {
+    return reply.code(500).send({
+      error: "STATS_FETCH_FAILED",
+      details: error instanceof Error ? error.message : String(error)
+    });
   }
 });
 

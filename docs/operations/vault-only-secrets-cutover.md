@@ -7,7 +7,9 @@
 
 ## Admin operations
 - Use web `Secrets` page (platform-admin only) to:
+  - list the Vault catalog
   - create/update/delete secrets (masked output only)
+  - create/update/delete a specific field by Vault path
   - run one-time plaintext migration placeholder if needed
 
 ## Required env defaults

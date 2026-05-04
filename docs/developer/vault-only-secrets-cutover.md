@@ -14,13 +14,18 @@
 - `POST /admin/secrets`
 - `PATCH /admin/secrets`
 - `DELETE /admin/secrets`
+- `GET /admin/secrets/catalog`
+- `POST /admin/secrets/by-path`
+- `PATCH /admin/secrets/by-path`
+- `DELETE /admin/secrets/by-path`
 - `POST /admin/secrets/migrate`
 
 These are implemented in `workflow-service` and exposed through `api-gateway`.
 
 ## Path model
-- User namespace: `secret/data/platform/users/<username>/<group>#<key>`
-- Global namespace: `secret/data/platform/global/<group>#<key>`
+- User namespace: `secret/data/platform/users/<username>/<group>` with fields addressed as `#<key>` in UI labels.
+- Integration credentials: `secret/data/platform/users/<ownerId>/sources/<kbId>`.
+- Global namespace: `secret/data/platform/global/<group>` with fields addressed as `#<key>` in UI labels.
 
 ## Compose wiring
 - Shared env no longer injects `VAULT_TOKEN`.

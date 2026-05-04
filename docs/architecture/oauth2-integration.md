@@ -2,206 +2,143 @@
 
 ## Overview
 
-The platform supports two credential methods for knowledge source integrations — **OAuth2 Connect** (recommended) and **Personal Access Token (PAT)** (fallback). Both methods store tokens in the same Vault paths, so the sync pipeline (n8n) never needs to know which method was used.
+Knowledge sources can be connected with OAuth or with a personal access token (PAT). OAuth is the preferred UI path for GitHub, GitLab, and Google Drive. Web URL sources do not require OAuth.
 
----
+The current implementation stores OAuth app credentials and provider tokens in Vault. Database rows keep only non-secret source metadata.
 
 ## Supported Providers
 
-| Provider | OAuth App Type | Scopes | Refresh Token |
-|----------|---------------|--------|---------------|
-| GitHub | GitHub OAuth App | `repo` | No (tokens don't expire) |
-| GitLab | GitLab OAuth Application | `read_repository read_api` | Yes (2h expiry — auto-refreshed) |
-| Google Drive | Google OAuth2 (Cloud Console) | `drive.readonly` | Yes (auto-refreshed) |
+| Source type | OAuth provider route | Provider scopes |
+|-------------|----------------------|-----------------|
+| `github` | `github` | `repo` |
+| `gitlab` | `gitlab` | `read_repository`, `read_api` |
+| `googledrive` | `google` | `drive.readonly` |
 
----
+The UI source type is `googledrive`; the OAuth route provider is `google`.
 
-## Public Callback URLs (register with each provider)
+## Current Callback URLs
 
-```
-https://dev.eclassmanager.com/ap/oauth/callback/github
-https://dev.eclassmanager.com/ap/oauth/callback/gitlab
-https://dev.eclassmanager.com/ap/oauth/callback/google
-```
+The web modal builds callback URLs from:
 
----
+- `NEXT_PUBLIC_PLATFORM_URL`, default `https://dev.eclassmanager.com/rapidrag`
+- `NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL`, default `https://dev.eclassmanager.com/rapidrag/connect`
 
-## Full Routing Chain
+Default callback URLs shown in the UI:
 
-```
-Browser
-  │  GET /gateway/oauth/connect/github?kbId=xxx  (via web proxy)
-  ▼
-api-gateway :4000
-  │  Generates HMAC-signed state → stores in Redis (10 min TTL)
-  │  302 → https://github.com/login/oauth/authorize?...
-  ▼
-GitHub / GitLab / Google (user approves)
-  │  302 → https://dev.eclassmanager.com/ap/oauth/callback/github?code=xxx&state=xxx
-  ▼
-Cloudflare (DNS proxy)
-  ▼
-External Nginx /etc/nginx/sites-enabled/dev-eclassmanager
-  │  location /ap/  →  proxy_pass https://localhost:4000/
-  ▼
-api-gateway :4000  GET /oauth/callback/github
-  │  1. Verify HMAC signature of state
-  │  2. Delete Redis key (single-use)
-  │  3. Decode userId + kbId from state payload
-  │  4. Exchange code → access_token (using client_secret from env)
-  │  5. POST /internal/oauth-token/:kbId → workflow-service
-  │  6. 302 → https://dev.eclassmanager.com/integrations?connected=true&provider=github
-  ▼
-workflow-service :4001  POST /internal/oauth-token/:kbId
-  │  Writes token to Vault: platform/users/{userId}/sources/{kbId}
-  │  Sets auth_method = "oauth"
-  ▼
-Vault KV2 (token stored)
+```text
+https://dev.eclassmanager.com/rapidrag/connect/oauth/callback/github
+https://dev.eclassmanager.com/rapidrag/connect/oauth/callback/gitlab
+https://dev.eclassmanager.com/rapidrag/connect/oauth/callback/google
 ```
 
----
+The API gateway receives callbacks at:
 
-## Vault Token Storage
-
-Both OAuth and PAT tokens land in the same Vault path — n8n sync payload is unchanged.
-
-```
-Path: secret/data/platform/users/{userId}/sources/{kbId}
-
-  github_token    → GitHub access token
-  gitlab_token    → GitLab access token
-  gitlab_refresh  → GitLab refresh token (OAuth only)
-  gdrive_token    → Google Drive access token
-  gdrive_refresh  → Google Drive refresh token
-  token_expiry    → ISO timestamp (GitLab/Google OAuth only)
-  auth_method     → "oauth" | "pat"
+```text
+GET /oauth/callback/:provider
 ```
 
----
+Production deployments should set `OAUTH_CALLBACK_BASE_URL`, `OAUTH_POST_CONNECT_REDIRECT`, `NEXT_PUBLIC_PLATFORM_URL`, and `NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL` consistently with the external reverse proxy path.
 
-## Token Refresh (GitLab & Google)
+## Runtime Flow
 
-Before every sync trigger in `workflow-service`, if `auth_method === "oauth"` and `token_expiry` is within 5 minutes:
-
-1. Calls provider's token refresh endpoint with `refresh_token`
-2. Updates Vault with fresh `access_token` and new `token_expiry`
-3. If refresh fails and no valid token exists → sync job marked `failed` with message: `"OAuth access token expired. Please reconnect the integration."`
-
----
-
-## Security Model
-
-| Threat | Mitigation |
-|--------|-----------|
-| CSRF on callback | `state` is HMAC-SHA256 signed, Redis single-use, 10 min TTL |
-| Code injection / replay | OAuth codes are provider-bound to `redirect_uri`; state is single-use |
-| State tampering | HMAC-SHA256 with `PLATFORM_OAUTH_SECRET` — any bit flip → rejected |
-| Client secret exposure | Stored only in api-gateway environment (`docker-compose.yml` → `.env`), never in browser |
-| Token in DB | Tokens never touch the database — Vault only |
-| Open redirect | Post-callback redirect is hardcoded in api-gateway (`OAUTH_POST_CONNECT_REDIRECT`) |
-
----
-
-## Environment Variables
-
-Set in `.env` (or via `docker-compose.yml` environment section for api-gateway):
-
-```bash
-# Required: random 32-byte hex secret
-PLATFORM_OAUTH_SECRET=<openssl rand -hex 32>
-
-# Public base URL for callbacks (must match redirect_uri registered with providers)
-OAUTH_CALLBACK_BASE_URL=https://dev.eclassmanager.com/ap
-
-# Where browser lands after successful OAuth
-OAUTH_POST_CONNECT_REDIRECT=https://dev.eclassmanager.com/integrations
-
-# GitHub OAuth App
-GITHUB_CLIENT_ID=
-GITHUB_CLIENT_SECRET=
-
-# GitLab OAuth Application
-GITLAB_CLIENT_ID=
-GITLAB_CLIENT_SECRET=
-
-# Google OAuth2 Client
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
+```text
+User opens Knowledge Connector
+  |
+  | Create & Connect with OAuth
+  v
+web creates /gateway/rag/integrations
+  |
+  | optional per-integration OAuth app credentials
+  v
+PATCH /gateway/rag/integrations/:id/oauth-app-credentials
+  |
+  v
+GET /gateway/oauth/connect/:provider?kbId=<id>&json=1
+  |
+  | api-gateway signs state and returns provider authorize URL
+  v
+Browser redirects to GitHub/GitLab/Google
+  |
+  v
+Provider redirects to /oauth/callback/:provider with code + state
+  |
+  v
+api-gateway verifies state and exchanges code
+  |
+  v
+workflow-service stores tokens in Vault via /internal/oauth-token/:kbId
+  |
+  v
+Browser returns to OAUTH_POST_CONNECT_REDIRECT
 ```
 
----
+`json=1` is used by the Next.js UI so it can receive `{ "url": "..." }` and assign `window.location.href`. Without `json=1`, the gateway can redirect directly.
 
-## API Routes (api-gateway)
+## Secret Storage
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/oauth/connect/:provider?kbId=xxx` | JWT required | Redirects browser to provider authorization page |
-| GET | `/oauth/callback/:provider` | None (state-protected) | Receives code, exchanges token, stores in Vault |
-| DELETE | `/oauth/token/:provider?kbId=xxx` | JWT required | Disconnects OAuth, reverts auth_method to "pat" |
+Source tokens are stored under the owner/source path:
 
-### Internal Routes (workflow-service, called by api-gateway only)
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/internal/oauth-token/:kbId` | `x-internal-secret` header | Stores OAuth tokens in Vault |
-| DELETE | `/internal/oauth-token/:kbId` | `x-internal-secret` header | Removes OAuth tokens from Vault |
-
----
-
-## Nginx Configuration
-
-Block added to `/etc/nginx/sites-enabled/dev-eclassmanager`:
-
-```nginx
-location /ap/ {
-    proxy_pass          https://localhost:4000/;
-    proxy_set_header    Host               $host;
-    proxy_set_header    X-Real-IP          $remote_addr;
-    proxy_set_header    X-Forwarded-For    $proxy_add_x_forwarded_for;
-    proxy_set_header    X-Forwarded-Proto  $scheme;
-    proxy_ssl_verify    off;   # api-gateway uses internal Vault CA cert
-}
+```text
+secret/data/platform/users/{ownerId}/sources/{kbId}
 ```
 
-The trailing slash on `proxy_pass` strips the `/ap/` prefix before forwarding to api-gateway.
+Typical fields:
 
----
+| Field | Purpose |
+|-------|---------|
+| `github_token` | GitHub access token or PAT |
+| `gitlab_token` | GitLab access token or PAT |
+| `gitlab_refresh` | GitLab OAuth refresh token |
+| `gdrive_token` | Google Drive access token |
+| `gdrive_refresh` | Google Drive refresh token |
+| `token_expiry` | ISO expiry timestamp for expiring OAuth providers |
+| `auth_method` | `oauth` or `pat` |
 
-## Registering OAuth Apps (One-Time Setup per Provider)
+OAuth app client credentials can be saved per integration through:
 
-### GitHub
-1. Go to github.com → Settings → Developer Settings → OAuth Apps → New OAuth App
-2. **Authorization callback URL**: `https://dev.eclassmanager.com/ap/oauth/callback/github`
-3. Copy Client ID and Client Secret → set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` in `.env`
+```text
+PATCH /rag/integrations/:id/oauth-app-credentials
+```
 
-### GitLab
-1. Go to gitlab.com → User Settings → Applications → Add new application
-2. **Redirect URI**: `https://dev.eclassmanager.com/ap/oauth/callback/gitlab`
-3. **Scopes**: `read_repository`, `read_api`
-4. Copy Application ID and Secret → set `GITLAB_CLIENT_ID` / `GITLAB_CLIENT_SECRET` in `.env`
+Gateway-level env credentials (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, etc.) still exist as fallback/configuration, but the UI supports per-integration app registration.
 
-### Google Drive
-1. Go to console.cloud.google.com → APIs & Services → Credentials → Create OAuth 2.0 Client ID
-2. **Application type**: Web application
-3. **Authorized redirect URI**: `https://dev.eclassmanager.com/ap/oauth/callback/google`
-4. Enable **Google Drive API** in the project
-5. Copy Client ID and Client Secret → set `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` in `.env`
+## API Routes
 
-After updating `.env`, restart api-gateway: `docker compose up -d api-gateway`
+### api-gateway
 
----
+| Method | Path | Access | Purpose |
+|--------|------|--------|---------|
+| `GET` | `/oauth/connect/:provider?kbId=...` | `admin`, `useradmin`, `operator` | Build or return provider authorization URL |
+| `GET` | `/oauth/callback/:provider` | state-protected | Exchange code and store token |
+| `DELETE` | `/oauth/token/:provider?kbId=...` | `admin`, `useradmin`, `operator` | Disconnect OAuth |
+| `PATCH` | `/rag/integrations/:id/oauth-app-credentials` | `admin`, `useradmin`, `operator` | Store OAuth app client credentials |
 
-## UI Behaviour
+### workflow-service internal
 
-On the Integrations page (`/integrations`), each source row now shows a credential panel with two tabs:
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/internal/oauth-token/:kbId` | Store OAuth token fields in Vault |
+| `DELETE` | `/internal/oauth-token/:kbId` | Remove OAuth token fields |
+| `GET` | `/internal/oauth-credentials/:provider` | Return stored OAuth app credentials to the gateway |
 
-**Connect OAuth tab** (shown first):
-- If `authMethod === "oauth"`: shows ✅ connected badge + **Reconnect** + **Disconnect** buttons
-- If not connected: shows **Connect [Provider]** button → triggers the OAuth flow
-- If provider env vars not set: shows "OAuth not configured — contact admin"
+## Security Properties
 
-**Token (PAT) tab** (fallback):
-- Existing password input field — unchanged behaviour
-- If OAuth is active: shows a notice that PAT is ignored until OAuth is disconnected
+- OAuth state is HMAC-signed with `PLATFORM_OAUTH_SECRET`.
+- Redis nonce storage is used when available for single-use state validation.
+- Provider access tokens are stored only in Vault.
+- Client secrets are never sent to the browser except as user-entered form values during setup.
+- Post-connect redirect is controlled by `OAUTH_POST_CONNECT_REDIRECT`.
 
-After successful OAuth connection, browser is redirected back to `/integrations?connected=true` and a success toast is shown.
+## UI Behavior
+
+The Knowledge Connector page (`/knowledge-connector`, with `/integrations` kept as a compatibility route) supports:
+
+- create with OAuth
+- create with PAT
+- reconnect OAuth
+- disconnect OAuth
+- update PAT
+- store per-integration OAuth app credentials
+- create unauthenticated web URL sources
+
+After a successful callback, the browser is redirected with `?connected=true&provider=...`; the UI shows a success message and then removes the callback query parameters from the address bar.

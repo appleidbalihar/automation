@@ -6,11 +6,11 @@ import type { ReactElement } from "react";
 import { useEffect, useState } from "react";
 import { fetchIdentity } from "./auth-client";
 
+// Base nav items visible to all authenticated users
 const baseNavItems: Array<{ href: string; label: string }> = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/knowledge-connector", label: "Knowledge Connector" },
-  { href: "/rag-assistant", label: "RAG Assistant" },
-  { href: "/logs", label: "Logs" }
+  { href: "/rag-assistant", label: "RAG Assistant" }
 ];
 
 export function NavigationSidebar(): ReactElement {
@@ -36,7 +36,13 @@ export function NavigationSidebar(): ReactElement {
   }, [pinned]);
 
   const navItems = [...baseNavItems, { href: "/profile", label: "Profile" }];
+  if (roles.includes("admin") || roles.includes("useradmin")) {
+    // RAG Stats visible to platform admin and user admin
+    navItems.push({ href: "/rag-stats", label: "RAG Stats" });
+  }
   if (roles.includes("admin")) {
+    // Logs are platform-wide system logs — only platform admins should see them
+    navItems.push({ href: "/logs", label: "Logs" });
     navItems.push({ href: "/users", label: "Users" });
     navItems.push({ href: "/secrets", label: "Secrets" });
     navItems.push({ href: "/security", label: "Security Health" });
@@ -51,8 +57,8 @@ export function NavigationSidebar(): ReactElement {
       </div>
       {pinned ? (
         <>
-          <h2 style={{ marginTop: 0 }}>Automation Platform</h2>
-          <p style={{ opacity: 0.8, marginTop: 0 }}>Enterprise Operations Suite</p>
+          <h2 style={{ marginTop: 0 }}>RapidRAG</h2>
+          <p style={{ opacity: 0.8, marginTop: 0 }}>End-to-end RAG Platform</p>
           <nav>
             {navItems.map((item) => {
               const isActive = pathname === item.href;

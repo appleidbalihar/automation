@@ -1,483 +1,266 @@
 # Web UI Operations Guide
 
-This guide covers every page in the operator dashboard at `https://<host>/` and how to perform common operational tasks.
+This guide describes the current RapidRAG web UI under `apps/web`.
 
----
+## Access
 
-## Accessing the Platform
+- Public landing page: `https://<host>:3443/`
+- Authenticated platform shell: `https://<host>:3443/dashboard`
+- API proxy used by the UI: `/gateway/*`
 
-**URL**: `https://<host>/` (port 3443 via Nginx ingress)
-
-On first load, if you are not authenticated, the app redirects you to the Keycloak login page.
-
-**Default account** (first deployment):
-- Username: `platform-admin`
-- Password: `admin123`
-- Role: `admin` (full access)
-
-After login you are redirected to the Dashboard.
-
----
+Unauthenticated users see the RapidRAG sign-in/register flow. Authenticated users enter the platform shell with the left navigation sidebar.
 
 ## Navigation Sidebar
 
-The left-side navigation bar is visible on all authenticated pages. Links shown depend on your role.
+The sidebar currently shows:
 
-| Link | Visible to | Destination |
-|------|-----------|-------------|
-| Dashboard | all | `/dashboard` |
-| Operations AI | all | `/operations-ai` |
-| Integrations | operator+ | `/integrations` |
-| Logs | operator+ | `/logs` |
-| Secrets | admin | `/secrets` |
-| Security | admin | `/security` |
-| Users | admin, useradmin | `/users` |
-| Profile | all | `/profile` |
+| Link | Route | Visibility |
+|------|-------|------------|
+| Dashboard | `/dashboard` | all authenticated users |
+| Knowledge Connector | `/knowledge-connector` | all authenticated users |
+| RAG Assistant | `/rag-assistant` | all authenticated users |
+| Profile | `/profile` | all authenticated users |
+| Logs | `/logs` | `admin` only |
+| Users | `/users` | `admin` only in sidebar |
+| Secrets | `/secrets` | `admin` only |
+| Security Health | `/security` | `admin` only |
 
----
+The sidebar can be pinned/unpinned. The preference is stored in browser local storage under `platform-left-nav:pinned`.
 
-## Dashboard — `/dashboard`
+Compatibility routes:
 
-**Purpose**: At-a-glance status of the platform and quick links to common tasks.
+- `/integrations` still opens the same Knowledge Connector UI.
+- `/operations-ai`, `/operations-ai-dify`, and `/operations-ai/setup` redirect to current routes.
 
-**What you see**:
-- Platform name and status banner
-- Quick-action cards: Operations AI, Logs, Integrations, Admin Tools
-- Links to recent activity (if any)
+## Dashboard
 
-**Common actions from this page**:
-- Click **Operations AI** to start a chat with the knowledge base
-- Click **Integrations** to manage document sources
-- Click **Logs** to investigate recent events
+Route: `/dashboard`
 
----
+The dashboard gives quick links for chat, source setup, logs, and admin tools. Some cards still use legacy route labels, but redirects keep them functional.
 
-## Operations AI — `/operations-ai`
+## Knowledge Connector
 
-**Purpose**: Chat with the platform's knowledge base. The AI answers questions by retrieving relevant documents from the indexed sources.
+Route: `/knowledge-connector`
 
-### Starting a new conversation
+Purpose: create, edit, share, sync, cleanup, and delete knowledge sources.
 
-1. Click **New Conversation** (top-right of the chat panel)
-2. Type your question in the message box at the bottom
-3. Press Enter or click **Send**
-4. The AI responds with retrieved context from the knowledge base
+Supported source types:
 
-### Viewing conversation history
+| UI source | Notes |
+|-----------|-------|
+| GitHub | OAuth or PAT, branch plus one or more document paths |
+| GitLab | OAuth or PAT, branch plus one or more document paths |
+| Google Drive | OAuth or token fields |
+| Web URL | No OAuth required |
 
-Past conversations are listed in the left panel (thread list). Click any thread to resume it.
+### Creating A Source
 
-### Switching knowledge bases
+1. Open Knowledge Connector.
+2. Click the create/connect action.
+3. Choose OAuth or PAT.
+4. Enter name, optional project name/description, source URL, branch, and one or more document paths.
+5. For OAuth, follow the provider app setup instructions and connect.
+6. For PAT, paste the relevant token and create.
 
-If multiple knowledge bases are configured, a dropdown at the top of the chat panel lets you select which KB to query. The default KB is pre-selected.
+The UI sends `sourcePaths` as an array. `sourcePath` is sent only for backward compatibility.
 
-### Setup wizard — `/operations-ai/setup`
+### Editing A Source
 
-If no knowledge base is configured yet, the chat page shows a prompt to run the setup wizard. The wizard guides you through:
-1. Choosing a source type
-2. Entering source credentials
-3. Creating the first knowledge base
-4. Triggering an initial sync
+The edit modal can update:
 
-### Dify chat — `/operations-ai-dify`
+- name
+- project name
+- description
+- source URL
+- branch
+- source paths
+- PAT token
+- OAuth app credentials
 
-An alternate chat interface that connects directly to the Dify backend. Functionally equivalent to the main chat but uses a slightly different layout. New deployments default here; the `/operations-ai` page is kept for continuity.
+When paths or project metadata change, the UI can trigger a smart sync that includes `addedPaths`, `removedPaths`, and `projectNameChanged`.
 
----
+### OAuth
 
-## Integrations — `/integrations`
+OAuth setup is per integration. The UI shows provider-specific setup steps and callback URLs based on environment settings.
 
-**Purpose**: Manage knowledge base sources. Each integration is a document source (GitHub repo, GitLab repo, Google Drive folder, or web URL) that is periodically synced into Dify for RAG retrieval.
+Actions:
 
-**Required role**: `operator` or higher
+- Create and connect with OAuth.
+- Reconnect OAuth after token expiry/revocation.
+- Disconnect OAuth to fall back to PAT.
+- Save OAuth app client ID/secret for the integration.
 
-### Viewing existing integrations
+### Sharing
 
-The page lists all configured knowledge bases with:
-- Source type (GitHub, GitLab, Google Drive, Web)
-- Source URL / path
-- Last sync status and timestamp
-- Active sync job progress (live progress bar if a sync is running)
+The Share modal grants another user chat access to a KB through:
 
-### Creating a new integration
+```text
+POST /gateway/rag/knowledge-bases/:id/shares
+GET /gateway/rag/knowledge-bases/:id/shares
+DELETE /gateway/rag/knowledge-bases/:id/shares/:shareId
+```
 
-1. Click **Add Integration** (top-right)
-2. Fill in the form:
-   - **Name**: A human-readable label
-   - **Source type**: GitHub / GitLab / Google Drive / Web
-   - **Source URL**: Repository URL, Drive folder ID, or web URL
-   - **Branch** (Git sources): Default branch to crawl
-   - **Path** (Git sources): Sub-directory to limit scope (optional)
-   - **Credentials**: Optionally enter a PAT here — or leave blank and connect via OAuth after creation
-3. Click **Create**
-4. The integration appears in the list with status `pending`
+Sharing grants chat access only. It does not share thread history.
 
-### Connecting credentials via OAuth (recommended)
+### Manual Sync
 
-Each GitHub / GitLab / Google Drive integration row shows a credential panel with two tabs:
+Click Sync on a source row. The UI calls:
 
-**Connect OAuth tab** (default):
-- Click **Connect [Provider]** — you are redirected to the provider's authorization page
-- Approve access on the provider's site
-- You are returned to `/integrations` with a success toast
-- The credential badge updates to show `🔗 OAuth`
-- To reconnect (e.g. after token revocation): click **Reconnect**
-- To switch back to PAT: click **Disconnect**
+```text
+POST /gateway/rag/knowledge-bases/:id/sync
+```
 
-**Token (PAT) tab** (fallback / advanced):
-- Paste a Personal Access Token and click **Save Token**
-- PAT is ignored if an active OAuth token is present — disconnect OAuth first if you want to switch
+The row and Sync Process Monitor show the latest job and step progress.
 
-### Triggering a manual sync
+### Cancel Sync
 
-1. Find the integration in the list
-2. Click the **Sync** button (circular arrow icon)
-3. A new sync job starts; the row shows a progress bar
-4. Sync steps and file counts update in real time (n8n sends progress callbacks)
-5. On completion, status changes to `completed` with timestamp
+Click Cancel for a running job. The UI calls:
 
-### Cancelling a running sync
+```text
+POST /gateway/rag/knowledge-bases/:id/sync-cancel
+```
 
-Click the **Cancel** button on the progress bar row. The n8n execution is stopped and the sync job is marked `cancelled`.
+### Cleanup
 
-### Sync Process Monitor
+Cleanup removes indexed Dify documents and resets sync state without deleting the integration record.
 
-When a sync is running (or after it completes), click the **Monitor** button on the integration row to open the Sync Process Monitor panel. This panel is the primary observability tool for sync jobs.
+```text
+POST /gateway/rag/knowledge-bases/:id/cleanup
+```
 
-#### KB selector and job history
-- Use the **KB selector** dropdown to switch between knowledge bases.
-- Use the **Job history** dropdown to select any of the last 10 sync jobs for the current KB. The monitor auto-switches to whichever KB just started an active sync.
+The monitor shows cleanup-specific steps such as Dify document deletion and file tracker reset.
 
-#### Progress bar
-- Shows `filesProcessed / filesTotal` (e.g. `3 / 8 files`).
-- Only counts files in the smart diff — unchanged files are excluded from the total.
-- If the repository was unchanged, the total is 0 and no progress bar appears.
+### Retry Failed Indexing
 
-#### Step table
+If Dify indexing fails, retry all failed documents or a selected document:
 
-Each sync shows up to four steps in order:
+```text
+POST /gateway/rag/knowledge-bases/:id/retry-failed-indexing
+```
 
-| Step | What it means |
-|------|--------------|
-| **Fetch File Tree** | n8n is retrieving the complete list of files from GitHub or GitLab. |
-| **Skip Sync** | No files changed since the last sync. Upload and indexing were skipped. |
-| **Upload Files** | Changed files are being fetched from the source and uploaded to Dify. |
-| **Dify Indexing** | Dify is chunking, embedding, and indexing the uploaded documents. |
+## Sync Process Monitor
 
-#### Status badges
+The monitor is embedded in the Knowledge Connector page.
 
-| Badge | Meaning |
-|-------|---------|
-| Blue / pulsing | Running — step is currently active |
-| Green | Completed successfully |
-| Red | Failed — see the error message or log drawer |
-| Grey | Not yet reached |
+It shows:
 
-#### Smart diff behaviour — "Only changed files are re-uploaded"
-The sync compares each file's SHA hash against the value stored from the previous sync. Files whose content has not changed are excluded before any download or upload begins. This means:
-- A repository with 500 files where only 3 changed will show `filesTotal: 3`.
-- Processing time is proportional to changes, not repository size.
-- Re-triggering a sync immediately after a completed sync usually results in Skip Sync.
+- KB selector
+- recent job history
+- trigger type (`manual`, `cleanup`, `retry_failed_indexing`, etc.)
+- file counters
+- step table
+- error details
+- failed Dify document retry controls
+- step log drawer
 
-#### What "Skip Sync" means
-When all files in the repository match the previously stored SHAs, the workflow sends a `skip_sync: completed` callback and ends immediately. The step table shows `Fetch File Tree: completed` and `Skip Sync: completed`. **This is normal and expected** — it means the repository content is unchanged. No documents were re-uploaded or re-indexed.
+Common step names include:
 
-#### Log drill-down
-Each step row has a log icon button. Clicking it opens a drawer showing the raw log messages emitted by n8n during that step. This is the fastest way to see error details without accessing n8n directly.
-
-#### Retrying failed Dify indexing
-If the **Dify Indexing** step shows `failed` (or completed but with some documents in error state), a **Retry** button appears in the monitor. Clicking it calls `POST /rag/knowledge-bases/:id/retry-failed-indexing`, which re-submits only the failed documents to Dify without re-downloading or re-uploading the full file set.
-
-#### Interpreting common error messages
-
-| Error message | Cause | Action |
-|--------------|-------|--------|
-| `HTTP 401: Bad credentials` | Source token is invalid or expired | Reconnect OAuth or update PAT in the credential panel |
-| `HTTP 404: Not Found` | Repository URL or branch does not exist | Check the sourceUrl and sourceBranch on the integration |
-| `HTTP 403: Forbidden` | Token lacks `repo` read scope | Generate a new token with the correct permissions |
-| `Dify API error: dataset not found` | Dify dataset ID mismatch | Recreate the KB integration or verify Dify dataset ID |
-| `Timed out` (job-level) | n8n stopped sending progress for 15+ minutes | Check n8n execution logs; trigger a new sync after resolving the root cause |
-
-### Viewing sync history
-
-Click the **History** icon on any integration row to see a list of past sync jobs with:
-- Trigger type (manual, scheduled, webhook)
-- Files processed / total
-- Chunks processed / total
-- Duration
-- Error message (if failed)
-
-### Configuring a knowledge base
-
-Click the **Settings** (gear) icon on an integration to open the KB configuration panel:
-
-| Field | Description |
-|-------|-------------|
-| System prompt | Base instructions given to the LLM for every query |
-| LLM model | Which model Dify uses (e.g. gpt-4o, claude-3) |
-| Temperature | Response creativity (0 = deterministic, 1 = creative) |
-| Response style | Tone: concise, detailed, bullet points |
-| Tone instructions | Additional tone directives |
-| Restriction rules | Topics the AI should decline to answer |
-| Welcome message | Shown when a new conversation starts |
-
-Click **Save** to apply. Changes take effect on the next conversation.
-
-### Setting the default knowledge base
-
-Click **Set as Default** on any integration. The default KB is pre-selected in the Operations AI chat for all operators.
-
-### Deploying a channel (Slack, Telegram, etc.)
-
-1. Open the integration's **Channels** tab
-2. Click **Add Channel**
-3. Select channel type: Slack / Discord / WhatsApp / Telegram / Google Chat
-4. Enter channel name and connection details
-5. Click **Deploy**
-6. n8n provisions the bot; status shows `active` when ready
-
-### Deleting an integration
-
-Click the **Delete** (trash) icon. This removes the integration record, stops future syncs, and removes the Dify dataset. Running sync jobs are cancelled first.
-
----
-
-## Logs — `/logs`
-
-**Purpose**: Search, filter, and inspect platform event logs from all services.
-
-**Required role**: `operator` or higher
-
-### Log list view
-
-Logs are displayed newest-first with columns:
-- Timestamp
-- Severity (INFO, WARN, ERROR)
-- Source service (api-gateway, workflow-service, logging-service, web)
-- Message summary
-- Correlation ID (click to filter by this ID)
-
-### Filtering logs
-
-Use the filter bar at the top:
-
-| Filter | Description |
-|--------|-------------|
-| Date range | Start and end datetime |
-| Severity | INFO / WARN / ERROR / DEBUG |
-| Source | Service name |
-| Correlation ID | Trace all events for one request |
-| Full-text search | Keyword search in message text |
-
-Click **Apply** to refresh results.
-
-### Viewing a log entry detail
-
-Click any row to expand the detail panel:
-- Full message text
-- Masked payload (sensitive fields replaced with `***`)
-- Duration (ms) if applicable
-- All metadata fields
-
-### Execution timeline
-
-When filtering by Correlation ID, a **Timeline** tab shows all events for that request in chronological order — useful for tracing a slow sync or failed chat request across services.
-
-### Exporting logs
-
-Click **Export CSV** (top-right) to download the current filtered view as a CSV file.
-
----
-
-## Secrets — `/secrets`
-
-**Purpose**: Manage platform secrets stored in HashiCorp Vault.
-
-**Required role**: `admin`
-
-### Secret catalog
-
-Secrets are organized by **scope** and **group**:
-- **Scope**: `global` (shared across platform) or `user` (per-user)
-- **Group**: Logical category (e.g., `dify`, `github`, `keycloak`, `integrations`)
-
-The left panel shows the catalog tree. Click a group to list its secrets.
-
-### Viewing a secret
-
-Click a secret name to see its metadata (key path, last updated). Values are not shown by default.
-
-### Creating a secret
-
-1. Click **New Secret** (top-right)
-2. Select scope and group (or type a new group name)
-3. Enter key name and value
-4. Click **Save**
-
-The secret is written to Vault at `secret/data/platform/{scope}/{group}/{key}`.
-
-### Updating a secret
-
-1. Click the secret name
-2. Click **Edit**
-3. Update the value
-4. Click **Save**
-
-Vault creates a new version; old versions are retained.
-
-### Deleting a secret
-
-Click **Delete** on the secret row. This soft-deletes the latest Vault version.
-
-### Migrating secrets to Vault
-
-If secrets were previously stored as environment variables, use **Admin → Migrate Secrets** (calls `POST /admin/secrets/migrate`) to batch-import them into Vault KV2.
-
----
-
-## Security — `/security`
-
-**Purpose**: Monitor TLS certificate health across all platform services and review rotation history.
-
-**Required role**: `admin`
-
-### Certificate status panel
-
-A card is shown for each service certificate:
-
-| Field | Description |
-|-------|-------------|
-| Service | Service name |
-| Expiry date | Certificate expiry |
-| Days remaining | Countdown |
-| Status | `ok` / `warning` / `critical` / `expired` |
-| Last renewed | When Vault Agent last issued a new certificate |
-
-Status thresholds (configurable in `.env`):
-- `ok`: > 7 days remaining
-- `warning`: 3–7 days remaining
-- `critical`: < 3 days remaining
-- `expired`: Past expiry
-
-### Alert history
-
-The **Alerts** tab lists certificate alerts that have been emitted to RabbitMQ, with timestamp, service name, and severity.
-
-### Manual rotation trigger
-
-For emergency rotation, click **Rotate** on any service card. This signals the `cert-rotation-controller` to request a new certificate from Vault and restart the service.
-
----
-
-## Users — `/users`
-
-**Purpose**: Manage operator accounts in Keycloak.
-
-**Required role**: `admin` or `useradmin`
-
-### User list
-
-All Keycloak users in the `automation-platform` realm are listed with:
-- Username
-- Email
-- Assigned roles
-- Status (enabled / disabled)
-
-### Creating a user
-
-1. Click **New User**
-2. Fill in:
-   - Username (required)
-   - Email
-   - First / Last name
-   - Initial password (user must change on first login)
-3. Select roles to assign
-4. Click **Create**
-
-### Editing a user
-
-Click a username to open the edit panel. You can:
-- Update email, name
-- Enable / disable the account
-- Reset password (sends reset email or sets directly)
-- Add or remove roles
-
-### Deleting a user
-
-Click **Delete** on the user row. This permanently removes the Keycloak account.
-
-### Role guide
-
-| Role | Purpose |
+| Step | Meaning |
 |------|---------|
-| admin | Platform-wide admin, secrets, users, certs |
-| useradmin | Manage users (cannot access secrets/certs) |
-| operator | Day-to-day operations: integrations, chat, logs |
-| approver | Approve workflow steps |
-| viewer | Read-only access to dashboard and logs |
+| `fetch_file_tree` | Fetch source file tree/list |
+| `skip_sync` | No changed files were found |
+| `upload_files` | Upload changed files to Dify |
+| `dify_indexing` | Poll/wait for Dify indexing |
+| `retry_failed_indexing` | Re-submit failed Dify documents |
+| `cleanup_*` | Delete/reset indexed state |
 
----
+The log drawer calls `/gateway/logs/sync-job?syncJobId=...&stepName=...`.
 
-## Profile — `/profile`
+## RAG Assistant
 
-**Purpose**: View and update your own account settings.
+Route: `/rag-assistant`
 
-**Accessible by**: all authenticated users
+Purpose: chat with one or more Dify-backed knowledge bases.
 
-### What you can do
+Capabilities:
 
-- View your username, email, and assigned roles
-- Update display name and email
-- Change your password
-- View active sessions
+- start or resume private discussion threads
+- select available KBs
+- ask questions through Dify
+- display per-KB answers in multi-KB responses
+- link back to Knowledge Connector when no KB is ready
 
----
+Legacy chat routes redirect here.
 
-## Common Operational Tasks
+## Logs
 
-### Onboarding a new operator
+Route: `/logs`
 
-1. Go to **Users** (`/users`)
-2. Click **New User**, fill in details, assign role `operator`
-3. Share the temporary password — user logs in and changes it
-4. User visits `/operations-ai` and starts using the platform
+Visibility: admin-only in the sidebar and gateway.
 
-### Setting up a new knowledge source (end-to-end)
+The Logs Explorer supports:
 
-1. Go to **Secrets** (`/secrets`) and store source credentials (GitHub token, etc.) in the appropriate Vault group
-2. Go to **Integrations** (`/integrations`) and click **Add Integration**
-3. Select source type, enter URL, reference the stored credential
-4. Click **Create**, then **Sync** to run the first ingestion
-5. Monitor sync progress on the integrations page
-6. Once sync completes, go to **Operations AI** (`/operations-ai`) and verify the knowledge base answers questions correctly
+- order/correlation ID filtering
+- severity filtering
+- source filtering
+- message substring filtering
+- refresh
+- order timeline lookup
 
-### Investigating a failed sync
+Backed API routes:
 
-1. On **Integrations** page, find the integration with `failed` status
-2. Click **History** to see the failed sync job
-3. Note the error message and n8n execution ID
-4. Go to **Logs** (`/logs`) and filter by Correlation ID or source `workflow-service` around the failure timestamp
-5. If n8n-related, log into n8n UI at `http://<host>:5678` and find the execution by ID for detailed step output
+```text
+GET /gateway/logs
+GET /gateway/logs/timeline
+```
 
-### Tracing a slow or failed chat request
+Step-level sync logs use:
 
-1. From the Operations AI page, note the time of the problematic request
-2. Go to **Logs** (`/logs`)
-3. Filter by date range around that time, source `api-gateway` or `workflow-service`, severity `WARN` or `ERROR`
-4. Find the log entry for the message, copy the Correlation ID
-5. Re-filter by Correlation ID to see the full request trace across services
+```text
+GET /gateway/logs/sync-job
+```
 
-### Checking certificate health
+That route is also available to `useradmin` and `operator` for scoped sync investigation.
 
-1. Go to **Security** (`/security`)
-2. Review the certificate status cards
-3. Any `warning` or `critical` services should be investigated
-4. If a certificate has not auto-renewed (Vault Agent issue), click **Rotate** for the affected service
+## Secrets
 
-### Rotating a service secret (e.g., Dify API key)
+Route: `/secrets`
 
-1. Go to **Secrets** (`/secrets`)
-2. Navigate to `global → dify`
-3. Click the secret for the affected knowledge base
-4. Click **Edit**, paste the new value, click **Save**
-5. Trigger a new sync on the affected integration to verify the new key works
+Visibility: admin-only.
+
+The Secrets panel manages Vault-backed platform secrets:
+
+- list catalog and stored secret metadata
+- create/update/delete secrets
+- read masked metadata
+- run the legacy plaintext migration endpoint if needed
+
+Backed API routes include `/gateway/admin/secrets`, `/gateway/admin/secrets/catalog`, `/gateway/admin/secrets/by-path`, and `/gateway/admin/secrets/migrate`.
+
+## Security Health
+
+Route: `/security`
+
+Visibility: admin-only.
+
+The Security Health page uses:
+
+```text
+GET /gateway/admin/security/certificates
+GET /gateway/admin/security/certificates/events
+POST /gateway/admin/security/certificates/:service/renew
+```
+
+The gateway monitors default targets for api-gateway, workflow-service, logging-service, and keycloak. Extra targets can be supplied through `CERT_TARGETS`.
+
+## Users
+
+Route: `/users`
+
+Visibility: admin in the sidebar. API routes also include useradmin-specific permissions in the Next.js user admin endpoints.
+
+User management is implemented in the web app through Keycloak admin APIs.
+
+## Profile
+
+Route: `/profile`
+
+Users can view current identity details and change their own password.
+
+## Current Operational Notes
+
+- Prefer `/knowledge-connector` and `/rag-assistant` in new instructions.
+- Treat `/integrations` and `/operations-ai*` as compatibility routes.
+- Logs are platform-wide and admin-only except sync-job scoped logs.
+- Source credentials, OAuth tokens, OAuth app credentials, and Dify API keys are Vault-only.
+- Flowise is not a current runtime component.

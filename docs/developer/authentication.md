@@ -14,8 +14,9 @@
 - If bearer token is not a valid JWT for the configured Keycloak realm/client, resolve to anonymous context and protected routes return `401`.
 
 ## Role model
-- Allowed roles: `admin`, `operator`, `approver`, `viewer`
-- Unknown/missing roles fall back to `viewer`
+- Allowed roles: `admin`, `useradmin`, `operator`, `approver`, `viewer`
+- Unknown/missing roles fall back to `viewer`.
+- Tokens with `operator` also receive `useradmin` in `@platform/auth` for current compatibility.
 
 ## Key env assumptions
 - `KEYCLOAK_URL`

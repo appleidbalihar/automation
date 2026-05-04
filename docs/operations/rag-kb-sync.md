@@ -1,307 +1,174 @@
-# RAG Knowledge Base Sync — Operations Runbook
+# RAG Knowledge Base Sync - Operations Runbook
 
-This runbook covers day-to-day operations for the GitHub/GitLab → Dify knowledge-base sync feature: triggering syncs, monitoring progress, diagnosing failures, and maintaining the n8n workflow.
+## Trigger A Sync
 
----
+### Web UI
 
-## Triggering a Sync
+1. Open **Knowledge Connector** (`/knowledge-connector`).
+2. Find the source.
+3. Click **Sync**.
+4. Watch the Sync Process Monitor.
 
-### Via the Web UI
-1. Navigate to **Integrations** (`/integrations`).
-2. Find the knowledge base integration you want to sync.
-3. Click the **Sync** button (circular arrow icon) on that integration's row.
-4. The Sync Process Monitor panel opens (or updates) showing the sync in progress.
+`/integrations` still works as a compatibility route, but new docs should use `/knowledge-connector`.
 
-### Via the API
+### API
+
 ```bash
-curl -X POST https://<host>/gateway/rag/knowledge-bases/<kb-id>/sync \
+curl -X POST "https://<host>:3443/gateway/rag/knowledge-bases/<kb-id>/sync" \
   -H "Authorization: Bearer <keycloak-jwt>" \
   -H "Content-Type: application/json"
 ```
 
-Response: `{ "syncJobId": "<uuid>", "status": "pending" }`
+Poll:
 
-You can then poll for status:
 ```bash
-curl https://<host>/gateway/rag/knowledge-bases/<kb-id>/sync-status \
+curl "https://<host>:3443/gateway/rag/knowledge-bases/<kb-id>/sync-status" \
   -H "Authorization: Bearer <keycloak-jwt>"
 ```
 
----
+## Monitor Jobs
 
-## Reading the Sync Process Monitor
+The Sync Process Monitor shows:
 
-The Sync Process Monitor is the primary observability tool for sync jobs. It is accessible from the **Integrations** page.
+- current KB selector
+- recent job history
+- trigger type
+- file counters
+- step status
+- failed Dify documents
+- retry controls
+- log drawer per step
 
-### KB selector and job history
-- The **KB selector** dropdown at the top lets you switch between configured knowledge bases.
-- The **Job history** dropdown shows the last 10 sync jobs for the selected KB. Select any past job to review its steps.
-- The monitor auto-switches to whichever KB has just started an active sync.
+Important step names:
 
-### Progress bar
-- Shows `filesProcessed / filesTotal` (e.g. `3 / 8 files`).
-- Only counts files included in the smart diff — files that have not changed are excluded from the total.
-- If the repo was unchanged, the total is 0 and no progress bar is shown (see Skip Sync below).
+| Step | Meaning |
+|------|---------|
+| `fetch_file_tree` | Fetch source file tree/list |
+| `calculate_diff` | Compare source files with `RagKbFileTracker` |
+| `cleanup_removed_paths` | Remove documents that no longer match configured paths |
+| `skip_sync` | No changed files to upload |
+| `upload_files` | Upload/update changed files in Dify |
+| `upload_file_success` | Per-file tracker update callback |
+| `dify_indexing` | Dify indexing status |
+| `retry_failed_indexing` | Retry failed Dify documents |
+| `cleanup_*` | Full cleanup job steps |
 
-### Step table
+## Read Logs
 
-Each sync goes through up to four named steps:
+Use the step log drawer first. It calls:
 
-| Step name | Display label | What it means |
-|-----------|--------------|---------------|
-| `fetch_file_tree` | Fetch File Tree | n8n is fetching the full recursive file list from GitHub/GitLab |
-| `skip_sync` | Skip Sync | Diff returned 0 changed files; sync ended without uploading anything |
-| `upload_files` | Upload Files | Changed files are being fetched and uploaded to Dify |
-| `dify_indexing` | Dify Indexing | Dify is chunking, embedding, and indexing the uploaded documents |
-
-### Status badges
-
-| Badge colour | Meaning |
-|-------------|---------|
-| Blue / pulsing | `running` — step is currently active |
-| Green | `completed` — step finished successfully |
-| Red | `failed` — step encountered an error; see error message |
-| Grey | Not yet reached |
-
-### Log drill-down
-Click the **log icon** (clipboard/list icon) on any step row to open a log drawer. The drawer shows the raw `logMessage` lines that were sent with each progress callback for that step. This is the first place to look when a step fails without an obvious error message.
-
----
-
-## Common Scenarios
-
-### Normal sync with changes
-Steps appear in order: Fetch File Tree → Upload Files → Dify Indexing, each transitioning from running to completed. The progress bar fills as files are uploaded.
-
-### Skip Sync ("No files to update")
-If the repository content is identical to the last sync (all SHA hashes match), you will see:
-- `fetch_file_tree: completed`
-- `skip_sync: completed`
-
-This is **expected and correct behaviour**. It means the smart diff found no changed files. No re-uploading or re-indexing occurred. This is more efficient than re-processing an entire repository on every scheduled sync.
-
----
-
-## Investigating a Failed Sync
-
-### Step 1: Check the Sync Process Monitor
-1. Open **Integrations** (`/integrations`) and select the failing KB.
-2. Check which step shows a red **failed** badge.
-3. Click the log icon on that step to see the raw error message from n8n.
-
-### Step 2: Read the step's error message
-The error message (shown in the step row or log drawer) typically identifies the cause directly. Common messages:
-- `"HTTP 401: Bad credentials"` — access token is invalid or expired
-- `"HTTP 404: Not Found"` — repository URL is wrong or the branch does not exist
-- `"HTTP 403: Forbidden"` — token has insufficient scopes (needs `repo` read permission)
-- `"Dify API error: dataset not found"` — Dify dataset ID mismatch; may need to recreate the KB
-
-### Step 3: Check stepsJson in the database
-```sql
-SELECT id, status, "errorMessage", "stepsJson", "lastProgressAt"
-FROM "RagKbSyncJob"
-WHERE "knowledgeBaseId" = '<kb-id>'
-ORDER BY "createdAt" DESC
-LIMIT 5;
+```text
+GET /gateway/logs/sync-job?syncJobId=<job-id>&stepName=<step-name>
 ```
 
-### Step 4: Check application logs
+For admin-wide investigation, use `/logs` and filter by source, severity, or message.
+
+Container logs:
+
 ```bash
-# Filter workflow-service logs for sync events
-docker compose logs workflow-service --since 30m | grep -i "sync\|rag\|error"
+docker compose logs workflow-service --since 30m
+docker compose logs api-gateway --since 30m
+docker compose logs n8n --since 30m
+docker compose logs dify-api dify-worker --since 30m
 ```
 
-Or use the **Logs** page (`/logs`), filtering by:
-- Source: `workflow-service`
-- Severity: `ERROR` or `WARN`
-- Time range: around the sync start time
+## Common Operations
 
-### Step 5: Check the n8n execution (if needed)
-1. Open n8n at `http://<host>:5678` (admin credentials in Vault).
-2. Go to **Executions** and find the execution matching the sync start time.
-3. Click the execution to see per-node input/output, including the raw GitHub API response.
+### Cancel A Running Sync
 
----
+Use the UI Cancel action or call:
 
-## Common Failure Modes and Resolution
-
-### HTTP 401 on Fetch File Tree
-
-**Symptom**: `fetch_file_tree` step fails with `"HTTP 401: Bad credentials"`.
-
-**Cause**: The OAuth token or PAT used to access the source repository is invalid, expired, or revoked.
-
-**Resolution**:
-1. Go to **Integrations** → find the affected integration → click the credential panel.
-2. If using OAuth: click **Reconnect** to re-authorize. If the OAuth app was revoked, generate a new one.
-3. If using PAT: click the **Token** tab, paste a new valid Personal Access Token, click **Save Token**.
-4. Trigger a new sync.
-
-### Sync stuck in "running" for more than 15 minutes
-
-**Symptom**: Sync job status is `running` but the Sync Process Monitor shows no progress updates for an extended period.
-
-**Cause**: n8n execution may have crashed, the network between n8n and api-gateway may have dropped, or the Dify indexing poll exceeded its timeout without sending a final callback.
-
-**Resolution — automatic**: The `sweepStaleJobs` process runs every 60 seconds in workflow-service and automatically marks any job with no progress for 15 minutes as `timed_out`. No manual action is needed unless you want to force it immediately.
-
-**Resolution — manual** (force-fail the job):
-```sql
-UPDATE "RagKbSyncJob"
-SET status = 'failed',
-    "errorMessage" = 'Manually marked failed by operator',
-    "completedAt" = NOW()
-WHERE id = '<sync-job-id>'
-  AND status = 'running';
+```bash
+curl -X POST "https://<host>:3443/gateway/rag/knowledge-bases/<kb-id>/sync-cancel" \
+  -H "Authorization: Bearer <keycloak-jwt>"
 ```
 
-Then trigger a fresh sync.
+If the job has an n8n execution ID and `N8N_API_KEY` is configured, workflow-service also asks n8n to stop the execution.
 
-### Dify indexing errors (some or all documents failed)
+### Retry Failed Dify Indexing
 
-**Symptom**: `dify_indexing` step shows `failed` or `completed` but the Operations AI chat cannot find expected content.
+Use the monitor retry controls or call:
 
-**Cause**: Dify rejected or failed to index one or more documents. This can happen with malformed PDFs, unsupported encoding, or Dify service instability.
+```bash
+curl -X POST "https://<host>:3443/gateway/rag/knowledge-bases/<kb-id>/retry-failed-indexing" \
+  -H "Authorization: Bearer <keycloak-jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"syncJobId":"<failed-job-id>"}'
+```
 
-**Resolution**:
-1. Check the log drawer for `dify_indexing` — it lists which documents failed.
-2. In the Sync Process Monitor, click the **Retry** button (if available) to call `POST /rag/knowledge-bases/:id/retry-failed-indexing`, which re-submits only the failed documents to Dify without re-uploading.
-3. If retry fails, check Dify's own logs: `docker compose logs dify --since 1h | grep -i error`.
-4. For persistent failures on specific files, consider excluding them from the sync path or converting them to a supported format.
+### Cleanup Indexed Data
 
-### "No files to update" / skip_sync appears unexpectedly
+Cleanup deletes indexed Dify documents and tracker state but keeps the integration record:
 
-**Symptom**: Every sync immediately shows `skip_sync: completed` even though you expect new content.
+```bash
+curl -X POST "https://<host>:3443/gateway/rag/knowledge-bases/<kb-id>/cleanup" \
+  -H "Authorization: Bearer <keycloak-jwt>"
+```
 
-**Cause**: The `RagKbSourcePath` table has stored SHAs that match the current repository content. This happens if:
-- Content was not actually changed (expected behaviour)
-- The branch parameter is wrong and n8n is fetching a different branch than you expect
-- Files were force-pushed and the SHAs were accidentally preserved
+After cleanup, run a fresh sync to rebuild the index.
 
-**Resolution**:
-1. Verify the `sourceBranch` on the KB record matches the branch you are editing.
-2. If you need to force a full re-sync, clear the stored SHAs:
+## Common Failures
+
+### Bad Source Credentials
+
+Symptoms:
+
+- `fetch_file_tree` failed
+- provider HTTP 401/403/404
+
+Actions:
+
+1. Open Knowledge Connector.
+2. Reconnect OAuth or save a new PAT.
+3. Confirm branch/source URL/path filters.
+4. Trigger sync again.
+
+### No Files To Update
+
+Symptoms:
+
+- `skip_sync` completed
+- `filesTotal` is 0
+
+This is expected when every matching file has the same SHA as the row in `RagKbFileTracker`.
+
+Force a full resync:
+
 ```sql
-DELETE FROM "RagKbSourcePath"
+DELETE FROM "RagKbFileTracker"
 WHERE "knowledgeBaseId" = '<kb-id>';
 ```
-Then trigger a new sync. All files will be treated as new.
 
----
+Then trigger sync.
 
-## Updating the n8n Workflow Template
+### Dify Indexing Failed
 
-### When is this needed?
-When you change the sync logic — add a node, fix a callback, change a URL — you must push the updated JSON to n8n's database. Editing the JSON template file alone has no runtime effect.
+Symptoms:
 
-### Process
+- `dify_indexing` failed
+- `failedDocuments` in monitor
 
-1. **Edit the template file**:
-   - GitHub workflow: `infra/n8n/templates/github-to-dify-sync.json`
-   - GitLab workflow: `infra/n8n/templates/gitlab-to-dify-sync.json`
+Actions:
 
-2. **Extract nodes and connections JSON** from the template (the template is the full n8n export format).
+1. Open the step log drawer.
+2. Retry failed documents from the monitor.
+3. Check `docker compose logs dify-api dify-worker --since 30m`.
+4. Exclude or convert persistently unsupported files.
 
-3. **Run the DB update** (use the helper SQL scripts or apply manually):
+### Job Stuck Running
+
+Workflow-service sweeps stale jobs using `lastProgressAt`. To inspect:
+
 ```sql
--- Insert new history version
-INSERT INTO workflow_history (
-  "versionId", "workflowId", authors, nodes, connections, name, autosaved, "createdAt", "updatedAt"
-) VALUES (
-  gen_random_uuid()::text,
-  '4f8dbb73-d6c5-4a55-8178-8c4f51c76d01',   -- GitHub workflow ID
-  'admin',
-  '<nodes-json>'::json,
-  '<connections-json>'::json,
-  'GitHub to Dify Sync',
-  false,
-  NOW(), NOW()
-);
-
--- Point workflow_entity to the new version
-UPDATE workflow_entity
-SET "activeVersionId" = (
-  SELECT "versionId" FROM workflow_history
-  WHERE "workflowId" = '4f8dbb73-d6c5-4a55-8178-8c4f51c76d01'
-  ORDER BY "createdAt" DESC LIMIT 1
-), "updatedAt" = NOW()
-WHERE id = '4f8dbb73-d6c5-4a55-8178-8c4f51c76d01';
-```
-
-4. **Restart n8n** to load the new version:
-```bash
-docker compose restart n8n
-```
-
-5. **Verify** by triggering a test sync and checking the Sync Process Monitor.
-
-### Workflow IDs
-| Workflow | ID |
-|----------|----|
-| GitHub → Dify | `4f8dbb73-d6c5-4a55-8178-8c4f51c76d01` |
-| GitLab → Dify | `22d3d7b8-d94b-4300-a3a3-b55835e6c902` |
-
----
-
-## Diagnostic SQL Queries
-
-### List recent sync jobs for a KB
-```sql
-SELECT id, status, trigger, "filesProcessed", "filesTotal",
-       "errorMessage", "createdAt", "completedAt"
-FROM "RagKbSyncJob"
-WHERE "knowledgeBaseId" = '<kb-id>'
-ORDER BY "createdAt" DESC
-LIMIT 10;
-```
-
-### Inspect step details for a specific job
-```sql
-SELECT "stepsJson"
-FROM "RagKbSyncJob"
-WHERE id = '<sync-job-id>';
-```
-
-### Find all currently running jobs (across all KBs)
-```sql
-SELECT j.id, j.status, j."lastProgressAt", kb.name AS kb_name
+SELECT j.id, j.status, j."lastProgressAt", j."createdAt", kb.name
 FROM "RagKbSyncJob" j
 JOIN "RagKnowledgeBase" kb ON kb.id = j."knowledgeBaseId"
 WHERE j.status IN ('running', 'pending')
 ORDER BY j."createdAt" DESC;
 ```
 
-### Find potentially stale jobs (running but no progress for 10+ minutes)
-```sql
-SELECT j.id, j.status, j."lastProgressAt", kb.name AS kb_name,
-       NOW() - j."lastProgressAt" AS idle_duration
-FROM "RagKbSyncJob" j
-JOIN "RagKnowledgeBase" kb ON kb.id = j."knowledgeBaseId"
-WHERE j.status = 'running'
-  AND (j."lastProgressAt" < NOW() - INTERVAL '10 minutes'
-    OR j."lastProgressAt" IS NULL)
-ORDER BY j."createdAt" DESC;
-```
+Manual timeout:
 
-### Check stored file SHAs for a KB (smart diff state)
-```sql
-SELECT "filePath", "fileSha"
-FROM "RagKbSourcePath"
-WHERE "knowledgeBaseId" = '<kb-id>'
-ORDER BY "filePath"
-LIMIT 50;
-```
-
-### Count tracked files per KB
-```sql
-SELECT kb.name, COUNT(p.id) AS tracked_files
-FROM "RagKnowledgeBase" kb
-LEFT JOIN "RagKbSourcePath" p ON p."knowledgeBaseId" = kb.id
-GROUP BY kb.id, kb.name
-ORDER BY kb.name;
-```
-
-### Manual force-timeout of a stale job
 ```sql
 UPDATE "RagKbSyncJob"
 SET status = 'timed_out',
@@ -311,8 +178,75 @@ WHERE id = '<sync-job-id>'
   AND status IN ('running', 'pending');
 ```
 
-### Clear smart-diff SHA cache (force full re-sync on next run)
+## Diagnostic SQL
+
+Recent jobs:
+
 ```sql
-DELETE FROM "RagKbSourcePath"
-WHERE "knowledgeBaseId" = '<kb-id>';
+SELECT id, status, trigger, "filesProcessed", "filesTotal",
+       "errorMessage", "lastProgressAt", "createdAt", "completedAt"
+FROM "RagKbSyncJob"
+WHERE "knowledgeBaseId" = '<kb-id>'
+ORDER BY "createdAt" DESC
+LIMIT 10;
 ```
+
+Steps:
+
+```sql
+SELECT "stepsJson"
+FROM "RagKbSyncJob"
+WHERE id = '<sync-job-id>';
+```
+
+Tracked files:
+
+```sql
+SELECT "filePath", "fileSha", "difyDocumentId", "syncedAt"
+FROM "RagKbFileTracker"
+WHERE "knowledgeBaseId" = '<kb-id>'
+ORDER BY "filePath"
+LIMIT 100;
+```
+
+Tracked file counts:
+
+```sql
+SELECT kb.name, COUNT(t.id) AS tracked_files
+FROM "RagKnowledgeBase" kb
+LEFT JOIN "RagKbFileTracker" t ON t."knowledgeBaseId" = kb.id
+GROUP BY kb.id, kb.name
+ORDER BY kb.name;
+```
+
+Path filters:
+
+```sql
+SELECT id, name, "sourceType", "sourceUrl", "sourceBranch", "sourcePath", "sourcePaths"
+FROM "RagKnowledgeBase"
+ORDER BY "updatedAt" DESC;
+```
+
+## n8n Workflow Maintenance
+
+Template files:
+
+```text
+infra/n8n/templates/github-to-dify-sync.json
+infra/n8n/templates/gitlab-to-dify-sync.json
+```
+
+Editing the JSON file alone does not update the active n8n workflow. Publish a new `workflow_history` version and update `workflow_entity.activeVersionId`, then recreate n8n if needed:
+
+```bash
+docker compose stop n8n
+docker compose rm -f n8n
+docker compose up -d n8n
+```
+
+Known workflow IDs:
+
+| Workflow | ID |
+|----------|----|
+| GitHub to Dify Sync | `4f8dbb73-d6c5-4a55-8178-8c4f51c76d01` |
+| GitLab to Dify Sync | `22d3d7b8-d94b-4300-a3a3-b55835e6c902` |

@@ -12,6 +12,8 @@ Control API access with role enforcement backed by Keycloak JWTs.
 - Token/client binding is validated against `KEYCLOAK_CLIENT_ID` using `azp`, `aud`, or `resource_access`.
 - Role checks are enforced at API gateway route level.
 - Non-JWT or invalid bearer tokens are rejected as unauthenticated.
+- Current roles are `admin`, `useradmin`, `operator`, `approver`, and `viewer`.
+- `operator` tokens are also granted `useradmin` by the shared auth helper for current compatibility.
 
 ## Key configuration
 - `KEYCLOAK_URL`

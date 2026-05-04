@@ -3,8 +3,8 @@ import type { ReactElement, ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Automation Platform",
-  description: "Enterprise automation platform dashboard"
+  title: "RapidRAG",
+  description: "End-to-end RAG platform — connect your docs, deploy chatbots, get answers instantly."
 };
 
 export default function RootLayout({ children }: { children: ReactNode }): ReactElement {

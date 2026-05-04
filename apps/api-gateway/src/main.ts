@@ -195,8 +195,8 @@ const eventPublisher = new EventPublisher(config.rabbitmqUrl);
 // ─── OAuth2 Connect Integration ───────────────────────────────────────────────
 
 const OAUTH_SECRET = String(process.env.PLATFORM_OAUTH_SECRET ?? "").trim();
-const OAUTH_CALLBACK_BASE_URL = String(process.env.OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/ap").trim();
-const OAUTH_POST_CONNECT_REDIRECT = String(process.env.OAUTH_POST_CONNECT_REDIRECT ?? "https://dev.eclassmanager.com/integrations").trim();
+const OAUTH_CALLBACK_BASE_URL = String(process.env.OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/rapidrag/connect").trim();
+const OAUTH_POST_CONNECT_REDIRECT = String(process.env.OAUTH_POST_CONNECT_REDIRECT ?? "https://dev.eclassmanager.com/rapidrag/integrations").trim();
 const VAULT_ADDR_OAUTH = String(process.env.VAULT_ADDR ?? "http://vault:8200").trim();
 const VAULT_KV_MOUNT_OAUTH = String(process.env.VAULT_KV_MOUNT ?? "secret").trim();
 const VAULT_NAMESPACE_OAUTH = String(process.env.VAULT_NAMESPACE ?? "").trim();
@@ -1187,16 +1187,29 @@ app.delete("/rag/discussions/:id", { preHandler: requireAnyRole(["admin", "usera
   await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/discussions/${id}`);
 });
 
-app.get("/logs", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+// ─── RAG Performance Stats ────────────────────────────────────────────────────
+// Restricted to platform admin and user admin — shows RAG response timing breakdown.
+app.get("/rag/stats", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/stats");
+});
+
+// Platform system logs — restricted to platform admins only.
+// These logs contain all n8n-rag-sync events, cert-control events, and other
+// platform-level operations. useradmin, operator, and viewer roles must NOT
+// see logs created by other users or the platform system.
+app.get("/logs", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.loggingServiceUrl, "/logs");
 });
 
-app.get("/logs/timeline", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+// Timeline logs — restricted to platform admins only for the same reason.
+app.get("/logs/timeline", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.loggingServiceUrl, "/logs/timeline");
 });
 
-// Proxy RAG sync job logs query to logging service (reads from OpenSearch with Postgres fallback)
-app.get("/logs/sync-job", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "viewer"]) }, async (request, reply) => {
+// Sync-job logs: scoped by syncJobId so the caller can only see logs for a
+// specific sync job they triggered. Accessible to admin and useradmin since
+// useradmin users trigger syncs and need to see their own sync job logs.
+app.get("/logs/sync-job", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.loggingServiceUrl, "/logs/sync-job");
 });
 
@@ -1225,6 +1238,17 @@ app.get("/oauth/connect/:provider", { preHandler: requireAnyRole(["admin", "user
   const nonce = randomBytes(24).toString("hex");
   const payload = Buffer.from(JSON.stringify({ userId, kbId, provider, nonce, exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS })).toString("base64url");
   const state = signState(payload);
+
+  // Store nonce in Redis so the callback can verify it as single-use.
+  // Must happen BEFORE redirecting to the provider — if Redis fails we still allow
+  // the flow but log a warning (the HMAC signature still provides replay protection).
+  try {
+    await getRedis().set(`oauth:state:${nonce}`, "1", "EX", STATE_TTL_SECONDS);
+  } catch (redisErr) {
+    logInfo("OAuth state Redis set failed — proceeding without nonce lock", {
+      error: redisErr instanceof Error ? redisErr.message : String(redisErr)
+    });
+  }
 
   const redirectUri = `${OAUTH_CALLBACK_BASE_URL}/oauth/callback/${provider}`;
   const authorizeUrl = new URL(provCfg.authUrl);

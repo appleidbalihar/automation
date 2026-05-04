@@ -4,8 +4,12 @@ import type { ReactElement } from "react";
 import { useEffect, useRef, useState } from "react";
 import type { Integration } from "./types";
 
-const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.eclassmanager.com").replace(/\/$/, "");
-const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/ap").replace(/\/$/, "");
+// PLATFORM_URL and OAUTH_CALLBACK_BASE are driven by env vars set in .env / .env.production.
+// Fallbacks use the /rapidrag path prefix so they're correct even without env vars.
+// Dev:  NEXT_PUBLIC_PLATFORM_URL=https://dev.eclassmanager.com/rapidrag
+// Prod: NEXT_PUBLIC_PLATFORM_URL=https://theaitools.ca/rapidrag
+const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.eclassmanager.com/rapidrag").replace(/\/$/, "");
+const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/rapidrag/connect").replace(/\/$/, "");
 
 type Props = {
   integration: Integration | null;
@@ -233,13 +237,20 @@ export function EditSourceModal(props: Props): ReactElement | null {
                       <div className="ops-oauth-app-creds-fields">
                         <label>
                           <span>Client ID {integration.oauthAppConfigured ? <span className="ops-oauth-cred-badge ops-oauth-cred-badge-ok">✓ Set</span> : null}</span>
-                          <input value={appClientId} onChange={(e) => setAppClientId(e.target.value)} placeholder={integration.oauthAppConfigured ? "••••• (already set — paste to update)" : `${providerLabel} Client ID`} autoComplete="off" />
+                          {/* Show masked placeholder when configured — never show actual stored value */}
+                          <input
+                            value={appClientId}
+                            onChange={(e) => setAppClientId(e.target.value)}
+                            placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client ID`}
+                            autoComplete="off"
+                          />
                         </label>
                         <label>
                           <span>Client Secret {integration.oauthAppConfigured ? <span className="ops-oauth-cred-badge ops-oauth-cred-badge-ok">✓ Set</span> : null}</span>
-                          <input type="password" value={appClientSecret} onChange={(e) => setAppClientSecret(e.target.value)} placeholder={integration.oauthAppConfigured ? "••••• (already set — paste to update)" : `${providerLabel} Client Secret`} autoComplete="off" />
+                          <input type="password" value={appClientSecret} onChange={(e) => setAppClientSecret(e.target.value)} placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client Secret`} autoComplete="off" />
                         </label>
                       </div>
+                      <p className="ops-oauth-app-creds-note">{integration.oauthAppConfigured ? "App credentials are configured. Leave blank to keep existing." : "Enter your OAuth App credentials to connect."}</p>
                     </div>
                     <div className="ops-edit-oauth-actions">
                       <button
@@ -266,14 +277,20 @@ export function EditSourceModal(props: Props): ReactElement | null {
                       <div className="ops-oauth-app-creds-fields">
                         <label>
                           <span>Client ID {integration.oauthAppConfigured ? <span className="ops-oauth-cred-badge ops-oauth-cred-badge-ok">✓ Set</span> : null}</span>
-                          <input value={appClientId} onChange={(e) => setAppClientId(e.target.value)} placeholder={integration.oauthAppConfigured ? "••••• (already set — paste to update)" : `${providerLabel} Client ID`} autoComplete="off" />
+                          {/* Show blank input — never echo back the stored client_id value from state */}
+                          <input
+                            value={appClientId}
+                            onChange={(e) => setAppClientId(e.target.value)}
+                            placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client ID`}
+                            autoComplete="off"
+                          />
                         </label>
                         <label>
                           <span>Client Secret {integration.oauthAppConfigured ? <span className="ops-oauth-cred-badge ops-oauth-cred-badge-ok">✓ Set</span> : null}</span>
-                          <input type="password" value={appClientSecret} onChange={(e) => setAppClientSecret(e.target.value)} placeholder={integration.oauthAppConfigured ? "••••• (already set — paste to update)" : `${providerLabel} Client Secret`} autoComplete="off" />
+                          <input type="password" value={appClientSecret} onChange={(e) => setAppClientSecret(e.target.value)} placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client Secret`} autoComplete="off" />
                         </label>
                       </div>
-                      <p className="ops-oauth-app-creds-note">{integration.oauthAppConfigured ? "App credentials already configured for this integration. Leave blank to keep existing." : "Leave blank to use admin-configured credentials."}</p>
+                      <p className="ops-oauth-app-creds-note">{integration.oauthAppConfigured ? "App credentials are configured. Leave blank to keep existing." : "Leave blank to use admin-configured credentials."}</p>
                     </div>
                     <button
                       type="button"
@@ -286,16 +303,17 @@ export function EditSourceModal(props: Props): ReactElement | null {
                 )}
               </div>
             ) : (
+              /* PAT tab — only shown when user explicitly selects Token (PAT) */
               <div className="ops-edit-cred-pat">
                 {integration.authMethod === "oauth" ? (
-                  <p className="ops-pat-note">⚠ OAuth is active — this PAT will be ignored unless you disconnect OAuth first.</p>
+                  <p className="ops-pat-note">⚠ OAuth is currently active. Save a PAT here if you want to switch to token authentication — then disconnect OAuth.</p>
                 ) : null}
                 <div className="ops-pat-input-row">
                   <input
                     type="password"
                     value={patDraft}
                     onChange={(e) => setPatDraft(e.target.value)}
-                    placeholder={`${providerLabel} personal access token`}
+                    placeholder={integration.credentialConfigured ? `${providerLabel} personal access token (already set — paste to update)` : `${providerLabel} personal access token`}
                     className="ops-pat-input"
                   />
                   <button

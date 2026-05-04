@@ -83,11 +83,11 @@ function LoginPanel({
   return (
     <main className="login-shell">
       <section className="login-card">
-        <h1>{mode === "login" ? "Automation Platform Sign In" : "Automation Platform Registration"}</h1>
+        <h1>{mode === "login" ? "Sign in to RapidRAG" : "Create your RapidRAG account"}</h1>
         <p>
           {mode === "login"
-            ? "Sign in with the application account platform-admin / admin123. The Keycloak console admin account is separate."
-            : "Create your account. The user will be provisioned in Keycloak automatically."}
+            ? "Sign in to access your knowledge bases, integrations, and AI chatbots."
+            : "Create your account to get started. Your user will be provisioned automatically."}
         </p>
         <div className="integration-tabs">
           <button type="button" className={mode === "login" ? "tab-active" : ""} onClick={() => setMode("login")}>
@@ -159,7 +159,7 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
     return (
       <main className="login-shell">
         <section className="login-card">
-          <h1>Automation Platform</h1>
+          <h1>RapidRAG</h1>
           <p>Validating session...</p>
         </section>
       </main>
