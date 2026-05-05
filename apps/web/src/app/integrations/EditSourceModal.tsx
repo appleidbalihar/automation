@@ -56,6 +56,18 @@ function resolveInitialPaths(integration: Integration): string[] {
   return arr.length > 0 ? arr : [""];
 }
 
+function normalizeDocumentPaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const raw of paths) {
+    const path = raw.trim().replace(/^\/+|\/+$/g, "");
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    normalized.push(path);
+  }
+  return normalized;
+}
+
 export function EditSourceModal(props: Props): ReactElement | null {
   const { integration, busy, onClose, onSave, onOAuthReconnect, onOAuthDisconnect, onUpdateToken } = props;
 
@@ -97,12 +109,17 @@ export function EditSourceModal(props: Props): ReactElement | null {
     : "GitHub";
   const oauthProvider = integration.sourceType === "googledrive" ? "google" : integration.sourceType;
   const supportsOauth = ["github", "gitlab", "googledrive"].includes(integration.sourceType);
+  const clientIdPlaceholder = integration.oauthAppConfigured
+    ? integration.oauthClientIdLast4
+      ? `Client ID ending in ${integration.oauthClientIdLast4} - paste new value to update`
+      : "Client ID set - paste new value to update"
+    : `${providerLabel} Client ID`;
 
   // The "original" saved paths for diff computation
-  const originalPaths = resolveInitialPaths(integration).filter(Boolean);
+  const originalPaths = normalizeDocumentPaths(resolveInitialPaths(integration));
 
   function handleSave(): void {
-    const filteredPaths = [...new Set(sourcePaths.map((p) => p.trim()).filter(Boolean))];
+    const filteredPaths = normalizeDocumentPaths(sourcePaths);
     const origSet = new Set(originalPaths);
     const newSet = new Set(filteredPaths);
 
@@ -118,9 +135,9 @@ export function EditSourceModal(props: Props): ReactElement | null {
         projectName: projectName.trim() || undefined,
         description: description.trim() || undefined,
         sourceBranch: sourceBranch.trim() || undefined,
-        sourcePaths: filteredPaths.length > 0 ? filteredPaths : undefined,
+        sourcePaths: filteredPaths,
         // backward-compat single-path field
-        sourcePath: filteredPaths[0] ?? undefined
+        sourcePath: filteredPaths[0] ?? null
       },
       { addedPaths, removedPaths, projectNameChanged }
     );
@@ -241,7 +258,7 @@ export function EditSourceModal(props: Props): ReactElement | null {
                           <input
                             value={appClientId}
                             onChange={(e) => setAppClientId(e.target.value)}
-                            placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client ID`}
+                            placeholder={clientIdPlaceholder}
                             autoComplete="off"
                           />
                         </label>
@@ -281,7 +298,7 @@ export function EditSourceModal(props: Props): ReactElement | null {
                           <input
                             value={appClientId}
                             onChange={(e) => setAppClientId(e.target.value)}
-                            placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client ID`}
+                            placeholder={clientIdPlaceholder}
                             autoComplete="off"
                           />
                         </label>

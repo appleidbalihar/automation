@@ -4,7 +4,7 @@ import Link from "next/link";
 import type { KeyboardEvent, ReactElement, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { resolveApiBase } from "./api-base";
-import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
+import { authHeaderFromStoredTokenOrRefresh, clearStoredToken, fetchIdentity } from "./auth-client";
 
 type RagDiscussionBackend = "dify";
 
@@ -115,8 +115,8 @@ function formatMessageTime(value: string): string {
   return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
-function buildRequestHeaders(hasBody: boolean): Record<string, string> {
-  const authorization = authHeaderFromStoredToken();
+async function buildRequestHeaders(hasBody: boolean): Promise<Record<string, string>> {
+  const authorization = await authHeaderFromStoredTokenOrRefresh();
   if (!authorization) throw new Error("You are not signed in.");
   return {
     authorization,
@@ -126,17 +126,31 @@ function buildRequestHeaders(hasBody: boolean): Record<string, string> {
 
 async function fetchRag<T>(path: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body !== undefined;
-  const response = await fetch(`${resolveApiBase()}${path}`, {
+  let response = await fetch(`${resolveApiBase()}${path}`, {
     ...init,
-    headers: { ...buildRequestHeaders(hasBody), ...(init?.headers ?? {}) }
+    headers: { ...(await buildRequestHeaders(hasBody)), ...(init?.headers ?? {}) }
   });
-  const raw = await response.text();
-  const payload = raw ? safeParseJson(raw) : undefined;
+  let raw = await response.text();
+  let payload = raw ? safeParseJson(raw) : undefined;
   if (!response.ok) {
     const details =
       readErrorField(payload, "details") ??
       readErrorField(payload, "error") ??
       `Request failed with status ${response.status}`;
+    if (response.status === 401 && details === "UNAUTHENTICATED") {
+      const authorization = await authHeaderFromStoredTokenOrRefresh(true);
+      if (authorization) {
+        response = await fetch(`${resolveApiBase()}${path}`, {
+          ...init,
+          headers: { authorization, ...(hasBody ? { "content-type": "application/json" } : {}), ...(init?.headers ?? {}) }
+        });
+        raw = await response.text();
+        payload = raw ? safeParseJson(raw) : undefined;
+        if (response.ok) return (payload ?? {}) as T;
+      }
+      clearStoredToken();
+      throw new Error("Your session expired. Sign in again to continue.");
+    }
     throw new Error(details);
   }
   return (payload ?? {}) as T;

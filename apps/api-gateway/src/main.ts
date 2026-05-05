@@ -1188,8 +1188,8 @@ app.delete("/rag/discussions/:id", { preHandler: requireAnyRole(["admin", "usera
 });
 
 // ─── RAG Performance Stats ────────────────────────────────────────────────────
-// Restricted to platform admin and user admin — shows RAG response timing breakdown.
-app.get("/rag/stats", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+// Restricted to platform admin only — shows platform-wide RAG response timing.
+app.get("/rag/stats", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
   await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/stats");
 });
 

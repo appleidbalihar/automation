@@ -17,6 +17,18 @@ import { EMPTY_FORM } from "./integrations/types";
 type OAuthProvider = "github" | "gitlab" | "googledrive";
 type SyncTriggerResponse = { accepted: boolean; syncJobId: string; knowledgeBaseId: string };
 
+function normalizeDocumentPaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const raw of paths) {
+    const path = raw.trim().replace(/^\/+|\/+$/g, "");
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    normalized.push(path);
+  }
+  return normalized;
+}
+
 // ShareModal is defined here to allow the linter to keep it imported.
 // It re-exports ShareKbModal from the integrations folder.
 // Keeping it as a named local alias avoids auto-import-removal by the formatter.
@@ -77,7 +89,7 @@ export function IntegrationsPage(): ReactElement {
     setError("");
     try {
       // Build the path fields: send both sourcePaths array and sourcePath (first entry) for backward compat
-      const filteredPaths = form.sourcePaths.map((p) => p.trim()).filter(Boolean);
+      const filteredPaths = normalizeDocumentPaths(form.sourcePaths);
       const created = await requestJson<Integration>("/rag/integrations", "POST", {
         name: form.name.trim(),
         projectName: form.projectName.trim() || undefined,
@@ -113,7 +125,7 @@ export function IntegrationsPage(): ReactElement {
     setError("");
     try {
       // Build the path fields: send both sourcePaths array and sourcePath (first entry) for backward compat
-      const filteredPaths = form.sourcePaths.map((p) => p.trim()).filter(Boolean);
+      const filteredPaths = normalizeDocumentPaths(form.sourcePaths);
       // Create the integration record first (no token) then redirect to OAuth
       const created = await requestJson<Integration>("/rag/integrations", "POST", {
         name: form.name.trim(),

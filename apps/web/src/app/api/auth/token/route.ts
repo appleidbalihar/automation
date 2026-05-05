@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 interface TokenRequestBody {
   username?: string;
   password?: string;
+  refreshToken?: string;
 }
 
 function requiredEnv(name: string, fallback: string): string {
@@ -13,8 +14,9 @@ export async function POST(request: Request): Promise<NextResponse> {
   const body = (await request.json().catch(() => ({}))) as TokenRequestBody;
   const username = String(body.username ?? "").trim();
   const password = String(body.password ?? "").trim();
+  const refreshToken = String(body.refreshToken ?? "").trim();
 
-  if (!username || !password) {
+  if (!refreshToken && (!username || !password)) {
     return NextResponse.json({ error: "USERNAME_AND_PASSWORD_REQUIRED" }, { status: 400 });
   }
 
@@ -28,10 +30,15 @@ export async function POST(request: Request): Promise<NextResponse> {
       : "";
 
   const form = new URLSearchParams();
-  form.set("grant_type", "password");
   form.set("client_id", keycloakClientId);
-  form.set("username", username);
-  form.set("password", password);
+  if (refreshToken) {
+    form.set("grant_type", "refresh_token");
+    form.set("refresh_token", refreshToken);
+  } else {
+    form.set("grant_type", "password");
+    form.set("username", username);
+    form.set("password", password);
+  }
   if (keycloakClientSecret) {
     form.set("client_secret", keycloakClientSecret);
   }

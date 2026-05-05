@@ -40,6 +40,7 @@ export type Integration = {
   latestSyncJob: SyncJob | null;
   authMethod: "oauth" | "pat" | null;
   oauthAppConfigured: boolean;
+  oauthClientIdLast4: string | null;
 };
 
 export type IntegrationForm = {

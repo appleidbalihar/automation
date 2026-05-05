@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { clearStoredToken, fetchIdentity, normalizeToken, saveStoredToken } from "./auth-client";
+import { AUTH_SESSION_CLEARED_EVENT, clearStoredToken, fetchIdentity, saveStoredToken } from "./auth-client";
 
 interface Identity {
   userId: string;
@@ -35,12 +35,18 @@ function LoginPanel({
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ username, password })
       });
-      const payload = (await response.json()) as { accessToken?: string; error?: string; details?: string };
+      const payload = (await response.json()) as {
+        accessToken?: string;
+        refreshToken?: string;
+        expiresIn?: number;
+        error?: string;
+        details?: string;
+      };
       if (!response.ok || !payload.accessToken) {
         setError(payload.details ?? payload.error ?? "Login failed");
         return;
       }
-      saveStoredToken(normalizeToken(payload.accessToken));
+      saveStoredToken(payload.accessToken, payload.refreshToken, payload.expiresIn);
       const identity = await fetchIdentity();
       onSignedIn(identity);
     } catch (requestError) {
@@ -138,6 +144,12 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
 
   useEffect(() => {
     let mounted = true;
+    function handleSessionCleared(): void {
+      if (!mounted) return;
+      setIdentity(null);
+      setStatus("signed-out");
+    }
+    window.addEventListener(AUTH_SESSION_CLEARED_EVENT, handleSessionCleared);
     fetchIdentity()
       .then((result) => {
         if (!mounted) return;
@@ -152,6 +164,7 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
       });
     return () => {
       mounted = false;
+      window.removeEventListener(AUTH_SESSION_CLEARED_EVENT, handleSessionCleared);
     };
   }, []);
 
