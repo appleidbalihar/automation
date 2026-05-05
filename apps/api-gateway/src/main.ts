@@ -1065,6 +1065,18 @@ app.patch("/rag/knowledge-bases/:id/config", { preHandler: requireAnyRole(["admi
   await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/config`);
 });
 
+
+// Returns the platform default system prompt (read-only, admin/useradmin only).
+// NOTE: Must come BEFORE /rag/knowledge-bases/:id routes to avoid route conflict.
+app.get("/rag/knowledge-bases/default-prompt", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/knowledge-bases/default-prompt");
+});
+
+// AI-powered system prompt generator — rewrites a rough description into a polished prompt.
+app.post("/rag/knowledge-bases/:id/generate-prompt", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/generate-prompt`);
+});
 // ─── KB Share Management Routes ───────────────────────────────────────────────
 // Owner or admin can share a KB with another user by their username.
 app.post("/rag/knowledge-bases/:id/shares", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {

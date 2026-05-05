@@ -16,6 +16,8 @@ type Props = {
   onDelete: (id: string) => void;
   onCleanup: (id: string) => void;
   onShare: (id: string) => void;
+  /** Optional: if provided, shows the System Prompt config button (admin/useradmin only). */
+  onConfigurePrompt?: (id: string) => void;
   status: string;
   error: string;
   onCreateSource: () => void;
@@ -39,7 +41,7 @@ function resolvePaths(integration: Integration): string[] {
 }
 
 export function KnowledgeSourcesTable(props: Props): ReactElement {
-  const { integrations, busy, onSetDefault, onSync, onRetryFailedIndexing, onCancelSync, onEdit, onDelete, onCleanup, onShare, status, error, onCreateSource } = props;
+  const { integrations, busy, onSetDefault, onSync, onRetryFailedIndexing, onCancelSync, onEdit, onDelete, onCleanup, onShare, onConfigurePrompt, status, error, onCreateSource } = props;
 
   const sortedIntegrations = useMemo(
     () => [...integrations].sort((a, b) => Number(b.isDefault) - Number(a.isDefault)),
@@ -58,144 +60,126 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
             + Create Source
           </button>
           <div className="integrations-status-stack">
-            {status ? <span className="integrations-status-success">{status}</span> : null}
-            {error ? <span className="integrations-status-error">{error}</span> : null}
+            {status ? <p className="ops-status-ok">{status}</p> : null}
+            {error ? <p className="ops-status-error">{error}</p> : null}
           </div>
         </div>
       </div>
 
-      {sortedIntegrations.length === 0 ? (
-        <div className="integrations-empty-state">
-          <strong>No sources connected yet.</strong>
-          <span>Use &quot;+ Create Source&quot; to add your first knowledge source.</span>
+      {integrations.length === 0 ? (
+        <div className="integrations-empty">
+          <p>No sources yet. Create your first knowledge source to get started.</p>
         </div>
       ) : (
         <div className="integrations-table-wrap">
           <table className="integrations-table">
             <thead>
               <tr>
+                <th>Name</th>
                 <th>Source</th>
-                <th>Project</th>
-                <th>Type</th>
-                <th>Location</th>
                 <th>Auth</th>
                 <th>Status</th>
-                <th>Latest Sync</th>
+                <th>Last Sync</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               {sortedIntegrations.map((integration) => {
-                const job = integration.latestSyncJob;
-                const syncRunning = job && ["running", "pending"].includes(String(job.status).toLowerCase());
-                const canRetryIndexing = hasFailedDifyIndexing(job);
                 const paths = resolvePaths(integration);
+                const latestJob = integration.latestSyncJob;
+                const syncStatus = latestJob?.status ?? "never_synced";
+                const isActiveSync = syncStatus === "running" || syncStatus === "pending";
+                const failedIndexing = hasFailedDifyIndexing(latestJob);
 
                 return (
-                  <tr key={integration.id}>
-                    {/* Source name */}
+                  <tr key={integration.id} className={integration.isDefault ? "integrations-row-default" : ""}>
+                    <td>
+                      <div className="integrations-name-cell">
+                        <span className="integrations-name">{integration.name}</span>
+                        {integration.isDefault ? (
+                          <span className="integrations-badge integrations-badge-default">Default</span>
+                        ) : null}
+                      </div>
+                    </td>
                     <td>
                       <div className="integrations-source-cell">
-                        <strong>
-                          {integration.name}
-                          {integration.isDefault ? <span className="ops-default-chip"> Default</span> : null}
-                        </strong>
-                        <span className="ops-source-desc">{integration.description || "No description provided."}</span>
-                      </div>
-                    </td>
-
-                    {/* Project name */}
-                    <td>
-                      {integration.projectName ? (
-                        <span className="ops-project-chip">{integration.projectName}</span>
-                      ) : (
-                        <span className="ops-source-desc">—</span>
-                      )}
-                    </td>
-
-                    {/* Type */}
-                    <td>
-                      <span className="ops-type-chip">{integration.sourceType}</span>
-                    </td>
-
-                    {/* Location */}
-                    <td>
-                      <div className="integrations-location-cell">
-                        <span className="ops-url-text">{integration.sourceUrl}</span>
+                        <span className="integrations-source-type">{integration.sourceType}</span>
+                        <a
+                          href={integration.sourceUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="integrations-source-url"
+                          title={integration.sourceUrl}
+                        >
+                          {integration.sourceUrl.replace(/^https?:\/\//, "").slice(0, 40)}
+                          {integration.sourceUrl.length > 47 ? "…" : ""}
+                        </a>
                         {integration.sourceBranch ? (
-                          <small className="ops-branch-label">⎇ {integration.sourceBranch}</small>
+                          <span className="integrations-source-branch">@{integration.sourceBranch}</span>
                         ) : null}
                         {paths.length > 0 ? (
-                          <div className="ops-paths-list">
-                            {paths.map((p, idx) => (
-                              <small key={idx} className="ops-path-item">📁 {p}</small>
-                            ))}
-                          </div>
+                          <span className="integrations-source-paths" title={paths.join(", ")}>
+                            {paths.slice(0, 2).join(", ")}{paths.length > 2 ? ` +${paths.length - 2}` : ""}
+                          </span>
                         ) : null}
                       </div>
                     </td>
-
-                    {/* Auth method */}
                     <td>{authBadge(integration.authMethod, integration.credentialConfigured)}</td>
-
-                    {/* Readiness */}
                     <td>
-                      <div className="ops-status-stack">
-                        <span className={`integrations-badge${integration.chatReady ? " integrations-badge-good" : " integrations-badge-bad"}`}>
-                          {integration.chatReady ? "Ready" : "Awaiting provisioning"}
-                        </span>
-                        {!integration.workflowAssigned ? (
-                          <span className="integrations-badge integrations-badge-bad">No workflow</span>
+                      <div className="integrations-status-cell">
+                        {integration.chatReady ? (
+                          <span className="integrations-badge integrations-badge-good">Chat ready</span>
+                        ) : (
+                          <span className="integrations-badge integrations-badge-warn">Not ready</span>
+                        )}
+                        {syncStatus === "completed" ? (
+                          <span className="integrations-badge integrations-badge-good">Synced</span>
+                        ) : syncStatus === "failed" ? (
+                          <span className="integrations-badge integrations-badge-bad" title={latestJob?.errorMessage ?? undefined}>
+                            Sync failed
+                          </span>
+                        ) : syncStatus === "running" || syncStatus === "pending" ? (
+                          <span className="integrations-badge integrations-badge-running">Syncing…</span>
+                        ) : null}
+                        {failedIndexing ? (
+                          <span className="integrations-badge integrations-badge-warn">Indexing errors</span>
                         ) : null}
                       </div>
                     </td>
-
-                    {/* Latest sync */}
                     <td>
-                      <div className="integrations-sync-cell">
-                        <span>{job ? job.status : "Never run"}</span>
-                        <small>{formatDate(job?.createdAt ?? job?.startedAt)}</small>
-                        {job ? (
-                          <small>
-                            {job.filesProcessed ?? 0}
-                            {job.filesTotal != null ? ` / ${job.filesTotal}` : ""} files
-                          </small>
-                        ) : null}
-                        {job?.errorMessage ? <em className="ops-sync-error">{job.errorMessage}</em> : null}
-                      </div>
+                      {latestJob?.completedAt ? formatDate(latestJob.completedAt) : "Never"}
                     </td>
-
-                    {/* Actions */}
                     <td>
-                      <div className="ops-row-actions">
-                        {syncRunning ? (
+                      <div className="integrations-actions">
+                        {isActiveSync ? (
                           <button
                             type="button"
                             className="ops-action-btn ops-action-cancel"
-                            onClick={() => void onCancelSync(integration.id)}
+                            onClick={() => onCancelSync(integration.id)}
                             disabled={busy === `cancel:${integration.id}`}
+                            title="Cancel running sync"
                           >
                             {busy === `cancel:${integration.id}` ? "…" : "Cancel"}
                           </button>
                         ) : (
                           <>
-                            {canRetryIndexing ? (
+                            {failedIndexing ? (
                               <button
                                 type="button"
                                 className="ops-action-btn ops-action-retry"
-                                onClick={() => void onRetryFailedIndexing(integration.id)}
-                                disabled={busy === `retry-indexing:${integration.id}`}
-                                title="Retry only the Dify documents that failed indexing"
+                                onClick={() => onRetryFailedIndexing(integration.id)}
+                                disabled={busy === `retry:${integration.id}` || !integration.syncReady}
+                                title="Retry failed Dify indexing for this source"
                               >
-                                {busy === `retry-indexing:${integration.id}` ? "…" : "Retry indexing"}
+                                {busy === `retry:${integration.id}` ? "Retrying…" : "↺ Retry"}
                               </button>
                             ) : null}
                             <button
                               type="button"
-                              className={`ops-action-btn${integration.syncReady ? " ops-action-sync" : " ops-action-sync-disabled"}`}
-                              onClick={() => void onSync(integration.id)}
-                              disabled={!integration.syncReady || busy === `sync:${integration.id}`}
-                              title={integration.syncReady ? "Trigger a full sync for this knowledge source" : syncDisabledReason(integration)}
+                              className={integration.syncReady ? "ops-action-btn ops-action-sync" : "ops-action-btn ops-action-sync ops-action-btn-disabled"}
+                              onClick={() => integration.syncReady ? onSync(integration.id) : undefined}
+                              disabled={busy === `sync:${integration.id}` || !integration.syncReady}
+                              title={integration.syncReady ? "Sync documents from source" : syncDisabledReason(integration)}
                             >
                               {busy === `sync:${integration.id}` ? "Syncing…" : "⟳ Sync"}
                             </button>
@@ -220,6 +204,18 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                         >
                           🔗 Share
                         </button>
+
+                        {/* System Prompt — admin/useradmin only, configure per-KB prompt */}
+                        {onConfigurePrompt ? (
+                          <button
+                            type="button"
+                            className="ops-action-btn ops-action-prompt"
+                            onClick={() => onConfigurePrompt(integration.id)}
+                            title="Configure system prompt for this knowledge base (admin/useradmin only)"
+                          >
+                            🤖 Prompt
+                          </button>
+                        ) : null}
 
                         {!integration.isDefault ? (
                           <button

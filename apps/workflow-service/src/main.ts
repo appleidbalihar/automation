@@ -740,6 +740,68 @@ async function createDifyApp(session: DifyConsoleSession, name: string, descript
   return appId;
 }
 
+/**
+ * Platform-level default system prompt — always applied to every knowledge base.
+ * This is the baseline RAG behaviour for the entire platform.
+ *
+ * Admins can view this in the UI (read-only). KB owners can ADD per-KB instructions
+ * on top of this via RagKnowledgeBaseConfig.systemPromptBase — they cannot replace
+ * or disable this default.
+ *
+ * To update: change this constant and redeploy the workflow-service.
+ * The new prompt will be used on the next chat message for all KBs automatically.
+ * It is also applied when a KB is re-provisioned (ensureDifyKnowledgeBaseProvisioned).
+ */
+export const PLATFORM_DEFAULT_SYSTEM_PROMPT =
+  "You are Operations AI, an expert assistant that answers questions using the connected knowledge base documents.\n\n" +
+  "Instructions:\n" +
+  "1. Base every answer on the retrieved document chunks provided in context. Do not invent facts.\n" +
+  "2. For questions about Docker containers or services, look for service names, port numbers, and purpose descriptions in the chunks.\n" +
+  "3. Database tables (PlatformLog, RagKnowledgeBase, etc.) are DIFFERENT from Docker containers — do not confuse them.\n" +
+  "4. For external documents (PDFs, DOCX, XLSX, PPTX, CSV, HTML, or any uploaded file): extract and quote the relevant facts directly from the retrieved chunks, even if the chunk is not perfectly structured.\n" +
+  "5. Always cite which document name your answer comes from.\n" +
+  "6. If the exact answer is not present in the retrieved chunks, clearly state what is missing and suggest syncing additional source paths or adding a companion index document for that file.";
+
+/**
+ * Compose the final system prompt sent to Dify by layering:
+ *   Layer 1: PLATFORM_DEFAULT_SYSTEM_PROMPT (always present, read-only for admins)
+ *   Layer 2: KB-specific system prompt (set by useradmin/admin per knowledge source)
+ *   Layer 3: Response style + tone instructions (user-adjustable)
+ *
+ * This allows per-KB customisation without losing the platform safety baseline.
+ */
+function buildFinalSystemPrompt(kbConfig: {
+  systemPromptBase?: string | null;
+  responseStyle?: string | null;
+  toneInstructions?: string | null;
+  restrictionRules?: string | null;
+} | null): string {
+  const parts: string[] = [PLATFORM_DEFAULT_SYSTEM_PROMPT];
+
+  // Layer 2: KB-specific instructions set by useradmin/admin
+  const kbPrompt = kbConfig?.systemPromptBase?.trim();
+  if (kbPrompt) {
+    parts.push(`\n\n## Knowledge Base Context\n${kbPrompt}`);
+  }
+
+  // Layer 3: Response style preferences (user-adjustable)
+  const styleLines: string[] = [];
+  if (kbConfig?.responseStyle?.trim()) {
+    styleLines.push(`Respond in a ${kbConfig.responseStyle.trim()} style.`);
+  }
+  if (kbConfig?.toneInstructions?.trim()) {
+    styleLines.push(kbConfig.toneInstructions.trim());
+  }
+  if (kbConfig?.restrictionRules?.trim()) {
+    styleLines.push(`Topic restriction: ${kbConfig.restrictionRules.trim()}`);
+  }
+  if (styleLines.length > 0) {
+    parts.push(`\n\n## Response Style\n${styleLines.join(" ")}`);
+  }
+
+  return parts.join("").trim();
+}
+
 async function configureDifyApp(session: DifyConsoleSession, appId: string, datasetId: string): Promise<void> {
   await difyConsoleFetch(session.baseUrl, `/apps/${appId}/model-config`, {
     method: "POST",
@@ -759,15 +821,7 @@ async function configureDifyApp(session: DifyConsoleSession, appId: string, data
         }
       },
       prompt_type: "simple",
-      pre_prompt:
-        "You are Operations AI, an expert assistant that answers questions using the connected knowledge base documents.\n\n" +
-        "Instructions:\n" +
-        "1. Base every answer on the retrieved document chunks provided in context. Do not invent facts.\n" +
-        "2. For questions about Docker containers or services, look for service names, port numbers, and purpose descriptions in the chunks.\n" +
-        "3. Database tables (PlatformLog, RagKnowledgeBase, etc.) are DIFFERENT from Docker containers — do not confuse them.\n" +
-        "4. For external documents (PDFs, DOCX, XLSX, PPTX, CSV, HTML, or any uploaded file): extract and quote the relevant facts directly from the retrieved chunks, even if the chunk is not perfectly structured.\n" +
-        "5. Always cite which document name your answer comes from.\n" +
-        "6. If the exact answer is not present in the retrieved chunks, clearly state what is missing and suggest syncing additional source paths or adding a companion index document for that file.",
+      pre_prompt: PLATFORM_DEFAULT_SYSTEM_PROMPT,
       dataset_configs: {
         retrieval_model: "multiple",
         datasets: {
@@ -4237,6 +4291,114 @@ app.get("/rag/stats", async (request, reply) => {
       error: "STATS_FETCH_FAILED",
       details: error instanceof Error ? error.message : String(error)
     });
+  }
+});
+
+// ─── Platform Default Prompt endpoint ────────────────────────────────────────
+// Returns the platform default system prompt so the UI can show it read-only.
+// Visible to admin and useradmin — they need to see it to know what they're adding to.
+
+app.get("/rag/knowledge-bases/default-prompt", async (request, reply) => {
+  return {
+    defaultPrompt: PLATFORM_DEFAULT_SYSTEM_PROMPT,
+    description:
+      "This prompt is always applied to every knowledge base chat session. " +
+      "You can add KB-specific instructions below it — they will be appended after this default."
+  };
+});
+
+// ─── AI Prompt Generator endpoint ────────────────────────────────────────────
+// Accepts a rough user description and uses the configured LLM (via Dify API)
+// to rewrite it into a professional, RAG-optimised system prompt instruction.
+// Only accessible to admin and useradmin roles.
+
+app.post("/rag/knowledge-bases/:id/generate-prompt", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const headers = request.headers as Record<string, unknown>;
+
+  if (!isAdminOrUserAdmin(headers)) {
+    return reply.code(403).send({ error: "FORBIDDEN_ADMIN_OR_USERADMIN_ONLY" });
+  }
+
+  const body = (request.body ?? {}) as { description?: string };
+  const description = String(body.description ?? "").trim();
+  if (!description) {
+    return reply.code(400).send({ error: "DESCRIPTION_REQUIRED" });
+  }
+  if (description.length > 5000) {
+    return reply.code(400).send({ error: "DESCRIPTION_TOO_LONG", max: 5000 });
+  }
+
+  // Verify the KB exists and the user has access
+  const userId = requesterUserId(headers);
+  const privileged = isAdminOrUserAdmin(headers);
+  const hasAccess = await canAccessKnowledgeBase(id, userId, privileged);
+  if (!hasAccess) {
+    return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+  }
+
+  const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id } });
+  if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+
+  // Fetch the Dify app API key from Vault to make the LLM call
+  const difySecrets = await readVaultKv(`platform/global/dify/${id}`);
+  const apiKey = String(difySecrets.app_api_key ?? difySecrets.api_key ?? "").trim();
+  if (!apiKey) {
+    return reply.code(503).send({ error: "DIFY_NOT_CONFIGURED", details: "Knowledge base must be provisioned before generating a prompt." });
+  }
+
+  // Meta-prompt: ask the LLM to rewrite the user's rough description into a polished system prompt
+  const metaPrompt =
+    `Rewrite the following rough description into a clear, professional system prompt instruction for a RAG (knowledge base) chat assistant.\n\n` +
+    `Requirements:\n` +
+    `- Describe what the knowledge base contains and its intended audience\n` +
+    `- Give specific instructions on how the assistant should answer questions\n` +
+    `- Be concise (3-6 sentences maximum)\n` +
+    `- Use professional, clear language\n` +
+    `- Do NOT include generic instructions about citing sources or not inventing facts (those are already in the platform default)\n` +
+    `- Focus only on what makes THIS knowledge base special\n\n` +
+    `Rough description from the user:\n"${description}"\n\n` +
+    `Output ONLY the rewritten system prompt text with no preamble, explanation, or quotes.`;
+
+  try {
+    const response = await fetch(`${String(kb.difyAppUrl ?? "http://dify-api:5001")}/v1/chat-messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        inputs: {},
+        query: metaPrompt,
+        response_mode: "blocking",
+        conversation_id: "",
+        user: `prompt-generator-${userId}`
+      })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      return reply.code(502).send({ error: "LLM_CALL_FAILED", details: errText.slice(0, 300) });
+    }
+
+    const payload = await response.json() as Record<string, unknown>;
+    const suggestion = typeof payload.answer === "string" ? payload.answer.trim() : "";
+    if (!suggestion) {
+      return reply.code(502).send({ error: "LLM_EMPTY_RESPONSE" });
+    }
+
+    logInfo("prompt_generated", {
+      service: "workflow-service",
+      kbId: id,
+      userId,
+      inputLen: description.length,
+      outputLen: suggestion.length
+    });
+
+    return { suggestion, kbId: id };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return reply.code(502).send({ error: "PROMPT_GENERATION_FAILED", details: msg });
   }
 });
 

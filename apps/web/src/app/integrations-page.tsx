@@ -9,6 +9,7 @@ import { loadIntegrations, requestJson } from "./integrations/api";
 import { CreateSourceModal } from "./integrations/CreateSourceModal";
 import { EditSourceModal } from "./integrations/EditSourceModal";
 import { KnowledgeSourcesTable } from "./integrations/KnowledgeSourcesTable";
+import { SystemPromptPanel } from "./integrations/SystemPromptPanel";
 // eslint-disable-next-line import/order
 import { SyncProcessMonitor } from "./integrations/SyncProcessMonitor";
 import type { Integration, IntegrationForm, SyncJob } from "./integrations/types";
@@ -39,6 +40,7 @@ export function IntegrationsPage(): ReactElement {
   const searchParams = useSearchParams();
   const [identity, setIdentity] = useState<{ userId: string; roles: string[] } | null>(null);
   const [integrations, setIntegrations] = useState<Integration[]>([]);
+  const isAdminOrUserAdmin = identity?.roles?.some((r) => r === "admin" || r === "useradmin") ?? false;
   const [form, setForm] = useState<IntegrationForm>(EMPTY_FORM);
   const [busy, setBusy] = useState<string>("");
   const [status, setStatus] = useState<string>("");
@@ -46,6 +48,7 @@ export function IntegrationsPage(): ReactElement {
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<Integration | null>(null);
   const [shareTargetId, setShareTargetId] = useState<string | null>(null);
+  const [promptTargetId, setPromptTargetId] = useState<string | null>(null);
 
   const loadAll = useCallback(async (): Promise<void> => {
     const [currentIdentity, items] = await Promise.all([fetchIdentity(), loadIntegrations()]);
@@ -568,10 +571,29 @@ export function IntegrationsPage(): ReactElement {
         onDelete={(id) => void handleDelete(id)}
         onCleanup={(id) => void handleCleanup(id)}
         onShare={(id) => setShareTargetId(id)}
+        onConfigurePrompt={isAdminOrUserAdmin ? (id) => setPromptTargetId(id) : undefined}
         status={status}
         error={error}
         onCreateSource={() => { setForm(EMPTY_FORM); setCreateModalOpen(true); }}
       />
+
+      {/* System Prompt Config modal — admin/useradmin only */}
+      {promptTargetId != null ? (
+        <div className="ops-modal-overlay" role="presentation" onClick={() => setPromptTargetId(null)}>
+          <div className="ops-modal-panel" role="dialog" aria-modal="true" style={{ maxWidth: 680 }} onClick={(e) => e.stopPropagation()}>
+            <div className="ops-modal-panel-header">
+              <span>System Prompt — {integrations.find((i) => i.id === promptTargetId)?.name ?? promptTargetId}</span>
+              <button type="button" className="ops-modal-close" onClick={() => setPromptTargetId(null)}>✕</button>
+            </div>
+            <div style={{ padding: "16px 20px", overflowY: "auto", maxHeight: "75vh" }}>
+              <SystemPromptPanel
+                kbId={promptTargetId}
+                initialConfig={integrations.find((i) => i.id === promptTargetId) as any}
+              />
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {/* Share KB modal — owner/admin grants chat access to specific users by username */}
       {shareTargetId != null ? (
