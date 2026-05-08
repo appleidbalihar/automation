@@ -242,8 +242,8 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
                           {step.failedDocuments.map((doc, index) => (
                             <div key={`${doc.difyDocId ?? doc.batchId ?? doc.filePath ?? "doc"}-${index}`} className="ops-failed-doc">
                               <strong>{doc.filePath ?? doc.difyDocId ?? "Unknown document"}</strong>
-                              {doc.error ? <span>Dify error: {doc.error}</span> : null}
-                              {doc.difyDocId ? <small>Dify document: {doc.difyDocId}</small> : null}
+                              {doc.error ? <span>AI Agent error: {doc.error}</span> : null}
+                              {doc.difyDocId ? <small>Document ID: {doc.difyDocId}</small> : null}
                               {canRetryIndexing && doc.difyDocId ? (
                                 <button
                                   type="button"

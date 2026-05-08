@@ -11,6 +11,7 @@
 | 2026-04-13 | AI stack hard clean reset | Completed | Removed assistant UI, `agent-service`, `rag-service`, `chat-service`, related routes/contracts/schema/docs/tests/compose wiring. |
 | 2026-04-14 | Operations AI platform focus | Completed | Platform scope narrowed to Operations AI, logs, secrets, users, profile, and security administration. |
 | 2026-04-18 | Dify & n8n complete migration | Completed | Full Dify stack, n8n orchestration, Vault PKI sidecars, and Frontend Chat interface added. |
+| 2026-05-07 | AI Agent prompt templates | Completed | Prompt template Prisma models, workflow-service CRUD/generate/apply routes, API gateway routes, and `/ai-agent-prompt` UI added. |
 
 ## Active blockers
 - None.

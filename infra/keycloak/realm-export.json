@@ -1,6 +1,10 @@
 {
   "realm": "automation-platform",
   "enabled": true,
+  "accessTokenLifespan": 3600,
+  "ssoSessionIdleTimeout": 28800,
+  "ssoSessionMaxLifespan": 36000,
+  "offlineSessionIdleTimeout": 2592000,
   "clients": [
     {
       "clientId": "automation-web",
@@ -18,19 +22,5 @@
       { "name": "approver" },
       { "name": "viewer" }
     ]
-  },
-  "users": [
-    {
-      "username": "platform-admin",
-      "firstName": "Platform",
-      "lastName": "Admin",
-      "email": "platform-admin@example.com",
-      "enabled": true,
-      "emailVerified": true,
-      "credentials": [
-        { "type": "password", "value": "admin123", "temporary": false }
-      ],
-      "realmRoles": ["admin"]
-    }
-  ]
+  }
 }

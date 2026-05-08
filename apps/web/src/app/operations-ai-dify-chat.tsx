@@ -17,6 +17,7 @@ type RagDiscussionSummary = {
   expiresAt: string;
   preview?: string;
   knowledgeBaseId?: string;
+  knowledgeBaseIds?: string[];
   backend: RagDiscussionBackend;
 };
 
@@ -36,6 +37,7 @@ type RagDiscussionThread = {
   lastMessageAt: string;
   expiresAt: string;
   knowledgeBaseId?: string;
+  knowledgeBaseIds?: string[];
   backend: RagDiscussionBackend;
   messages: RagDiscussionMessage[];
 };
@@ -90,6 +92,8 @@ type Identity = {
   userId: string;
   roles: string[];
 };
+
+type RagChatScope = "current" | "selected" | "all";
 
 const SUGGESTED_QUESTIONS = [
   "How do we register a new user in the automation platform?",
@@ -323,6 +327,8 @@ export function OperationsAiDifyChat(): ReactElement {
   const [kbs, setKbs] = useState<RagKnowledgeBase[]>([]);
   const [syncHistory, setSyncHistory] = useState<RagKbSyncJob[]>([]);
   const [selectedKbId, setSelectedKbId] = useState<string>("");
+  const [chatScope, setChatScope] = useState<RagChatScope>("current");
+  const [selectedChatKbIds, setSelectedChatKbIds] = useState<string[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [activeThread, setActiveThread] = useState<RagDiscussionThread | null>(null);
   const [composer, setComposer] = useState<string>("");
@@ -342,6 +348,21 @@ export function OperationsAiDifyChat(): ReactElement {
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   const selectedKb = useMemo(() => kbs.find((kb) => kb.id === selectedKbId) ?? null, [kbs, selectedKbId]);
+  const chatKnowledgeBaseIds = useMemo(() => {
+    if (chatScope === "all") return kbs.map((kb) => kb.id);
+    if (chatScope === "selected") {
+      const visibleIds = new Set(kbs.map((kb) => kb.id));
+      const ids = selectedChatKbIds.filter((id) => visibleIds.has(id));
+      return ids.length ? ids : selectedKbId ? [selectedKbId] : [];
+    }
+    return selectedKbId ? [selectedKbId] : [];
+  }, [chatScope, kbs, selectedChatKbIds, selectedKbId]);
+  const chatScopeLabel = useMemo(() => {
+    if (chatScope === "all") return "All KBs";
+    if (chatKnowledgeBaseIds.length > 1) return `${chatKnowledgeBaseIds.length} KBs`;
+    const kb = kbs.find((item) => item.id === chatKnowledgeBaseIds[0]) ?? selectedKb;
+    return kb?.name ?? "No KB selected";
+  }, [chatKnowledgeBaseIds, chatScope, kbs, selectedKb]);
   const activeSyncJob = useMemo(() => latestSyncJob(selectedKb), [selectedKb]);
   const adminMode = isPrivileged(identity);
   const hasKnowledgeBases = kbs.length > 0;
@@ -378,6 +399,7 @@ export function OperationsAiDifyChat(): ReactElement {
         const defaultKb = loadedKbs.find((kb) => kb.isDefault) ?? loadedKbs[0] ?? null;
         if (defaultKb) {
           setSelectedKbId(defaultKb.id);
+          setSelectedChatKbIds([defaultKb.id]);
           setConfigForm({
             responseStyle: defaultKb.config?.responseStyle ?? "",
             toneInstructions: defaultKb.config?.toneInstructions ?? "",
@@ -389,12 +411,18 @@ export function OperationsAiDifyChat(): ReactElement {
         if (!active) return;
         setActiveThreadId(nextThread.id);
         setActiveThread(nextThread);
-        if (nextThread.knowledgeBaseId && loadedKbs.some((kb) => kb.id === nextThread.knowledgeBaseId)) {
+        const threadKbIds = nextThread.knowledgeBaseIds?.filter((id) => loadedKbs.some((kb) => kb.id === id)) ?? [];
+        if (threadKbIds.length > 1) {
+          setSelectedChatKbIds(threadKbIds);
+          setChatScope("selected");
+        } else if (nextThread.knowledgeBaseId && loadedKbs.some((kb) => kb.id === nextThread.knowledgeBaseId)) {
           setSelectedKbId(nextThread.knowledgeBaseId);
+          setSelectedChatKbIds([nextThread.knowledgeBaseId]);
+          setChatScope("current");
         }
       } catch (error) {
         if (!active) return;
-        setSidebarError(error instanceof Error ? error.message : "Unable to load Operations AI.");
+        setSidebarError(error instanceof Error ? error.message : "Unable to load RAG Assistant.");
         setActiveThreadId(null);
         setActiveThread(null);
       } finally {
@@ -444,12 +472,34 @@ export function OperationsAiDifyChat(): ReactElement {
 
   function syncKbSelection(kbId: string): void {
     setSelectedKbId(kbId);
+    setSelectedChatKbIds((current) => {
+      if (chatScope === "current" || current.length === 0) return [kbId];
+      return current.includes(kbId) ? current : [...current, kbId];
+    });
     setShowConfig(false);
     const kb = kbs.find((c) => c.id === kbId) ?? null;
     setConfigForm({
       responseStyle: kb?.config?.responseStyle ?? "",
       toneInstructions: kb?.config?.toneInstructions ?? "",
       restrictionRules: kb?.config?.restrictionRules ?? ""
+    });
+  }
+
+  function handleChatScopeChange(scope: RagChatScope): void {
+    setChatScope(scope);
+    if (scope === "current" && selectedKbId) setSelectedChatKbIds([selectedKbId]);
+    if (scope === "all") setSelectedChatKbIds(kbs.map((kb) => kb.id));
+    if (scope === "selected" && selectedChatKbIds.length === 0 && selectedKbId) setSelectedChatKbIds([selectedKbId]);
+  }
+
+  function toggleChatKb(kbId: string): void {
+    setChatScope("selected");
+    setSelectedChatKbIds((current) => {
+      if (current.includes(kbId)) {
+        const next = current.filter((id) => id !== kbId);
+        return next.length ? next : [kbId];
+      }
+      return [...current, kbId];
     });
   }
 
@@ -461,7 +511,23 @@ export function OperationsAiDifyChat(): ReactElement {
       const thread = await fetchRag<RagDiscussionThread>(`/rag/discussions/${threadId}`);
       setActiveThreadId(thread.id);
       setActiveThread(thread);
-      if (thread.knowledgeBaseId) syncKbSelection(thread.knowledgeBaseId);
+      const threadKbIds = thread.knowledgeBaseIds?.filter((id) => kbs.some((kb) => kb.id === id)) ?? [];
+      if (threadKbIds.length > 1) {
+        setSelectedChatKbIds(threadKbIds);
+        setChatScope("selected");
+        if (thread.knowledgeBaseId) {
+          setSelectedKbId(thread.knowledgeBaseId);
+          const kb = kbs.find((c) => c.id === thread.knowledgeBaseId) ?? null;
+          setConfigForm({
+            responseStyle: kb?.config?.responseStyle ?? "",
+            toneInstructions: kb?.config?.toneInstructions ?? "",
+            restrictionRules: kb?.config?.restrictionRules ?? ""
+          });
+        }
+      } else if (thread.knowledgeBaseId) {
+        syncKbSelection(thread.knowledgeBaseId);
+        setChatScope("current");
+      }
       setShowConfig(false);
     } catch (error) {
       setChatError(error instanceof Error ? error.message : "Unable to load this discussion.");
@@ -471,13 +537,13 @@ export function OperationsAiDifyChat(): ReactElement {
   }
 
   async function createDiscussion(seed?: string): Promise<void> {
-    if (!selectedKbId) { setChatError("OPERATIONS_AI_NOT_CONFIGURED"); return; }
+    if (chatKnowledgeBaseIds.length === 0) { setChatError("OPERATIONS_AI_NOT_CONFIGURED"); return; }
     setSidebarError("");
     setChatError("");
     try {
       const created = await fetchRag<RagDiscussionSummary>("/rag/discussions", {
         method: "POST",
-        body: JSON.stringify({ knowledgeBaseId: selectedKbId })
+        body: JSON.stringify({ knowledgeBaseIds: chatKnowledgeBaseIds })
       });
       setThreads((current) => upsertThreadSummary(current, created));
       setActiveThreadId(created.id);
@@ -516,6 +582,7 @@ export function OperationsAiDifyChat(): ReactElement {
   async function handleSendMessage(seed?: string): Promise<void> {
     const content = String(seed ?? composer).trim();
     if (!content || sending) return;
+    if (chatKnowledgeBaseIds.length === 0) { setChatError("Select at least one knowledge base."); return; }
     setSending(true);
     setChatError("");
     let threadId = activeThreadId;
@@ -523,7 +590,7 @@ export function OperationsAiDifyChat(): ReactElement {
       if (!threadId) {
         const created = await fetchRag<RagDiscussionSummary>("/rag/discussions", {
           method: "POST",
-          body: JSON.stringify({ knowledgeBaseId: selectedKbId || undefined })
+          body: JSON.stringify({ knowledgeBaseIds: chatKnowledgeBaseIds })
         });
         threadId = created.id;
         setThreads((current) => upsertThreadSummary(current, created));
@@ -533,7 +600,7 @@ export function OperationsAiDifyChat(): ReactElement {
       }
       const response = await fetchRag<RagDiscussionSendMessageResponse>(`/rag/discussions/${threadId}/messages`, {
         method: "POST",
-        body: JSON.stringify({ content })
+        body: JSON.stringify({ content, knowledgeBaseIds: chatKnowledgeBaseIds })
       });
       setThreads((current) => upsertThreadSummary(current, response.thread));
       setActiveThread((current) => {
@@ -542,6 +609,10 @@ export function OperationsAiDifyChat(): ReactElement {
       });
       setActiveThreadId(response.thread.id);
       if (response.thread.knowledgeBaseId) syncKbSelection(response.thread.knowledgeBaseId);
+      if (response.thread.knowledgeBaseIds && response.thread.knowledgeBaseIds.length > 1) {
+        setSelectedChatKbIds(response.thread.knowledgeBaseIds);
+        setChatScope("selected");
+      }
       setComposer("");
     } catch (error) {
       setChatError(error instanceof Error ? error.message : "Unable to send your question.");
@@ -631,7 +702,7 @@ export function OperationsAiDifyChat(): ReactElement {
             type="button"
             className="rag-chat-new-btn"
             onClick={() => startNewDiscussion()}
-            disabled={sending || !hasKnowledgeBases}
+            disabled={sending || !hasKnowledgeBases || chatKnowledgeBaseIds.length === 0}
           >
             <span className="rag-chat-new-plus">+</span> New chat
           </button>
@@ -693,7 +764,7 @@ export function OperationsAiDifyChat(): ReactElement {
         <div className="rag-chat-sidebar-footer">
           {hasKnowledgeBases ? (
             <>
-              <p className="rag-chat-kb-section-label">KNOWLEDGE BASE</p>
+              <p className="rag-chat-kb-section-label">ACTIVE KB</p>
               <div className="rag-chat-kb-selector-wrap">
                 <select
                   value={selectedKbId}
@@ -707,6 +778,45 @@ export function OperationsAiDifyChat(): ReactElement {
                   ))}
                 </select>
               </div>
+
+              <p className="rag-chat-kb-section-label">CHAT SCOPE</p>
+              <div className="rag-chat-scope-tabs" role="group" aria-label="Chat knowledge base scope">
+                <button
+                  type="button"
+                  className={`rag-chat-scope-tab${chatScope === "current" ? " rag-chat-scope-tab-active" : ""}`}
+                  onClick={() => handleChatScopeChange("current")}
+                >
+                  Current
+                </button>
+                <button
+                  type="button"
+                  className={`rag-chat-scope-tab${chatScope === "selected" ? " rag-chat-scope-tab-active" : ""}`}
+                  onClick={() => handleChatScopeChange("selected")}
+                >
+                  Selected
+                </button>
+                <button
+                  type="button"
+                  className={`rag-chat-scope-tab${chatScope === "all" ? " rag-chat-scope-tab-active" : ""}`}
+                  onClick={() => handleChatScopeChange("all")}
+                >
+                  All
+                </button>
+              </div>
+              {chatScope === "selected" ? (
+                <div className="rag-chat-kb-checklist">
+                  {kbs.map((kb) => (
+                    <label key={kb.id} className="rag-chat-kb-check">
+                      <input
+                        type="checkbox"
+                        checked={selectedChatKbIds.includes(kb.id)}
+                        onChange={() => toggleChatKb(kb.id)}
+                      />
+                      <span>{kb.name}</span>
+                    </label>
+                  ))}
+                </div>
+              ) : null}
 
               <div className="rag-chat-sync-row">
                 <span className={`rag-chat-sync-dot ${syncDotClass}`} />
@@ -781,10 +891,10 @@ export function OperationsAiDifyChat(): ReactElement {
           <div className="rag-chat-topbar-title">
             <span className="rag-chat-topbar-sparkle" aria-hidden>✦</span>
             <span>RAG Assistant</span>
-            {selectedKb ? (
+            {hasKnowledgeBases ? (
               <>
                 <span className="rag-chat-topbar-sep" aria-hidden>·</span>
-                <span className="rag-chat-topbar-kb">{selectedKb.name}</span>
+                <span className="rag-chat-topbar-kb">{chatScopeLabel}</span>
               </>
             ) : null}
           </div>
@@ -822,7 +932,7 @@ export function OperationsAiDifyChat(): ReactElement {
         {showConfig && adminMode ? (
           <div className="rag-chat-config-panel">
             <h2>Configure {selectedKb?.name ?? "Knowledge Base"}</h2>
-            <p className="rag-chat-config-sub">Override Dify response defaults for this knowledge base.</p>
+            <p className="rag-chat-config-sub">Override RAG Assistant response defaults for this knowledge base.</p>
             <div className="rag-chat-config-form">
               <div className="rag-chat-config-field">
                 <label>Response Style</label>
@@ -871,7 +981,7 @@ export function OperationsAiDifyChat(): ReactElement {
                 {activeThread.messages.map((msg) => (
                   <article key={msg.id} className={`rag-chat-msg rag-chat-msg-${msg.role}`}>
                     <p className="rag-chat-msg-label">
-                      {msg.role === "assistant" ? "Operations AI" : "You"}
+                      {msg.role === "assistant" ? "RAG Assistant" : "You"}
                       <span className="rag-chat-msg-time">{formatMessageTime(msg.createdAt)}</span>
                     </p>
                     <div className="rag-chat-msg-bubble">
@@ -883,7 +993,7 @@ export function OperationsAiDifyChat(): ReactElement {
                 ))}
                 {sending ? (
                   <article className="rag-chat-msg rag-chat-msg-assistant">
-                    <p className="rag-chat-msg-label">Operations AI <span className="rag-chat-msg-time">Thinking…</span></p>
+                    <p className="rag-chat-msg-label">RAG Assistant <span className="rag-chat-msg-time">Thinking…</span></p>
                     <div className="rag-chat-msg-bubble rag-chat-msg-pending">
                       <p>Searching the knowledge base and preparing a response…</p>
                     </div>
@@ -898,7 +1008,7 @@ export function OperationsAiDifyChat(): ReactElement {
                   </svg>
                 </div>
                 <h2 className="rag-chat-empty-title">
-                  {hasKnowledgeBases ? "How can I help with operations today?" : "Operations AI setup required"}
+                  {hasKnowledgeBases ? "How can RAG Assistant help today?" : "RAG Assistant setup required"}
                 </h2>
                 <p className="rag-chat-empty-sub">
                   {hasKnowledgeBases
@@ -935,9 +1045,9 @@ export function OperationsAiDifyChat(): ReactElement {
               placeholder={
                 hasKnowledgeBases
                   ? "Ask about registration, logs, secrets, security health…"
-                  : "Operations AI is waiting for a knowledge base."
+                  : "RAG Assistant is waiting for a knowledge base."
               }
-              disabled={initializing || sending || !hasKnowledgeBases || showConfig}
+              disabled={initializing || sending || !hasKnowledgeBases || chatKnowledgeBaseIds.length === 0 || showConfig}
               rows={1}
               className="rag-chat-composer-input"
             />
@@ -945,7 +1055,7 @@ export function OperationsAiDifyChat(): ReactElement {
               type="button"
               className="rag-chat-send-btn"
               onClick={() => void handleSendMessage()}
-              disabled={initializing || sending || !composer.trim() || !hasKnowledgeBases || showConfig}
+              disabled={initializing || sending || !composer.trim() || !hasKnowledgeBases || chatKnowledgeBaseIds.length === 0 || showConfig}
               aria-label="Send message"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -955,7 +1065,7 @@ export function OperationsAiDifyChat(): ReactElement {
           </div>
           <p className="rag-chat-composer-hint">
             Enter to send · Shift+Enter for newline
-            {selectedKb ? <> · Grounded in <strong>{selectedKb.name}</strong></> : null}
+            {hasKnowledgeBases ? <> · Grounded in <strong>{chatScopeLabel}</strong></> : null}
           </p>
         </div>
       </main>

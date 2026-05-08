@@ -1,18 +1,17 @@
 "use client";
 
 import type { Dispatch, ReactElement, SetStateAction } from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { IntegrationForm } from "./types";
 import { normalizeRepositoryInput } from "./types";
+import type { PromptTemplate } from "../prompt-templates/types";
+import { CATEGORY_ICONS, CATEGORY_LABELS } from "../prompt-templates/types";
+import { listTemplates } from "../prompt-templates/api";
 
 type AuthMode = "choose" | "oauth" | "pat";
 type OAuthStep = "provider" | "details";
 type Provider = "github" | "gitlab" | "googledrive";
 
-// PLATFORM_URL and OAUTH_CALLBACK_BASE are driven by env vars set in .env / .env.production.
-// Fallbacks use the /rapidrag path prefix so they're correct even without env vars.
-// Dev:  NEXT_PUBLIC_PLATFORM_URL=https://dev.eclassmanager.com/rapidrag
-// Prod: NEXT_PUBLIC_PLATFORM_URL=https://theaitools.ca/rapidrag
 const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.eclassmanager.com/rapidrag").replace(/\/$/, "");
 const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/rapidrag/connect").replace(/\/$/, "");
 
@@ -81,23 +80,88 @@ const PROVIDER_META: Record<Provider, ProviderMeta> = {
   }
 };
 
+function TemplateSelector({
+  value,
+  onChange,
+  templates,
+  loading
+}: {
+  value: string;
+  onChange: (id: string) => void;
+  templates: PromptTemplate[];
+  loading: boolean;
+}): ReactElement {
+  return (
+    <div className="tpl-selector-section">
+      <label className="tpl-selector-label">
+        AI Agent Template
+        <span className="ops-create-prompt-badge" style={{ marginLeft: 8 }}>Required</span>
+      </label>
+      <p className="tpl-selector-hint">
+        The template defines how the AI agent answers questions from this knowledge base.
+        You can change it later from the Knowledge Connector page.
+      </p>
+      {loading ? (
+        <p className="tpl-loading" style={{ fontSize: "0.85rem" }}>Loading templates…</p>
+      ) : (
+        <select
+          className="tpl-select"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        >
+          <option value="">— Select a template —</option>
+          {templates.map((t) => {
+            const icon = CATEGORY_ICONS[t.category] ?? "🤖";
+            const label = CATEGORY_LABELS[t.category] ?? t.category;
+            return (
+              <option key={t.id} value={t.id}>
+                {icon} {t.name} ({label}){t.isBuiltIn ? " ★" : ""}
+              </option>
+            );
+          })}
+        </select>
+      )}
+    </div>
+  );
+}
+
 type Props = {
   open: boolean;
   onClose: () => void;
   form: IntegrationForm;
   setForm: Dispatch<SetStateAction<IntegrationForm>>;
   busy: boolean;
+  isAdminOrUserAdmin?: boolean;
   onSubmitPat: () => void;
   onSubmitOauth: (provider: Provider, appCredentials: { clientId: string; clientSecret: string } | null) => void;
 };
 
 export function CreateSourceModal(props: Props): ReactElement | null {
-  const { open, onClose, form, setForm, busy, onSubmitPat, onSubmitOauth } = props;
+  const { open, onClose, form, setForm, busy, isAdminOrUserAdmin, onSubmitPat, onSubmitOauth } = props;
   const [mode, setMode] = useState<AuthMode>("choose");
   const [oauthStep, setOauthStep] = useState<OAuthStep>("provider");
   const [oauthProvider, setOauthProvider] = useState<Provider>("github");
   const [appClientId, setAppClientId] = useState("");
   const [appClientSecret, setAppClientSecret] = useState("");
+  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open || !isAdminOrUserAdmin) return;
+    setTemplatesLoading(true);
+    listTemplates()
+      .then((list) => {
+        setTemplates(list);
+        // Pre-select General Assistant if nothing is selected
+        if (!form.templateId) {
+          const generalAssistant = list.find((t) => t.isBuiltIn && t.category === "general");
+          if (generalAssistant) setForm((c) => ({ ...c, templateId: generalAssistant.id }));
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => setTemplatesLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, isAdminOrUserAdmin]);
 
   if (!open) return null;
 
@@ -114,6 +178,15 @@ export function CreateSourceModal(props: Props): ReactElement | null {
     setForm((c) => ({ ...c, sourceType: p }));
     setOauthStep("details");
   }
+
+  const templateSelector = isAdminOrUserAdmin ? (
+    <TemplateSelector
+      value={form.templateId}
+      onChange={(id) => setForm((c) => ({ ...c, templateId: id }))}
+      templates={templates}
+      loading={templatesLoading}
+    />
+  ) : null;
 
   // ── Step 0: choose auth mode ────────────────────────────────────────────────
   if (mode === "choose") {
@@ -282,7 +355,7 @@ export function CreateSourceModal(props: Props): ReactElement | null {
             <label className="integrations-form-span-2">
               <label className="integrations-checkbox">
                 <input type="checkbox" checked={form.setDefault} onChange={(e) => setForm((c) => ({ ...c, setDefault: e.target.checked }))} />
-                <span>Set as my default Operations AI knowledge base</span>
+                <span>Set as my default RAG knowledge base</span>
               </label>
             </label>
           </div>
@@ -295,8 +368,6 @@ export function CreateSourceModal(props: Props): ReactElement | null {
             <div className="ops-oauth-app-creds-fields">
               <label>
                 <span>Client ID</span>
-                {/* Use autoComplete="new-password" to prevent ALL browser autofill/password-manager injection.
-                    The name attribute is intentionally generic to avoid browser heuristics. */}
                 <input
                   id="oauth-app-client-id"
                   name="oauth-app-client-id"
@@ -325,6 +396,8 @@ export function CreateSourceModal(props: Props): ReactElement | null {
               Already registered your OAuth App previously? Leave these blank to reuse your existing credentials stored in Vault.
             </p>
           </div>
+
+          {templateSelector}
 
           <div className="ops-modal-footer-nav ops-modal-footer-nav-spread">
             <button type="button" className="ops-modal-back-btn" onClick={() => setOauthStep("provider")}>← Back</button>
@@ -448,11 +521,13 @@ export function CreateSourceModal(props: Props): ReactElement | null {
           )}
         </div>
 
+        {templateSelector}
+
         <div className="integrations-panel-footer ops-modal-footer">
           <div className="integrations-footer-copy">
             <label className="integrations-checkbox">
               <input type="checkbox" checked={form.setDefault} onChange={(e) => setForm((c) => ({ ...c, setDefault: e.target.checked }))} />
-              <span>Set as my default Operations AI knowledge base</span>
+              <span>Set as my default RAG knowledge base</span>
             </label>
           </div>
           <div className="ops-modal-footer-nav-spread" style={{ display: "flex", gap: 10, alignItems: "center" }}>

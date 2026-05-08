@@ -2,7 +2,7 @@
 
 ## What Is RapidRAG
 
-RapidRAG is a self-hosted RAG (Retrieval-Augmented Generation) operations platform. Operators connect document sources (GitHub, GitLab, Google Drive, or web URLs), sync supported files into Dify knowledge bases, and chat through the RAG Assistant. Administrators manage users, secrets, logs, and certificate health from the web UI.
+RapidRAG is a self-hosted RAG (Retrieval-Augmented Generation) operations platform. Operators connect document sources (GitHub, GitLab, Google Drive, web URLs, or manual/upload-style sources), sync supported files into Dify knowledge bases through n8n, and chat through the RAG Assistant. Administrators manage prompt templates, users, secrets, logs, RAG stats, and certificate health from the web UI.
 
 ## Quick Reference: Services and Ports
 
@@ -60,6 +60,8 @@ The authenticated platform UI lives at `https://<host>:3443` under these routes:
 | `/knowledge-connector` | Source and knowledge base management | admin, useradmin, operator |
 | `/rag-assistant` | Dify-backed RAG chat | All roles |
 | `/profile` | User profile and password change | All roles |
+| `/ai-agent-prompt` | Reusable system prompt templates | admin, useradmin |
+| `/rag-stats` | RAG response timing and usage stats | admin only |
 | `/logs` | Platform log explorer | admin only |
 | `/users` | User management | admin, useradmin |
 | `/secrets` | Vault secret management | admin only |
@@ -81,13 +83,14 @@ RapidRAG uses Keycloak-issued JWTs with these platform roles:
 | Role | Permissions |
 |------|-------------|
 | `admin` | Full access: logs, users, secrets, certificates, all KB operations |
-| `useradmin` | User management plus KB and source operations |
-| `operator` | Source sync, RAG chat, sync-job logs |
+| `useradmin` | User management, prompt templates, plus KB and source operations exposed by gateway routes |
+| `operator` | Source sync, RAG chat, OAuth source connection, sync-job logs |
 | `approver` | Read and chat access |
 | `viewer` | Read and chat access |
 
 **Admin-only routes:** `/logs`, `/logs/timeline`
 **Operator and above:** `/logs/sync-job` (scoped by sync job ID)
+**Compatibility note:** `operator` is also granted `useradmin` by `@platform/auth` for current backward compatibility.
 
 ## Database Models (Prisma)
 
@@ -102,7 +105,10 @@ The platform database schema (`packages/db/prisma/schema.prisma`) contains these
 | `RagKbFileTracker` | Per-file SHA hash and Dify document ID for incremental sync |
 | `RagKbSyncJob` | Sync job lifecycle, steps, progress, and error state |
 | `RagChannelDeployment` | Channel deployment metadata |
+| `SystemPromptTemplate` | Built-in, private, and shared AI agent system prompt templates |
+| `SystemPromptTemplateShare` | Per-user shares for prompt templates with `specific` share scope |
 | `RagDiscussionThread` | RAG chat thread records |
+| `RagDiscussionKbSession` | Per-KB Dify conversation IDs for multi-KB threads |
 | `RagDiscussionMessage` | Individual messages in a chat thread |
 
 Note: These are **database tables**, not Docker containers. Docker containers are listed in the Service table above and in `containers.md`.
@@ -123,6 +129,8 @@ When an operator triggers a knowledge base sync:
 9. UI polls sync-status endpoint and displays progress
 ```
 
+Source credentials, OAuth tokens, OAuth app credentials, and Dify app API keys are stored in Vault. The database stores non-secret source metadata, Dify dataset IDs, sync state, shares, prompt-template references, and discussion records.
+
 ## How RAG Chat Works
 
 When an operator sends a message in the RAG Assistant:
@@ -137,6 +145,24 @@ When an operator sends a message in the RAG Assistant:
 7. LLM response is returned to workflow-service
 8. Response is stored in RagDiscussionMessage and returned to the UI
 ```
+
+Discussion threads are private to the user who created them. Sharing a KB grants another user chat access to that KB, but it does not share discussion history.
+
+## How Prompt Templates Work
+
+Admins and useradmins use `/ai-agent-prompt` to manage reusable system prompt templates:
+
+```text
+web /ai-agent-prompt
+  ↓ /gateway/rag/prompt-templates/*
+api-gateway RBAC
+  ↓
+workflow-service prompt-template routes
+  ↓
+PostgreSQL SystemPromptTemplate / SystemPromptTemplateShare
+```
+
+Templates can be built-in, private, shared with all users, or shared with specific users. Applying a template to a KB stores `RagKnowledgeBase.templateId`, updates the KB config prompt fields, and attempts to push the prompt to the associated Dify app when possible.
 
 ## Security Architecture
 

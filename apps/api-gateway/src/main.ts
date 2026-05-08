@@ -1077,6 +1077,56 @@ app.post("/rag/knowledge-bases/:id/generate-prompt", { preHandler: requireAnyRol
   const id = (request.params as { id: string }).id;
   await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/generate-prompt`);
 });
+
+// ─── Apply Template to KB ─────────────────────────────────────────────────────
+app.post("/rag/knowledge-bases/:id/apply-template", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/apply-template`);
+});
+
+// ─── Prompt Template CRUD ─────────────────────────────────────────────────────
+// NOTE: /rag/prompt-templates/generate must come BEFORE /:id routes to avoid conflict.
+app.post("/rag/prompt-templates/generate", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/rag/prompt-templates/generate");
+});
+
+app.get("/rag/prompt-templates", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/prompt-templates");
+});
+
+app.post("/rag/prompt-templates", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  await proxy(request, reply, "POST", config.workflowServiceUrl, "/rag/prompt-templates");
+});
+
+app.get("/rag/prompt-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "GET", config.workflowServiceUrl, `/rag/prompt-templates/${id}`);
+});
+
+app.patch("/rag/prompt-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, `/rag/prompt-templates/${id}`);
+});
+
+app.delete("/rag/prompt-templates/:id", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/prompt-templates/${id}`);
+});
+
+app.post("/rag/prompt-templates/:id/duplicate", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/prompt-templates/${id}/duplicate`);
+});
+
+app.post("/rag/prompt-templates/:id/share", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  await proxy(request, reply, "POST", config.workflowServiceUrl, `/rag/prompt-templates/${id}/share`);
+});
+
+app.delete("/rag/prompt-templates/:id/share/:userId", { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request, reply) => {
+  const { id, userId } = request.params as { id: string; userId: string };
+  await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/prompt-templates/${id}/share/${userId}`);
+});
 // ─── KB Share Management Routes ───────────────────────────────────────────────
 // Owner or admin can share a KB with another user by their username.
 app.post("/rag/knowledge-bases/:id/shares", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {

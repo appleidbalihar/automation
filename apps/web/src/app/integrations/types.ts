@@ -21,6 +21,13 @@ export type FailedDifyDocument = {
   retryable?: boolean;
 };
 
+export type KbConfig = {
+  systemPromptBase?: string | null;
+  responseStyle?: string | null;
+  toneInstructions?: string | null;
+  restrictionRules?: string | null;
+};
+
 export type Integration = {
   id: string;
   name: string;
@@ -41,6 +48,9 @@ export type Integration = {
   authMethod: "oauth" | "pat" | null;
   oauthAppConfigured: boolean;
   oauthClientIdLast4: string | null;
+  config?: KbConfig | null;
+  templateId?: string | null;
+  templateName?: string | null;
 };
 
 export type IntegrationForm = {
@@ -56,7 +66,20 @@ export type IntegrationForm = {
   googleDriveAccessToken: string;
   googleDriveRefreshToken: string;
   setDefault: boolean;
+  systemPromptBase: string;
+  templateId: string;
 };
+
+/**
+ * Default template text for Knowledge Base Instructions.
+ * Pre-filled as actual value (not just placeholder) so users can edit directly.
+ */
+export const KB_INSTRUCTIONS_TEMPLATE =
+  "This knowledge base covers [describe your domain and topics].\n\n" +
+  "When answering questions:\n" +
+  "- Focus on [specific topics or document types in this KB]\n" +
+  "- Always mention which document or section the answer comes from\n" +
+  "- [Any other KB-specific instruction]";
 
 export const EMPTY_FORM: IntegrationForm = {
   name: "",
@@ -70,7 +93,9 @@ export const EMPTY_FORM: IntegrationForm = {
   gitlabToken: "",
   googleDriveAccessToken: "",
   googleDriveRefreshToken: "",
-  setDefault: true
+  setDefault: true,
+  systemPromptBase: KB_INSTRUCTIONS_TEMPLATE,
+  templateId: ""
 };
 
 export type NormalizedSyncStep = {

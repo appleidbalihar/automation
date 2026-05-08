@@ -16,7 +16,7 @@ const baseNavItems: Array<{ href: string; label: string }> = [
 export function NavigationSidebar(): ReactElement {
   const pathname = usePathname();
   const [roles, setRoles] = useState<string[]>([]);
-  const [pinned, setPinned] = useState<boolean>(true);
+  const [navOpen, setNavOpen] = useState<boolean>(false);
 
   useEffect(() => {
     fetchIdentity()
@@ -25,17 +25,13 @@ export function NavigationSidebar(): ReactElement {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const stored = window.localStorage.getItem("platform-left-nav:pinned");
-    setPinned(stored !== "false");
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem("platform-left-nav:pinned", pinned ? "true" : "false");
-  }, [pinned]);
+    setNavOpen(false);
+  }, [pathname]);
 
   const navItems = [...baseNavItems, { href: "/profile", label: "Profile" }];
+  if (roles.includes("admin") || roles.includes("useradmin")) {
+    navItems.push({ href: "/ai-agent-prompt", label: "AI Agent Prompt" });
+  }
   if (roles.includes("admin")) {
     // Platform admin exclusive items
     navItems.push({ href: "/rag-stats", label: "RAG Stats" });
@@ -45,39 +41,62 @@ export function NavigationSidebar(): ReactElement {
     navItems.push({ href: "/security", label: "Security Health" });
   }
 
+  const renderNavItems = (): ReactElement[] =>
+    navItems.map((item) => {
+      const isActive = pathname === item.href;
+      return (
+        <Link
+          key={item.href}
+          href={item.href}
+          className={`nav-item nav-item-link${isActive ? " nav-item-active" : ""}`}
+          onClick={() => setNavOpen(false)}
+        >
+          {item.label}
+        </Link>
+      );
+    });
+
   return (
-    <aside className={`left-nav${pinned ? "" : " left-nav-collapsed"}`}>
-      <div className="left-nav-topbar">
-        <button type="button" className="left-nav-pin-button" onClick={() => setPinned((value) => !value)}>
-          {pinned ? "Unpin" : "Pin"}
+    <aside className="left-nav">
+      <div className="left-nav-bar">
+        <button
+          type="button"
+          className="left-nav-menu-button"
+          aria-label={navOpen ? "Close navigation" : "Open navigation"}
+          aria-expanded={navOpen}
+          onClick={() => setNavOpen((value) => !value)}
+        >
+          <span />
+          <span />
+          <span />
         </button>
+        <div className="left-nav-brand">
+          <strong>RapidRAG</strong>
+          <span>End-to-end RAG Platform</span>
+        </div>
       </div>
-      {pinned ? (
-        <>
-          <h2 style={{ marginTop: 0 }}>RapidRAG</h2>
-          <p style={{ opacity: 0.8, marginTop: 0 }}>End-to-end RAG Platform</p>
-          <nav>
-            {navItems.map((item) => {
-              const isActive = pathname === item.href;
-              return (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className={`nav-item nav-item-link${isActive ? " nav-item-active" : ""}`}
-                >
-                  {item.label}
-                </Link>
-              );
-            })}
-          </nav>
-        </>
-      ) : (
-        <div className="left-nav-collapsed-content">
-          <button type="button" className="left-nav-reveal-button" onClick={() => setPinned(true)}>
-            Show Navigation
+      {navOpen ? (
+        <button
+          type="button"
+          className="left-nav-backdrop"
+          aria-label="Close navigation"
+          onClick={() => setNavOpen(false)}
+        />
+      ) : null}
+      <div className={`left-nav-drawer${navOpen ? " left-nav-drawer-open" : ""}`}>
+        <div className="left-nav-drawer-header">
+          <div>
+            <strong>RapidRAG</strong>
+            <span>Navigation</span>
+          </div>
+          <button type="button" className="left-nav-close-button" aria-label="Close navigation" onClick={() => setNavOpen(false)}>
+            ×
           </button>
         </div>
-      )}
+        <nav className="left-nav-list" aria-label="Platform navigation">
+          {renderNavItems()}
+        </nav>
+      </div>
     </aside>
   );
 }

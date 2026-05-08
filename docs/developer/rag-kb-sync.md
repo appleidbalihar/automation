@@ -26,6 +26,9 @@
 | `POST` | `/rag/knowledge-bases` | `admin`, `useradmin` |
 | `GET` | `/rag/knowledge-bases/:id` | authenticated platform roles |
 | `PATCH` | `/rag/knowledge-bases/:id/config` | authenticated platform roles |
+| `GET` | `/rag/knowledge-bases/default-prompt` | `admin`, `useradmin` |
+| `POST` | `/rag/knowledge-bases/:id/generate-prompt` | `admin`, `useradmin` |
+| `POST` | `/rag/knowledge-bases/:id/apply-template` | `admin`, `useradmin` |
 | `POST` | `/rag/knowledge-bases/:id/shares` | authenticated platform roles |
 | `GET` | `/rag/knowledge-bases/:id/shares` | authenticated platform roles |
 | `DELETE` | `/rag/knowledge-bases/:id/shares/:shareId` | authenticated platform roles |
@@ -36,6 +39,20 @@
 | `GET` | `/rag/knowledge-bases/:id/sync-status` | authenticated platform roles |
 | `GET` | `/rag/knowledge-bases/:id/sync-history` | `admin`, `useradmin`, `operator` |
 | `GET` | `/logs/sync-job` | `admin`, `useradmin`, `operator` |
+
+### Prompt template routes through api-gateway
+
+| Method | Path | Roles |
+|--------|------|-------|
+| `GET` | `/rag/prompt-templates` | `admin`, `useradmin` |
+| `POST` | `/rag/prompt-templates` | `admin`, `useradmin` |
+| `GET` | `/rag/prompt-templates/:id` | `admin`, `useradmin` |
+| `PATCH` | `/rag/prompt-templates/:id` | `admin`, `useradmin` |
+| `DELETE` | `/rag/prompt-templates/:id` | `admin`, `useradmin` |
+| `POST` | `/rag/prompt-templates/:id/duplicate` | `admin`, `useradmin` |
+| `POST` | `/rag/prompt-templates/:id/share` | `admin`, `useradmin` |
+| `DELETE` | `/rag/prompt-templates/:id/share/:userId` | `admin`, `useradmin` |
+| `POST` | `/rag/prompt-templates/generate` | `admin`, `useradmin` |
 
 ### n8n/internal callback routes
 
@@ -142,6 +159,7 @@ Current primary routes:
 
 - `/knowledge-connector`: source and sync management.
 - `/rag-assistant`: Dify-backed chat.
+- `/ai-agent-prompt`: reusable system prompt template management for admin/useradmin.
 
 Compatibility routes:
 
@@ -155,6 +173,19 @@ Important UI files:
 - `KnowledgeSourcesTable.tsx`: row actions including sync, cleanup, share, edit, delete.
 - `SyncProcessMonitor.tsx`: job polling, step table, retry actions.
 - `StepLogDrawer.tsx`: `/logs/sync-job` drawer.
+- `prompt-templates/*`: template list, cards, editor modal, and API client.
+
+## Prompt Templates
+
+Prompt templates are stored in `SystemPromptTemplate` and `SystemPromptTemplateShare`. Built-in templates are seeded by workflow-service startup logic, private templates belong to `ownerId`, and shared templates use either `shareScope = "all"` or rows in `SystemPromptTemplateShare`.
+
+Applying a template:
+
+```text
+POST /rag/knowledge-bases/:id/apply-template { "templateId": "..." }
+```
+
+The workflow-service checks visibility, updates `RagKnowledgeBase.templateId`, writes prompt-related KB config fields, and pushes the prompt to Dify when a Dify app is available.
 
 ## Cleanup
 

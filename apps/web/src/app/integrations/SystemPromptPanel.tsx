@@ -1,46 +1,28 @@
 "use client";
 
-/**
- * SystemPromptPanel — Per-knowledge-base system prompt configuration.
- *
- * Only shown to admin and useradmin roles.
- *
- * Layout:
- *   1. Platform Default Prompt (read-only, always applied, collapsible)
- *   2. KB-Specific Instructions (editable textarea)
- *      └── ✦ Generate button → AI rewrites rough input → suggestion box
- *          └── [Apply This Suggestion] [Regenerate]
- *   3. Response Style dropdown + Tone Instructions textarea
- *   4. Topic Restriction textarea
- *   5. [Save Config] button
- */
-
 import type { ReactElement } from "react";
 import { useEffect, useState } from "react";
 import { requestJson } from "./api";
-
-type KbConfig = {
-  systemPromptBase?: string | null;
-  responseStyle?: string | null;
-  toneInstructions?: string | null;
-  restrictionRules?: string | null;
-};
+import type { KbConfig } from "./types";
+import type { PromptTemplate } from "../prompt-templates/types";
+import { CATEGORY_ICONS } from "../prompt-templates/types";
+import { applyTemplateToKb, listTemplates } from "../prompt-templates/api";
 
 type DefaultPromptResponse = {
   defaultPrompt: string;
   description: string;
 };
 
-type GeneratePromptResponse = {
-  suggestion: string;
-  kbId: string;
+type ConfigSaveResponse = KbConfig & {
+  difyPromptUpdated?: boolean;
+  difyPromptError?: string;
 };
 
 type Props = {
   kbId: string;
-  /** Current KB config loaded from the knowledge base */
   initialConfig?: KbConfig | null;
-  /** Called after successfully saving config */
+  templateId?: string | null;
+  templateName?: string | null;
   onSaved?: (updatedConfig: KbConfig) => void;
 };
 
@@ -53,11 +35,38 @@ const RESPONSE_STYLE_OPTIONS = [
   { value: "concise", label: "Concise — brief answers only" }
 ];
 
-export function SystemPromptPanel({ kbId, initialConfig, onSaved }: Props): ReactElement {
-  const [defaultPrompt, setDefaultPrompt] = useState<string>("");
-  const [defaultPromptDesc, setDefaultPromptDesc] = useState<string>("");
+function buildPromptPreview(config: {
+  systemPromptBase: string;
+  responseStyle: string;
+  toneInstructions: string;
+  restrictionRules: string;
+  defaultPrompt: string;
+}): string {
+  const parts: string[] = [];
+  if (config.systemPromptBase.trim()) parts.push(`## Knowledge Base Context\n${config.systemPromptBase.trim()}`);
+  const styleLines: string[] = [];
+  if (config.responseStyle.trim()) styleLines.push(`Respond in a ${config.responseStyle.trim()} style.`);
+  if (config.toneInstructions.trim()) styleLines.push(config.toneInstructions.trim());
+  if (config.restrictionRules.trim()) styleLines.push(`Topic restriction: ${config.restrictionRules.trim()}`);
+  if (styleLines.length > 0) parts.push(`## Response Style\n${styleLines.join(" ")}`);
+  parts.push(`## Platform Grounding Rules\n${config.defaultPrompt.trim() || "(Loading...)"}`);
+  return parts.join("\n\n").trim();
+}
+
+export function SystemPromptPanel({ kbId, initialConfig, templateId: initialTemplateId, templateName: initialTemplateName, onSaved }: Props): ReactElement {
+  const [defaultPrompt, setDefaultPrompt] = useState("");
+  const [defaultPromptDesc, setDefaultPromptDesc] = useState("");
   const [defaultPromptOpen, setDefaultPromptOpen] = useState(false);
 
+  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [currentTemplateName, setCurrentTemplateName] = useState(initialTemplateName ?? "None");
+  const [selectedTemplateId, setSelectedTemplateId] = useState(initialTemplateId ?? "");
+  const [applying, setApplying] = useState(false);
+  const [applyStatus, setApplyStatus] = useState<string | null>(null);
+  const [applyError, setApplyError] = useState<string | null>(null);
+
+  const [fineTuneOpen, setFineTuneOpen] = useState(false);
   const [systemPromptBase, setSystemPromptBase] = useState(initialConfig?.systemPromptBase ?? "");
   const [responseStyle, setResponseStyle] = useState(initialConfig?.responseStyle ?? "");
   const [toneInstructions, setToneInstructions] = useState(initialConfig?.toneInstructions ?? "");
@@ -66,24 +75,30 @@ export function SystemPromptPanel({ kbId, initialConfig, onSaved }: Props): Reac
   const [generating, setGenerating] = useState(false);
   const [suggestion, setSuggestion] = useState<string | null>(null);
   const [generateError, setGenerateError] = useState<string | null>(null);
-
   const [saving, setSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [lastSentPrompt, setLastSentPrompt] = useState<string | null>(null);
 
-  // Load platform default prompt on mount
+  const hasFineTuneText = systemPromptBase.trim().length > 0;
+  const generateLabel = hasFineTuneText ? "✦ Improve" : "✦ Recommend Best Practice";
+
+  const promptPreview = buildPromptPreview({ systemPromptBase, responseStyle, toneInstructions, restrictionRules, defaultPrompt });
+
   useEffect(() => {
     requestJson<DefaultPromptResponse>("/rag/knowledge-bases/default-prompt", "GET")
-      .then((res) => {
-        setDefaultPrompt(res.defaultPrompt);
-        setDefaultPromptDesc(res.description);
-      })
-      .catch(() => {
-        setDefaultPrompt("(Could not load platform default prompt)");
-      });
+      .then((res) => { setDefaultPrompt(res.defaultPrompt); setDefaultPromptDesc(res.description); })
+      .catch(() => setDefaultPrompt("(Could not load platform default prompt)"));
   }, []);
 
-  // Sync from parent if initialConfig changes (e.g. after KB reload)
+  useEffect(() => {
+    setTemplatesLoading(true);
+    listTemplates()
+      .then(setTemplates)
+      .catch(() => undefined)
+      .finally(() => setTemplatesLoading(false));
+  }, []);
+
   useEffect(() => {
     setSystemPromptBase(initialConfig?.systemPromptBase ?? "");
     setResponseStyle(initialConfig?.responseStyle ?? "");
@@ -91,21 +106,48 @@ export function SystemPromptPanel({ kbId, initialConfig, onSaved }: Props): Reac
     setRestrictionRules(initialConfig?.restrictionRules ?? "");
   }, [initialConfig]);
 
-  async function handleGenerate(): Promise<void> {
-    const description = systemPromptBase.trim();
-    if (!description) {
-      setGenerateError("Type a rough description first, then click Generate to improve it.");
-      return;
+  useEffect(() => {
+    setCurrentTemplateName(initialTemplateName ?? "None");
+    setSelectedTemplateId(initialTemplateId ?? "");
+    setLastSentPrompt(null);
+  }, [kbId, initialTemplateId, initialTemplateName]);
+
+  async function handleApplyTemplate(): Promise<void> {
+    if (!selectedTemplateId) { setApplyError("Select a template first."); return; }
+    setApplying(true);
+    setApplyStatus(null);
+    setApplyError(null);
+    try {
+      const res = await applyTemplateToKb(kbId, selectedTemplateId);
+      const tpl = templates.find((t) => t.id === selectedTemplateId);
+      setCurrentTemplateName(tpl?.name ?? selectedTemplateId);
+      setApplyStatus(res.difyPromptUpdated ? "Template applied and sent to AI Agent." : "Template applied. AI Agent will receive it on next provision.");
+      // Refresh fine-tune fields from template
+      if (tpl) {
+        setSystemPromptBase(tpl.systemPromptBase ?? "");
+        setResponseStyle(tpl.responseStyle ?? "");
+        setToneInstructions(tpl.toneInstructions ?? "");
+        setRestrictionRules(tpl.restrictionRules ?? "");
+        onSaved?.({ systemPromptBase: tpl.systemPromptBase ?? null, responseStyle: tpl.responseStyle ?? null, toneInstructions: tpl.toneInstructions ?? null, restrictionRules: tpl.restrictionRules ?? null });
+      }
+    } catch (err) {
+      setApplyError(err instanceof Error ? err.message : "Apply failed");
+    } finally {
+      setApplying(false);
     }
+  }
+
+  async function handleGenerate(): Promise<void> {
+    const selectedTpl = templates.find((t) => t.id === selectedTemplateId);
     setGenerating(true);
     setSuggestion(null);
     setGenerateError(null);
     try {
-      const result = await requestJson<GeneratePromptResponse>(
-        `/rag/knowledge-bases/${kbId}/generate-prompt`,
-        "POST",
-        { description }
-      );
+      const result = await requestJson<{ suggestion: string }>("/rag/prompt-templates/generate", "POST", {
+        description: systemPromptBase.trim() || undefined,
+        category: selectedTpl?.category ?? "general",
+        templateName: currentTemplateName !== "None" ? currentTemplateName : undefined
+      });
       setSuggestion(result.suggestion);
     } catch (err) {
       setGenerateError(err instanceof Error ? err.message : "Generation failed");
@@ -114,14 +156,7 @@ export function SystemPromptPanel({ kbId, initialConfig, onSaved }: Props): Reac
     }
   }
 
-  function handleApplySuggestion(): void {
-    if (suggestion) {
-      setSystemPromptBase(suggestion);
-      setSuggestion(null);
-    }
-  }
-
-  async function handleSave(): Promise<void> {
+  async function handleSaveFineTune(): Promise<void> {
     setSaving(true);
     setSaveStatus(null);
     setSaveError(null);
@@ -132,9 +167,22 @@ export function SystemPromptPanel({ kbId, initialConfig, onSaved }: Props): Reac
         toneInstructions: toneInstructions.trim() || null,
         restrictionRules: restrictionRules.trim() || null
       };
-      await requestJson(`/rag/knowledge-bases/${kbId}/config`, "PATCH", patch);
-      setSaveStatus("System prompt configuration saved.");
-      onSaved?.(patch);
+      const updated = await requestJson<ConfigSaveResponse>(`/rag/knowledge-bases/${kbId}/config`, "PATCH", patch);
+      onSaved?.({
+        systemPromptBase: updated.systemPromptBase ?? null,
+        responseStyle: updated.responseStyle ?? null,
+        toneInstructions: updated.toneInstructions ?? null,
+        restrictionRules: updated.restrictionRules ?? null
+      });
+      if (updated.difyPromptError) {
+        setSaveStatus("Fine-tune saved. AI Agent update needs attention.");
+        setSaveError(updated.difyPromptError);
+      } else if (updated.difyPromptUpdated) {
+        setSaveStatus("Fine-tune saved and sent to the AI Agent.");
+        setLastSentPrompt(promptPreview);
+      } else {
+        setSaveStatus("Fine-tune saved. AI Agent will receive it when provisioned.");
+      }
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : "Save failed");
     } finally {
@@ -142,26 +190,133 @@ export function SystemPromptPanel({ kbId, initialConfig, onSaved }: Props): Reac
     }
   }
 
+  const currentTplObj = templates.find((t) => t.id === selectedTemplateId || t.name === currentTemplateName);
+  const currentIcon = currentTplObj ? (CATEGORY_ICONS[currentTplObj.category] ?? "🤖") : "🤖";
+
   return (
     <div className="ops-system-prompt-panel">
       <h3 className="ops-edit-section-title" style={{ marginBottom: 12 }}>
-        🤖 System Prompt Configuration
+        🤖 AI Agent Template
       </h3>
 
-      {/* ── Platform Default (read-only, collapsible) ── */}
-      <div className="ops-system-prompt-default">
-        <button
-          type="button"
-          className="ops-system-prompt-default-toggle"
-          onClick={() => setDefaultPromptOpen((o) => !o)}
-          aria-expanded={defaultPromptOpen}
-        >
-          <span className="ops-system-prompt-default-label">
-            {defaultPromptOpen ? "▼" : "▶"} Platform Default Prompt
-          </span>
+      {/* ── Current Template ── */}
+      <div className="tpl-current-section">
+        <div className="tpl-current-row">
+          <span className="tpl-current-label">Current Template</span>
+          <span className="tpl-current-value">{currentIcon} {currentTemplateName}</span>
+        </div>
+
+        <div className="tpl-change-row">
+          <label className="tpl-selector-label">Change Template</label>
+          {templatesLoading ? (
+            <p className="tpl-loading" style={{ fontSize: "0.85rem" }}>Loading…</p>
+          ) : (
+            <div className="tpl-change-controls">
+              <select
+                className="tpl-select"
+                value={selectedTemplateId}
+                onChange={(e) => { setSelectedTemplateId(e.target.value); setApplyStatus(null); setApplyError(null); }}
+              >
+                <option value="">— Select template —</option>
+                {templates.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {CATEGORY_ICONS[t.category] ?? "🤖"} {t.name}{t.isBuiltIn ? " ★" : ""}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="ops-btn ops-btn-primary ops-btn-sm"
+                onClick={() => void handleApplyTemplate()}
+                disabled={applying || !selectedTemplateId}
+              >
+                {applying ? "Applying…" : "Apply Template"}
+              </button>
+            </div>
+          )}
+          {applyStatus && <p className="ops-system-prompt-save-ok" style={{ marginTop: 6 }}>{applyStatus}</p>}
+          {applyError && <p className="ops-system-prompt-save-error" style={{ marginTop: 6 }}>{applyError}</p>}
+        </div>
+      </div>
+
+      {/* ── Fine-tune (collapsible) ── */}
+      <button
+        type="button"
+        className="tpl-finetune-toggle"
+        style={{ marginTop: 12 }}
+        onClick={() => setFineTuneOpen((v) => !v)}
+      >
+        {fineTuneOpen ? "▾" : "▸"} Fine-tune (optional)
+      </button>
+
+      {fineTuneOpen && (
+        <div className="tpl-finetune-panel">
+          <p className="tpl-hint">Override or extend the template with KB-specific instructions. Appended on top of the template text.</p>
+
+          <div className="tpl-form-field">
+            <div className="tpl-form-label-row">
+              <label>Additional Instructions</label>
+              <button type="button" className="ops-btn ops-btn-sm ops-btn-ghost" onClick={() => void handleGenerate()} disabled={generating}>
+                {generating ? "Generating…" : generateLabel}
+              </button>
+            </div>
+            <textarea
+              className="ops-system-prompt-textarea"
+              value={systemPromptBase}
+              onChange={(e) => setSystemPromptBase(e.target.value)}
+              placeholder="Add KB-specific context on top of the selected template…"
+              rows={5}
+            />
+          </div>
+
+          {generateError && <p className="ops-system-prompt-error">{generateError}</p>}
+          {suggestion && (
+            <div className="ops-system-prompt-suggestion">
+              <div className="ops-system-prompt-suggestion-header">
+                <span className="ops-system-prompt-suggestion-label">✦ AI Suggestion</span>
+                <div className="ops-system-prompt-suggestion-actions">
+                  <button type="button" className="ops-btn ops-btn-primary ops-btn-sm" onClick={() => { setSystemPromptBase(suggestion); setSuggestion(null); }}>
+                    Apply
+                  </button>
+                  <button type="button" className="ops-btn ops-btn-secondary ops-btn-sm" onClick={() => void handleGenerate()} disabled={generating}>
+                    {generating ? "Regenerating…" : "Regenerate"}
+                  </button>
+                  <button type="button" className="ops-btn ops-btn-ghost ops-btn-sm" onClick={() => setSuggestion(null)}>Dismiss</button>
+                </div>
+              </div>
+              <pre className="ops-system-prompt-suggestion-text">{suggestion}</pre>
+            </div>
+          )}
+
+          <div className="ops-system-prompt-style-section" style={{ marginTop: 10 }}>
+            <label className="ops-form-label">Response Style</label>
+            <select className="ops-select" value={responseStyle} onChange={(e) => setResponseStyle(e.target.value)}>
+              {RESPONSE_STYLE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+            </select>
+
+            <label className="ops-form-label" style={{ marginTop: 10 }}>Tone Instructions <span className="ops-form-label-hint">(optional)</span></label>
+            <input type="text" className="ops-input" value={toneInstructions} onChange={(e) => setToneInstructions(e.target.value)} placeholder="e.g. Always use bullet points." />
+
+            <label className="ops-form-label" style={{ marginTop: 10 }}>Topic Restriction <span className="ops-form-label-hint">(optional)</span></label>
+            <input type="text" className="ops-input" value={restrictionRules} onChange={(e) => setRestrictionRules(e.target.value)} placeholder="e.g. Answer only DevOps questions." />
+          </div>
+
+          <div className="ops-system-prompt-save-row" style={{ marginTop: 12 }}>
+            <button type="button" className="ops-btn ops-btn-primary" onClick={() => void handleSaveFineTune()} disabled={saving}>
+              {saving ? "Saving…" : "Save Fine-tune"}
+            </button>
+            {saveStatus && <span className="ops-system-prompt-save-ok">{saveStatus}</span>}
+            {saveError && <span className="ops-system-prompt-save-error">{saveError}</span>}
+          </div>
+        </div>
+      )}
+
+      {/* ── Platform Default (collapsible) ── */}
+      <div className="ops-system-prompt-default" style={{ marginTop: 14 }}>
+        <button type="button" className="ops-system-prompt-default-toggle" onClick={() => setDefaultPromptOpen((o) => !o)} aria-expanded={defaultPromptOpen}>
+          <span className="ops-system-prompt-default-label">{defaultPromptOpen ? "▼" : "▶"} Platform Default Prompt</span>
           <span className="ops-system-prompt-default-badge">Always Applied · Read-only</span>
         </button>
-
         {defaultPromptOpen && (
           <div className="ops-system-prompt-default-body">
             <p className="ops-system-prompt-default-desc">{defaultPromptDesc}</p>
@@ -170,134 +325,22 @@ export function SystemPromptPanel({ kbId, initialConfig, onSaved }: Props): Reac
         )}
       </div>
 
-      {/* ── KB-Specific Instructions ── */}
-      <div className="ops-system-prompt-kb-section">
-        <label className="ops-form-label" htmlFor={`system-prompt-${kbId}`}>
-          KB-Specific Instructions
-          <span className="ops-form-label-hint"> (optional — appended after the platform default)</span>
-        </label>
-
-        <textarea
-          id={`system-prompt-${kbId}`}
-          className="ops-system-prompt-textarea"
-          value={systemPromptBase}
-          onChange={(e) => setSystemPromptBase(e.target.value)}
-          placeholder="Describe what this knowledge base is about and how the assistant should answer questions for it.&#10;&#10;Example: This KB covers DevOps runbooks for the ACME platform. Prioritise step-by-step commands. Always mention which runbook the answer comes from."
-          rows={5}
-        />
-
-        {/* ✦ Generate button row */}
-        <div className="ops-system-prompt-generate-row">
-          <button
-            type="button"
-            className="ops-btn ops-btn-secondary ops-system-prompt-generate-btn"
-            onClick={() => void handleGenerate()}
-            disabled={generating}
-          >
-            {generating ? "✦ Generating…" : "✦ Generate"}
-          </button>
-          <span className="ops-system-prompt-generate-hint">
-            Type a rough description above, then click Generate to have AI improve it.
-          </span>
+      {/* ── Prompt Preview ── */}
+      <div className="ops-system-prompt-preview" style={{ marginTop: 14 }}>
+        <div className="ops-system-prompt-preview-header">
+          <span className="ops-system-prompt-preview-label">📋 Preview: What the AI Agent Will Receive</span>
         </div>
+        <pre className="ops-system-prompt-preview-text">{promptPreview}</pre>
+      </div>
 
-        {generateError && (
-          <p className="ops-system-prompt-error">{generateError}</p>
-        )}
-
-        {/* AI suggestion box */}
-        {suggestion && (
-          <div className="ops-system-prompt-suggestion">
-            <div className="ops-system-prompt-suggestion-header">
-              <span className="ops-system-prompt-suggestion-label">✦ AI Suggestion</span>
-              <div className="ops-system-prompt-suggestion-actions">
-                <button
-                  type="button"
-                  className="ops-btn ops-btn-primary ops-btn-sm"
-                  onClick={handleApplySuggestion}
-                >
-                  Apply This Suggestion
-                </button>
-                <button
-                  type="button"
-                  className="ops-btn ops-btn-secondary ops-btn-sm"
-                  onClick={() => void handleGenerate()}
-                  disabled={generating}
-                >
-                  {generating ? "Regenerating…" : "Regenerate"}
-                </button>
-                <button
-                  type="button"
-                  className="ops-btn ops-btn-ghost ops-btn-sm"
-                  onClick={() => setSuggestion(null)}
-                >
-                  Dismiss
-                </button>
-              </div>
-            </div>
-            <pre className="ops-system-prompt-suggestion-text">{suggestion}</pre>
+      {lastSentPrompt && (
+        <div className="ops-system-prompt-preview ops-system-prompt-last-sent">
+          <div className="ops-system-prompt-preview-header">
+            <span className="ops-system-prompt-preview-label">📤 Last sent to AI Agent</span>
           </div>
-        )}
-      </div>
-
-      {/* ── Response Style ── */}
-      <div className="ops-system-prompt-style-section">
-        <label className="ops-form-label" htmlFor={`response-style-${kbId}`}>
-          Response Style
-        </label>
-        <select
-          id={`response-style-${kbId}`}
-          className="ops-select"
-          value={responseStyle}
-          onChange={(e) => setResponseStyle(e.target.value)}
-        >
-          {RESPONSE_STYLE_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-
-        <label className="ops-form-label" htmlFor={`tone-${kbId}`} style={{ marginTop: 12 }}>
-          Additional Tone Instructions
-          <span className="ops-form-label-hint"> (optional)</span>
-        </label>
-        <input
-          id={`tone-${kbId}`}
-          type="text"
-          className="ops-input"
-          value={toneInstructions}
-          onChange={(e) => setToneInstructions(e.target.value)}
-          placeholder="e.g. Always use bullet points. Keep answers under 5 sentences."
-        />
-
-        <label className="ops-form-label" htmlFor={`restriction-${kbId}`} style={{ marginTop: 12 }}>
-          Topic Restriction
-          <span className="ops-form-label-hint"> (optional)</span>
-        </label>
-        <input
-          id={`restriction-${kbId}`}
-          type="text"
-          className="ops-input"
-          value={restrictionRules}
-          onChange={(e) => setRestrictionRules(e.target.value)}
-          placeholder="e.g. Only answer questions related to DevOps and infrastructure. Decline off-topic questions."
-        />
-      </div>
-
-      {/* ── Save row ── */}
-      <div className="ops-system-prompt-save-row">
-        <button
-          type="button"
-          className="ops-btn ops-btn-primary"
-          onClick={() => void handleSave()}
-          disabled={saving}
-        >
-          {saving ? "Saving…" : "Save Prompt Config"}
-        </button>
-        {saveStatus && <span className="ops-system-prompt-save-ok">{saveStatus}</span>}
-        {saveError && <span className="ops-system-prompt-save-error">{saveError}</span>}
-      </div>
+          <pre className="ops-system-prompt-preview-text">{lastSentPrompt}</pre>
+        </div>
+      )}
     </div>
   );
 }

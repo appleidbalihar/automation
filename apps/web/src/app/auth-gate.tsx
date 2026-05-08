@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { ReactElement, ReactNode } from "react";
 import { useRouter } from "next/navigation";
+import type { ReactElement, ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { AUTH_SESSION_CLEARED_EVENT, clearStoredToken, fetchIdentity, saveStoredToken } from "./auth-client";
 
 interface Identity {
@@ -16,8 +16,8 @@ function LoginPanel({
   onSignedIn: (identity: Identity) => void;
 }): ReactElement {
   const [mode, setMode] = useState<"login" | "register">("login");
-  const [username, setUsername] = useState<string>("platform-admin");
-  const [password, setPassword] = useState<string>("admin123");
+  const [username, setUsername] = useState<string>("");
+  const [password, setPassword] = useState<string>("");
   const [email, setEmail] = useState<string>("");
   const [firstName, setFirstName] = useState<string>("");
   const [lastName, setLastName] = useState<string>("");
@@ -87,53 +87,155 @@ function LoginPanel({
   }
 
   return (
-    <main className="login-shell">
-      <section className="login-card">
-        <h1>{mode === "login" ? "Sign in to RapidRAG" : "Create your RapidRAG account"}</h1>
-        <p>
-          {mode === "login"
-            ? "Sign in to access your knowledge bases, integrations, and AI chatbots."
-            : "Create your account to get started. Your user will be provisioned automatically."}
-        </p>
-        <div className="integration-tabs">
-          <button type="button" className={mode === "login" ? "tab-active" : ""} onClick={() => setMode("login")}>
-            Sign In
-          </button>
-          <button type="button" className={mode === "register" ? "tab-active" : ""} onClick={() => setMode("register")}>
-            Register
-          </button>
+    <div className="rr-auth-page">
+    <main className="rr-auth-shell">
+      {/* Left panel */}
+      <div className="rr-auth-left">
+        <div className="rr-auth-left-inner">
+          <div className="rr-auth-logo">
+            <span className="rr-logo-mark">R</span>
+            <span>RapidRAG</span>
+          </div>
+          <div className="rr-auth-welcome-badge">● WELCOME BACK</div>
+          <h2 className="rr-auth-left-headline">
+            Your knowledge,<br /><span className="rr-auth-left-accent">instant answers.</span>
+          </h2>
+          <p className="rr-auth-left-sub">
+            Sign in to manage your knowledge bases, monitor chatbots, and connect new sources across Slack, Telegram, and WhatsApp.
+          </p>
+          <ul className="rr-auth-features">
+            <li><span className="rr-auth-check">✓</span> 20+ connectors — GitHub, Drive, Notion, Confluence</li>
+            <li><span className="rr-auth-check">✓</span> Encryption at rest, role-based access, full audit logs</li>
+            <li><span className="rr-auth-check">✓</span> Bring your own LLM key — no vendor lock-in</li>
+          </ul>
         </div>
-        <div className="login-form">
-          <label htmlFor="login-username">Username</label>
-          <input id="login-username" value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" />
-          <label htmlFor="login-password">Password</label>
-          <input
-            id="login-password"
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            autoComplete="current-password"
-          />
-          {mode === "register" ? (
-            <>
-              <label htmlFor="register-email">Email</label>
-              <input id="register-email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" />
-              <label htmlFor="register-first-name">First Name</label>
-              <input id="register-first-name" value={firstName} onChange={(event) => setFirstName(event.target.value)} autoComplete="given-name" />
-              <label htmlFor="register-last-name">Last Name</label>
-              <input id="register-last-name" value={lastName} onChange={(event) => setLastName(event.target.value)} autoComplete="family-name" />
-            </>
-          ) : null}
+      </div>
+
+      {/* Right panel */}
+      <div className="rr-auth-right">
+        <div className="rr-auth-form-wrap">
+          <h1 className="rr-auth-title">{mode === "login" ? "Sign in to RapidRAG" : "Create your account"}</h1>
+          <p className="rr-auth-subtitle">
+            {mode === "login"
+              ? "Access your knowledge bases, integrations, and AI chatbots."
+              : "Create your account to get started. Your user will be provisioned automatically."}
+          </p>
+
+          <div className="rr-auth-tabs">
+            <button type="button" className={mode === "login" ? "rr-auth-tab rr-auth-tab-active" : "rr-auth-tab"} onClick={() => setMode("login")}>
+              Sign In
+            </button>
+            <button type="button" className={mode === "register" ? "rr-auth-tab rr-auth-tab-active" : "rr-auth-tab"} onClick={() => setMode("register")}>
+              Register
+            </button>
+          </div>
+
+          <div className="rr-auth-divider"><span>OR WITH EMAIL</span></div>
+
+          {/*
+            Security: autoComplete="off" + data-form-type="other" + name attrs that don't
+            match browser heuristics prevent password managers from injecting saved credentials.
+          */}
+          <form
+            autoComplete="off"
+            onSubmit={(e) => { e.preventDefault(); (mode === "login" ? signIn() : register()).catch(() => undefined); }}
+            className="rr-auth-form"
+          >
+            <input type="text" name="prevent_autofill" style={{ display: "none" }} readOnly tabIndex={-1} aria-hidden="true" />
+            <input type="password" name="prevent_autofill_pw" style={{ display: "none" }} readOnly tabIndex={-1} aria-hidden="true" />
+
+            <div className="rr-auth-field">
+              <label htmlFor="login-username">USERNAME</label>
+              <div className="rr-auth-input-wrap">
+                <span className="rr-auth-input-icon">👤</span>
+                <input
+                  id="login-username"
+                  name="rapidrag-user"
+                  placeholder="your.username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  autoComplete="off"
+                  data-form-type="other"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
+                />
+              </div>
+            </div>
+
+            <div className="rr-auth-field">
+              <label htmlFor="login-password">PASSWORD</label>
+              <div className="rr-auth-input-wrap">
+                <span className="rr-auth-input-icon">🔒</span>
+                <input
+                  id="login-password"
+                  name="rapidrag-secret"
+                  type="password"
+                  placeholder="••••••••"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete="new-password"
+                  data-form-type="other"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
+                />
+              </div>
+            </div>
+
+            {mode === "register" ? (
+              <>
+                <div className="rr-auth-field">
+                  <label htmlFor="register-email">EMAIL</label>
+                  <div className="rr-auth-input-wrap">
+                    <span className="rr-auth-input-icon">✉️</span>
+                    <input id="register-email" name="rapidrag-email" placeholder="you@company.com" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="off" data-form-type="other" />
+                  </div>
+                </div>
+                <div className="rr-auth-name-row">
+                  <div className="rr-auth-field">
+                    <label htmlFor="register-first-name">FIRST NAME</label>
+                    <input id="register-first-name" name="rapidrag-fname" placeholder="Jane" value={firstName} onChange={(event) => setFirstName(event.target.value)} autoComplete="off" data-form-type="other" />
+                  </div>
+                  <div className="rr-auth-field">
+                    <label htmlFor="register-last-name">LAST NAME</label>
+                    <input id="register-last-name" name="rapidrag-lname" placeholder="Smith" value={lastName} onChange={(event) => setLastName(event.target.value)} autoComplete="off" data-form-type="other" />
+                  </div>
+                </div>
+              </>
+            ) : null}
+
+            <button type="submit" className="rr-auth-submit" disabled={submitting}>
+              {submitting
+                ? (mode === "login" ? "Signing In..." : "Registering...")
+                : mode === "login" ? "Sign in →" : "Create account →"}
+            </button>
+          </form>
+
+          {status ? <p className="rr-auth-status">{status}</p> : null}
+          {error ? <p className="rr-auth-error">{error}</p> : null}
+
+          {mode === "login" ? (
+            <p className="rr-auth-switch">
+              New to RapidRAG?{" "}
+              <button type="button" className="rr-auth-switch-link" onClick={() => setMode("register")}>
+                Create an account
+              </button>
+            </p>
+          ) : (
+            <p className="rr-auth-switch">
+              Already have an account?{" "}
+              <button type="button" className="rr-auth-switch-link" onClick={() => setMode("login")}>
+                Sign in
+              </button>
+            </p>
+          )}
+
+          <p className="rr-auth-terms">
+            By continuing, you agree to RapidRAG&apos;s Terms and Privacy Policy
+          </p>
         </div>
-        <div className="login-actions">
-          <button type="button" onClick={() => (mode === "login" ? signIn() : register()).catch(() => undefined)} disabled={submitting}>
-            {submitting ? (mode === "login" ? "Signing In..." : "Registering...") : mode === "login" ? "Sign In" : "Register"}
-          </button>
-        </div>
-        {status ? <p className="ops-status-line">{status}</p> : null}
-        {error ? <p className="ops-error">{error}</p> : null}
-      </section>
+      </div>
     </main>
+    </div>
   );
 }
 

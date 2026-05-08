@@ -31,5 +31,5 @@ When enabled, services expose:
 - Outbound internal `fetch` calls use the refreshed TLS dispatcher.
 
 ## Current note
-- Internal service-to-service TLS is enabled at app plane.
-- `api-gateway` keeps HTTP listener for ingress compatibility while using TLS for downstream internal service calls.
+- Internal service-to-service TLS is enabled at the app plane.
+- `api-gateway`, `workflow-service`, and `logging-service` initialize Fastify with the shared TLS runtime, so their service listeners and downstream internal calls use the rendered `/tls/*` material when `MTLS_REQUIRED=true`.

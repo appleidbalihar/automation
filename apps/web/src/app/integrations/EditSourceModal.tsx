@@ -1,7 +1,9 @@
 "use client";
 
+// eslint-disable-next-line import/order
 import type { ReactElement } from "react";
 import { useEffect, useRef, useState } from "react";
+// eslint-disable-next-line import/order
 import type { Integration } from "./types";
 
 // PLATFORM_URL and OAUTH_CALLBACK_BASE are driven by env vars set in .env / .env.production.
@@ -14,6 +16,7 @@ const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? 
 type Props = {
   integration: Integration | null;
   busy: string;
+  isAdminOrUserAdmin?: boolean;
   onClose: () => void;
   /**
    * onSave receives both the patch fields and smart-sync metadata:

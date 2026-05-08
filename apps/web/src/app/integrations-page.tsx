@@ -12,7 +12,7 @@ import { KnowledgeSourcesTable } from "./integrations/KnowledgeSourcesTable";
 import { SystemPromptPanel } from "./integrations/SystemPromptPanel";
 // eslint-disable-next-line import/order
 import { SyncProcessMonitor } from "./integrations/SyncProcessMonitor";
-import type { Integration, IntegrationForm, SyncJob } from "./integrations/types";
+import type { Integration, IntegrationForm, KbConfig, SyncJob } from "./integrations/types";
 import { EMPTY_FORM } from "./integrations/types";
 
 type OAuthProvider = "github" | "gitlab" | "googledrive";
@@ -85,6 +85,11 @@ export function IntegrationsPage(): ReactElement {
     setIntegrations((prev) => prev.map((i) => (i.id === kbId ? { ...i, latestSyncJob: job } : i)));
   }, []);
 
+  const onMergeKbConfig = useCallback((kbId: string, config: KbConfig) => {
+    setIntegrations((prev) => prev.map((i) => (i.id === kbId ? { ...i, config: { ...(i.config ?? {}), ...config } } : i)));
+    setEditTarget((current) => (current?.id === kbId ? { ...current, config: { ...(current.config ?? {}), ...config } } : current));
+  }, []);
+
   // ── Create (PAT) ────────────────────────────────────────────────────────────
   async function handleCreatePat(): Promise<void> {
     setBusy("create");
@@ -103,6 +108,7 @@ export function IntegrationsPage(): ReactElement {
         sourcePaths: filteredPaths.length > 0 ? filteredPaths : undefined,
         sourcePath: filteredPaths[0] ?? undefined,
         setDefault: form.setDefault,
+        systemPromptBase: form.systemPromptBase.trim() || undefined,
         credentials: {
           githubToken: form.githubToken.trim() || undefined,
           gitlabToken: form.gitlabToken.trim() || undefined,
@@ -139,7 +145,8 @@ export function IntegrationsPage(): ReactElement {
         sourceBranch: form.sourceBranch.trim() || undefined,
         sourcePaths: filteredPaths.length > 0 ? filteredPaths : undefined,
         sourcePath: filteredPaths[0] ?? undefined,
-        setDefault: form.setDefault
+        setDefault: form.setDefault,
+        systemPromptBase: form.systemPromptBase.trim() || undefined
       });
       // Save app credentials per-integration (after integration exists)
       if (appCredentials?.clientId || appCredentials?.clientSecret) {
@@ -222,7 +229,7 @@ export function IntegrationsPage(): ReactElement {
     }
   }
 
-  // ── Retry Dify indexing only ────────────────────────────────────────────────
+  // ── Retry AI indexing only ─────────────────────────────────────────────────
   async function handleRetryFailedIndexing(id: string, options?: { syncJobId?: string; documentIds?: string[] }): Promise<void> {
     const busyKey = options?.documentIds?.length === 1 ? options.documentIds[0] : id;
     setBusy(`retry-indexing:${busyKey}`);
@@ -244,7 +251,7 @@ export function IntegrationsPage(): ReactElement {
             stepName: "retry_failed_indexing",
             status: "running",
             startedAt: new Date().toISOString(),
-            message: options?.documentIds?.length === 1 ? "Retrying selected Dify document" : "Retrying failed Dify documents"
+            message: options?.documentIds?.length === 1 ? "Retrying selected document" : "Retrying failed documents"
           }
         ]
       };
@@ -412,14 +419,14 @@ export function IntegrationsPage(): ReactElement {
     }
   }
 
-  // ── Cleanup (remove all indexed documents / Dify KB data for this source) ───
+  // ── Cleanup (remove all indexed documents / AI KB data for this source) ─────
   // Calls the dedicated cleanup endpoint and shows an optimistic deletion-only
   // job in the Sync Monitor so the user can see what's being removed.
   // No upload, fetch, or indexing — only deletion steps are shown.
   async function handleCleanup(id: string): Promise<void> {
     const integration = integrations.find((i) => i.id === id);
     if (!window.confirm(
-      `Remove ALL indexed documents and Dify knowledge-base data for "${integration?.name ?? "this source"}"?\n\n` +
+      `Remove ALL indexed documents and AI knowledge-base data for "${integration?.name ?? "this source"}"?\n\n` +
       `This ONLY deletes existing data — no files will be fetched or re-indexed.\n` +
       `The integration record stays — you can re-sync to rebuild the index afterwards.\n\nContinue?`
     )) return;
@@ -441,11 +448,11 @@ export function IntegrationsPage(): ReactElement {
       completedAt: null,
       stepsJson: [
         {
-          task: "Cleanup: Remove documents from Dify knowledge base",
+          task: "Cleanup: Remove documents from AI knowledge base",
           stepName: "cleanup_dify_documents",
           status: "running",
           startedAt: nowIso,
-          message: "Deleting all indexed documents from Dify"
+          message: "Deleting all indexed documents from AI knowledge base"
         },
         {
           task: "Cleanup: Clear vector embeddings",
@@ -477,12 +484,12 @@ export function IntegrationsPage(): ReactElement {
         completedAt: completedIso,
         stepsJson: [
           {
-            task: "Cleanup: Remove documents from Dify knowledge base",
+            task: "Cleanup: Remove documents from AI knowledge base",
             stepName: "cleanup_dify_documents",
             status: "completed",
             startedAt: nowIso,
             durationMs: Date.now() - new Date(nowIso).getTime(),
-            message: "All indexed documents deleted from Dify"
+            message: "All indexed documents deleted from AI knowledge base"
           },
           {
             task: "Cleanup: Clear vector embeddings",
@@ -588,7 +595,10 @@ export function IntegrationsPage(): ReactElement {
             <div style={{ padding: "16px 20px", overflowY: "auto", maxHeight: "75vh" }}>
               <SystemPromptPanel
                 kbId={promptTargetId}
-                initialConfig={integrations.find((i) => i.id === promptTargetId) as any}
+                initialConfig={integrations.find((i) => i.id === promptTargetId)?.config}
+                templateId={integrations.find((i) => i.id === promptTargetId)?.templateId}
+                templateName={integrations.find((i) => i.id === promptTargetId)?.templateName}
+                onSaved={(config) => onMergeKbConfig(promptTargetId, config)}
               />
             </div>
           </div>
@@ -617,6 +627,7 @@ export function IntegrationsPage(): ReactElement {
         form={form}
         setForm={setForm}
         busy={busy === "create"}
+        isAdminOrUserAdmin={isAdminOrUserAdmin}
         onSubmitPat={() => void handleCreatePat()}
         onSubmitOauth={(provider, creds) => void handleCreateOauth(provider, creds)}
       />
@@ -624,6 +635,7 @@ export function IntegrationsPage(): ReactElement {
       <EditSourceModal
         integration={editTarget}
         busy={busy}
+        isAdminOrUserAdmin={isAdminOrUserAdmin}
         onClose={() => setEditTarget(null)}
         onSave={(id, patch, syncMeta) => void handleEditSave(id, patch, syncMeta)}
         onOAuthReconnect={handleOAuthReconnect}

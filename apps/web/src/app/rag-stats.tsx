@@ -136,10 +136,10 @@ export function RagStats(): ReactElement {
                 <StatCard
                   label="Total (end-to-end)"
                   value={formatMs(stats.averages!.totalPipelineMs)}
-                  sub="Vault + Dify + overhead"
+                  sub="Vault + AI Agent + overhead"
                 />
                 <StatCard
-                  label="Dify Call (Vector DB + LLM)"
+                  label="AI Agent Call (Vector DB + LLM)"
                   value={formatMs(stats.averages!.difyCallMs)}
                   sub="Main bottleneck — embedding + generation"
                 />
@@ -159,7 +159,7 @@ export function RagStats(): ReactElement {
               <div style={{ background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 10, padding: 16, marginTop: 4, marginBottom: 20 }}>
                 <h4 style={{ margin: "0 0 10px", color: "#0c4a6e", fontSize: 14 }}>🔍 Where is the time spent?</h4>
                 <p style={{ margin: "0 0 8px", fontSize: 13, color: "#1e3a5f", lineHeight: 1.6 }}>
-                  <strong>Dify Call</strong> ({formatMs(stats.averages!.difyCallMs)}) = Vector DB retrieval + LLM summarization.
+                  <strong>AI Agent Call</strong> ({formatMs(stats.averages!.difyCallMs)}) = Vector DB retrieval + LLM summarization.
                   This is almost always the dominant cost. With 8 documents it is faster; with 100+ documents
                   the vector search takes longer, and the LLM prompt grows proportionally.
                 </p>
@@ -168,7 +168,7 @@ export function RagStats(): ReactElement {
                   Should be &lt;100ms. If this is slow, Vault itself may be under load.
                 </p>
                 <p style={{ margin: 0, fontSize: 13, color: "#1e3a5f", lineHeight: 1.6 }}>
-                  <strong>Scaling prediction:</strong> With 100 documents (vs current 8), expect Dify call time
+                  <strong>Scaling prediction:</strong> With 100 documents (vs current 8), expect AI Agent call time
                   to increase by ~2–4× due to larger vector index and longer context window for the LLM.
                 </p>
               </div>
@@ -182,7 +182,7 @@ export function RagStats(): ReactElement {
                       <tr>
                         <th>Percentile</th>
                         <th>Total</th>
-                        <th>Dify Call</th>
+                        <th>AI Agent</th>
                         <th>Vault Fetch</th>
                       </tr>
                     </thead>
@@ -219,7 +219,7 @@ export function RagStats(): ReactElement {
                       <tr>
                         <th>Time</th>
                         <th>Total</th>
-                        <th>Dify Call</th>
+                        <th>AI Agent</th>
                         <th>Vault</th>
                         <th>Prompt Chars</th>
                       </tr>
@@ -249,7 +249,7 @@ export function RagStats(): ReactElement {
                         <th>Knowledge Base ID</th>
                         <th>Requests</th>
                         <th>Avg Total</th>
-                        <th>Avg Dify</th>
+                        <th>Avg AI Agent</th>
                         <th>Avg Vault</th>
                       </tr>
                     </thead>

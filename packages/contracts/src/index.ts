@@ -10,7 +10,16 @@ export interface RagDiscussionSummary {
   expiresAt: string;
   preview?: string;
   knowledgeBaseId?: string;
+  knowledgeBaseIds?: string[];
   backend: RagDiscussionBackend;
+}
+
+export interface RagDiscussionKbResult {
+  knowledgeBaseId: string;
+  knowledgeBaseName: string;
+  ownerUsername?: string;
+  answer: string;
+  error?: string;
 }
 
 export interface RagDiscussionMessage {
@@ -19,6 +28,7 @@ export interface RagDiscussionMessage {
   role: RagDiscussionMessageRole;
   content: string;
   createdAt: string;
+  kbResults?: RagDiscussionKbResult[];
 }
 
 export interface RagDiscussionThread {
@@ -29,16 +39,20 @@ export interface RagDiscussionThread {
   lastMessageAt: string;
   expiresAt: string;
   knowledgeBaseId?: string;
+  knowledgeBaseIds?: string[];
   backend: RagDiscussionBackend;
   messages: RagDiscussionMessage[];
 }
 
 export interface RagDiscussionCreateRequest {
   knowledgeBaseId?: string;
+  knowledgeBaseIds?: string[];
 }
 
 export interface RagDiscussionSendMessageRequest {
   content: string;
+  knowledgeBaseId?: string;
+  knowledgeBaseIds?: string[];
 }
 
 export interface RagDiscussionSendMessageResponse {

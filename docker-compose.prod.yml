@@ -1,0 +1,175 @@
+# docker-compose.prod.yml
+#
+# Production hardening overrides for the automation platform.
+# Applies on top of docker-compose.yml.
+#
+# Usage:
+#   ENVIRONMENT=prod bash scripts/generate-runtime-env.sh
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     --env-file .env.production --env-file .env.runtime up -d
+#   shred -u .env.runtime
+#
+# Production differences from base docker-compose.yml:
+#   - Vault port NOT exposed to host (internal-only)
+#   - Internal service ports NOT exposed to host
+#   - no-new-privileges enforced on all app containers
+#   - ALL Linux capabilities dropped, only IPC_LOCK re-added for Vault
+#   - read_only filesystem for Node.js services with tmpfs for /tmp
+#   - Memory and CPU limits set to prevent runaway containers
+#   - Tighter cert TTL (30 days)
+
+services:
+  # ── Vault ──────────────────────────────────────────────────────────────────
+  vault:
+    # Port 8200 NOT published — Vault is internal-only in production.
+    # To run seed/list scripts from the host, use docker exec:
+    #   docker exec -e VAULT_TOKEN=... vault vault kv get secret/platform/prod/infra/postgres/config
+    cap_add:
+      - IPC_LOCK
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    cpus: 1.0
+    # Port NOT published — access only via DATABASE_URL inside Docker network
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    cpus: 0.5
+
+  # ── RabbitMQ ───────────────────────────────────────────────────────────────
+  rabbitmq:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 0.5
+
+  # ── OpenSearch ─────────────────────────────────────────────────────────────
+  opensearch:
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: 1.0
+
+  # ── MinIO ──────────────────────────────────────────────────────────────────
+  minio:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 0.5
+
+  # ── Keycloak ───────────────────────────────────────────────────────────────
+  keycloak:
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 0.5
+
+  # ── api-gateway ────────────────────────────────────────────────────────────
+  api-gateway:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec
+      - /run:size=16m,noexec
+    mem_limit: 512m
+    cpus: 0.5
+
+  # ── workflow-service ───────────────────────────────────────────────────────
+  workflow-service:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec
+    mem_limit: 512m
+    cpus: 0.5
+
+  # ── logging-service ────────────────────────────────────────────────────────
+  logging-service:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec
+    mem_limit: 256m
+    cpus: 0.25
+
+  # ── web ────────────────────────────────────────────────────────────────────
+  web:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 0.5
+
+  # ── Dify ───────────────────────────────────────────────────────────────────
+  dify-db:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+
+  dify-api:
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.0
+
+  dify-worker:
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.0
+
+  # ── n8n ────────────────────────────────────────────────────────────────────
+  n8n-db:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+
+  n8n:
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 0.5
+    # Port NOT published in prod — accessed via nginx web-ingress at /n8n/
+
+  # ── cert-rotation-controller ───────────────────────────────────────────────
+  cert-rotation-controller:
+    environment:
+      ROTATION_ENABLE_FALLBACK: "true"    # Enable automatic fallback rotation in prod
+      RESTART_WINDOW_SECONDS: "86400"     # 24h minimum between fallback full-restarts
+
+  # ── Vault bootstrap ────────────────────────────────────────────────────────
+  vault-bootstrap:
+    environment:
+      PKI_LEAF_TTL: ${PKI_LEAF_TTL:-720h}   # 30-day cert TTL in production

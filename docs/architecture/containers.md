@@ -76,6 +76,8 @@ The platform runs the following Docker containers:
 - Responsibilities:
   - create/edit/delete knowledge sources
   - manage `sourcePaths`, sharing, defaults, config, sync jobs, cleanup jobs, retry jobs
+  - manage AI agent prompt templates and apply templates to KB agent configs
+  - calculate platform-wide RAG stats
   - provision and call Dify datasets/apps
   - trigger and cancel n8n executions
   - store source credentials, OAuth tokens, OAuth app credentials, and Dify API keys in Vault

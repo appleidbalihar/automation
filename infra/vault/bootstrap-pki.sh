@@ -6,7 +6,7 @@ VAULT_INIT_FILE="${VAULT_INIT_FILE:-/vault/file/vault-init.json}"
 APPROLE_DIR="${APPROLE_DIR:-/vault/file/approle}"
 PKI_ROOT_TTL="${PKI_ROOT_TTL:-87600h}"
 PKI_INT_TTL="${PKI_INT_TTL:-43800h}"
-PKI_LEAF_TTL="${PKI_LEAF_TTL:-8760h}"
+PKI_LEAF_TTL="${PKI_LEAF_TTL:-720h}"
 WATCH_MODE="${VAULT_WATCH_MODE:-false}"
 WATCH_INTERVAL_SECONDS="${VAULT_WATCH_INTERVAL_SECONDS:-15}"
 
@@ -78,6 +78,9 @@ bootstrap_once() {
 
   vault secrets enable -path=secret kv-v2 >/dev/null 2>&1 || true
 
+  # Enable file-based audit log — records every request/response (values are hashed)
+  vault audit enable file file_path=/vault/file/audit.log log_raw=false >/dev/null 2>&1 || true
+
   vault secrets enable pki >/dev/null 2>&1 || true
   vault secrets tune -max-lease-ttl="${PKI_ROOT_TTL}" pki >/dev/null
 
@@ -142,6 +145,34 @@ EOF
     mkdir -p "${APPROLE_DIR}/${service}"
     vault read -format=json auth/approle/role/"${service}-role"/role-id | jq -r '.data.role_id' >"${APPROLE_DIR}/${service}/role_id"
     vault write -force -format=json auth/approle/role/"${service}-role"/secret-id | jq -r '.data.secret_id' >"${APPROLE_DIR}/${service}/secret_id"
+  done
+
+  # ── Deploy AppRoles ──────────────────────────────────────────────────────────
+  # Two roles: deploy-dev (reads platform/dev/*) and deploy-prod (reads platform/prod/*).
+  # Used by scripts/generate-runtime-env.sh and scripts/list-secrets.sh at deploy time.
+  for deploy_env in dev prod; do
+    cat >/tmp/deploy-${deploy_env}.hcl <<EOF
+path "secret/data/platform/${deploy_env}/*" {
+  capabilities = ["read"]
+}
+path "secret/metadata/platform/${deploy_env}/*" {
+  capabilities = ["list", "read"]
+}
+path "secret/data/platform/${deploy_env}/*" {
+  capabilities = ["read", "update"]
+}
+EOF
+    vault policy write "deploy-${deploy_env}" /tmp/deploy-${deploy_env}.hcl >/dev/null
+    vault write auth/approle/role/"deploy-${deploy_env}-role" \
+      token_policies="deploy-${deploy_env}" \
+      token_ttl="1h" \
+      token_max_ttl="4h" >/dev/null
+
+    mkdir -p "${APPROLE_DIR}/deploy-${deploy_env}"
+    vault read -format=json auth/approle/role/"deploy-${deploy_env}-role"/role-id \
+      | jq -r '.data.role_id' >"${APPROLE_DIR}/deploy-${deploy_env}/role_id"
+    vault write -force -format=json auth/approle/role/"deploy-${deploy_env}-role"/secret-id \
+      | jq -r '.data.secret_id' >"${APPROLE_DIR}/deploy-${deploy_env}/secret_id"
   done
 
   echo "Vault PKI bootstrap complete."

@@ -1,13 +1,13 @@
 x-shared-env: &shared-env
-  DATABASE_URL: postgresql://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform}@postgres:5432/${POSTGRES_DB:-automation}?schema=public&sslmode=verify-full&sslrootcert=/tls/ca.pem
-  REDIS_URL: rediss://:platformredis@redis:6379
-  RABBITMQ_URL: amqps://guest:guest@rabbitmq:5671
-  OPENSEARCH_URL: https://admin:DevAdmin123!@opensearch:9200
+  DATABASE_URL: ${DATABASE_URL}
+  REDIS_URL: ${REDIS_URL}
+  RABBITMQ_URL: ${RABBITMQ_URL}
+  OPENSEARCH_URL: ${OPENSEARCH_URL}
   KEYCLOAK_URL: https://keycloak:8443
   KEYCLOAK_PUBLIC_URL: ${KEYCLOAK_PUBLIC_URL:-https://localhost:8443}
   KEYCLOAK_REALM: ${KEYCLOAK_REALM:-automation-platform}
   KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-automation-web}
-  KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-replace-me}
+  KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
   WORKFLOW_SERVICE_URL: https://workflow-service:4001
   LOGGING_SERVICE_URL: https://logging-service:4005
   # Dify — internal base URL only; API keys are stored in Vault, never in env
@@ -39,7 +39,7 @@ x-vault-agent: &vault-agent
   entrypoint: ["sh", "/vault/scripts/agent-entrypoint.sh"]
   environment:
     VAULT_ADDR: http://vault:8200
-    CERT_TTL: ${TLS_CERT_TTL:-8760h}
+    CERT_TTL: ${TLS_CERT_TTL:-720h}
   volumes:
     - ./infra/vault:/vault/scripts:ro
     - vault_data:/vault/file:ro
@@ -58,9 +58,9 @@ services:
         "cp /tls/cert.pem /var/lib/postgresql/server.crt && cp /tls/key.pem /var/lib/postgresql/server.key && cp /tls/ca.pem /var/lib/postgresql/root.crt && chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key /var/lib/postgresql/root.crt && chmod 600 /var/lib/postgresql/server.key && chmod 644 /var/lib/postgresql/server.crt /var/lib/postgresql/root.crt && export PATH=/usr/lib/postgresql/15/bin:$$PATH && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key -c ssl_ca_file=/var/lib/postgresql/root.crt -c hba_file=/etc/postgresql/pg_hba.conf -c max_connections=${POSTGRES_MAX_CONNECTIONS:-300} -c idle_session_timeout=${POSTGRES_IDLE_SESSION_TIMEOUT:-5min}"
       ]
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-platform}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-platform}
-      POSTGRES_DB: ${POSTGRES_DB:-automation}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
@@ -90,7 +90,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--requirepass", "${REDIS_PASSWORD}"]
     ports:
       - "6379:6379"
     volumes:
@@ -116,6 +116,8 @@ services:
     image: rabbitmq:3-management
     environment:
       RABBITMQ_CONFIG_FILE: /etc/rabbitmq/rabbitmq
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
     ports:
       - "5671:5671"
       - "15671:15671"
@@ -142,7 +144,7 @@ services:
     image: opensearchproject/opensearch:2.14.0
     environment:
       discovery.type: single-node
-      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "DevAdmin123!"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
       OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
     ports:
       - "9200:9200"
@@ -152,15 +154,15 @@ services:
 
   minio:
     image: minio/minio:latest
+    entrypoint: /bin/sh
     command:
       [
-        "sh",
         "-lc",
         "mkdir -p /root/.minio/certs/CAs && cp /tls/cert.pem /root/.minio/certs/public.crt && cp /tls/key.pem /root/.minio/certs/private.key && cp /tls/ca.pem /root/.minio/certs/CAs/ca.crt && exec minio server /data --console-address :9001"
       ]
     environment:
-      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -197,7 +199,7 @@ services:
       ]
     environment:
       KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
     ports:
       - "8443:8443"
     volumes:
@@ -238,7 +240,7 @@ services:
       VAULT_ADDR: http://vault:8200
       VAULT_INIT_FILE: /vault/file/vault-init.json
       APPROLE_DIR: /vault/file/approle
-      PKI_LEAF_TTL: ${PKI_LEAF_TTL:-8760h}
+      PKI_LEAF_TTL: ${PKI_LEAF_TTL:-720h}
       VAULT_WATCH_MODE: "true"
       VAULT_WATCH_INTERVAL_SECONDS: 15
     volumes:
@@ -284,7 +286,7 @@ services:
       PORT: 4001
       SERVICE_NAME: workflow-service
       VAULT_ADDR: http://workflow-service-vault-agent:8200
-      PLATFORM_OAUTH_SECRET: ${PLATFORM_OAUTH_SECRET:-change-me-in-production}
+      PLATFORM_OAUTH_SECRET: ${PLATFORM_OAUTH_SECRET}
     volumes:
       - tls_workflow_service:/tls:ro
     depends_on:
@@ -345,7 +347,7 @@ services:
       <<: *shared-env
       PORT: 4000
       SERVICE_NAME: api-gateway
-      PLATFORM_OAUTH_SECRET: ${PLATFORM_OAUTH_SECRET:-change-me-in-production}
+      PLATFORM_OAUTH_SECRET: ${PLATFORM_OAUTH_SECRET}
       OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/rapidrag/connect}
       OAUTH_POST_CONNECT_REDIRECT: ${OAUTH_POST_CONNECT_REDIRECT:-https://dev.eclassmanager.com/rapidrag/integrations}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
@@ -380,7 +382,7 @@ services:
       PORT: 3000
       KEYCLOAK_URL: ${WEB_KEYCLOAK_URL:-https://keycloak:8443}
       KEYCLOAK_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
-      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
       KEYCLOAK_REGISTER_DEFAULT_ROLE: ${KEYCLOAK_REGISTER_DEFAULT_ROLE:-useradmin}
       KEYCLOAK_REALM: ${KEYCLOAK_REALM:-automation-platform}
       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-automation-web}
@@ -470,7 +472,7 @@ services:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: dify
-      POSTGRES_PASSWORD: ${DIFY_DB_PASSWORD:-dify}
+      POSTGRES_PASSWORD: ${DIFY_DB_PASSWORD}
       POSTGRES_DB: dify
     volumes:
       - dify_db_data:/var/lib/postgresql/data
@@ -485,7 +487,7 @@ services:
   dify-redis:
     # Internal Redis for Dify's celery task queue — isolated from platform Redis.
     image: redis:6-alpine
-    command: ["redis-server", "--requirepass", "${DIFY_REDIS_PASSWORD:-dify-redis}"]
+    command: ["redis-server", "--requirepass", "${DIFY_REDIS_PASSWORD}"]
     volumes:
       - dify_redis_data:/data
     restart: unless-stopped
@@ -515,15 +517,15 @@ services:
       MODE: api
       LOG_LEVEL: INFO
       DB_USERNAME: dify
-      DB_PASSWORD: ${DIFY_DB_PASSWORD:-dify}
+      DB_PASSWORD: ${DIFY_DB_PASSWORD}
       DB_HOST: dify-db
       DB_PORT: 5432
       DB_DATABASE: dify
       REDIS_HOST: dify-redis
       REDIS_PORT: 6379
-      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD:-dify-redis}
-      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD:-dify-redis}@dify-redis:6379/1
-      SECRET_KEY: ${DIFY_SECRET_KEY:-change-me-seed-from-vault}
+      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD}@dify-redis:6379/1
+      SECRET_KEY: ${DIFY_SECRET_KEY}
       STORAGE_TYPE: local
       STORAGE_LOCAL_PATH: /app/storage
       NODE_EXTRA_CA_CERTS: /tls/ca.pem
@@ -550,18 +552,18 @@ services:
       LOG_LEVEL: INFO
       # DB — internal Dify DB only
       DB_USERNAME: dify
-      DB_PASSWORD: ${DIFY_DB_PASSWORD:-dify}
+      DB_PASSWORD: ${DIFY_DB_PASSWORD}
       DB_HOST: dify-db
       DB_PORT: 5432
       DB_DATABASE: dify
       # Redis — internal Dify Redis only
       REDIS_HOST: dify-redis
       REDIS_PORT: 6379
-      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD:-dify-redis}
-      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD:-dify-redis}@dify-redis:6379/1
+      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD}@dify-redis:6379/1
       # Secret key for signing — loaded from Vault-rendered file at /tls/dify-secret-key
       # Dify will use the SECRET_KEY env var; we set it from the file in startup.
-      SECRET_KEY: ${DIFY_SECRET_KEY:-change-me-seed-from-vault}
+      SECRET_KEY: ${DIFY_SECRET_KEY}
       # Storage
       STORAGE_TYPE: local
       STORAGE_LOCAL_PATH: /app/storage
@@ -571,9 +573,9 @@ services:
       VECTOR_STORE: pgvector
       PGVECTOR_HOST: postgres
       PGVECTOR_PORT: 5432
-      PGVECTOR_USER: ${POSTGRES_USER:-platform}
-      PGVECTOR_PASSWORD: ${POSTGRES_PASSWORD:-platform}
-      PGVECTOR_DATABASE: ${POSTGRES_DB:-automation}
+      PGVECTOR_USER: ${POSTGRES_USER}
+      PGVECTOR_PASSWORD: ${POSTGRES_PASSWORD}
+      PGVECTOR_DATABASE: ${POSTGRES_DB}
       # Dify's own endpoint — used by worker to call back
       DIFY_BASE_URL: http://dify-api:5001
       # CORS — allow the Dify web UI (port 3002) to call this API across origins.
@@ -606,24 +608,24 @@ services:
       MODE: worker
       LOG_LEVEL: INFO
       DB_USERNAME: dify
-      DB_PASSWORD: ${DIFY_DB_PASSWORD:-dify}
+      DB_PASSWORD: ${DIFY_DB_PASSWORD}
       DB_HOST: dify-db
       DB_PORT: 5432
       DB_DATABASE: dify
       REDIS_HOST: dify-redis
       REDIS_PORT: 6379
-      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD:-dify-redis}
-      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD:-dify-redis}@dify-redis:6379/1
-      SECRET_KEY: ${DIFY_SECRET_KEY:-change-me-seed-from-vault}
+      REDIS_PASSWORD: ${DIFY_REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${DIFY_REDIS_PASSWORD}@dify-redis:6379/1
+      SECRET_KEY: ${DIFY_SECRET_KEY}
       STORAGE_TYPE: local
       STORAGE_LOCAL_PATH: /app/storage
       NODE_EXTRA_CA_CERTS: /tls/ca.pem
       VECTOR_STORE: pgvector
       PGVECTOR_HOST: postgres
       PGVECTOR_PORT: 5432
-      PGVECTOR_USER: ${POSTGRES_USER:-platform}
-      PGVECTOR_PASSWORD: ${POSTGRES_PASSWORD:-platform}
-      PGVECTOR_DATABASE: ${POSTGRES_DB:-automation}
+      PGVECTOR_USER: ${POSTGRES_USER}
+      PGVECTOR_PASSWORD: ${POSTGRES_PASSWORD}
+      PGVECTOR_DATABASE: ${POSTGRES_DB}
       DIFY_BASE_URL: http://dify-api:5001
     volumes:
       - tls_dify_api:/tls:ro
@@ -672,7 +674,7 @@ services:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: n8n
-      POSTGRES_PASSWORD: ${N8N_DB_PASSWORD:-n8n}
+      POSTGRES_PASSWORD: ${N8N_DB_PASSWORD}
       POSTGRES_DB: n8n
     volumes:
       - n8n_db_data:/var/lib/postgresql/data
@@ -709,10 +711,10 @@ services:
       DB_POSTGRESDB_PORT: 5432
       DB_POSTGRESDB_DATABASE: n8n
       DB_POSTGRESDB_USER: n8n
-      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD:-n8n}
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
       # Encryption key for n8n credentials store — should be seeded from Vault.
       # Run: infra/n8n/seed-vault-secrets.sh then set N8N_ENCRYPTION_KEY from Vault.
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-change-me-seed-from-vault}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       N8N_PORT: 5678
       N8N_PROTOCOL: http
       # Sub-path prefix so n8n generates correct asset URLs when served at /n8n/

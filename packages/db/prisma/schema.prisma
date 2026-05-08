@@ -54,6 +54,10 @@ model RagKnowledgeBase {
   isDefault     Boolean  @default(false)   // User's personal default KB for new threads
   createdById   String   // Same as ownerId at creation time
 
+  // AI Agent prompt template linked to this KB (optional — falls back to platform default)
+  templateId    String?              // FK to SystemPromptTemplate
+  template      SystemPromptTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -67,6 +71,7 @@ model RagKnowledgeBase {
   @@index([ownerId])
   @@index([isDefault])
   @@index([createdById])
+  @@index([templateId])
 }
 
 // ─── KB Share Records ─────────────────────────────────────────────────────────
@@ -184,6 +189,56 @@ model RagChannelDeployment {
   @@index([ownerId, channelType])
   @@index([knowledgeBaseId])
   @@index([status])
+}
+
+// ─── AI Agent System Prompt Templates ───────────────────────────────────────
+// Templates are reusable system prompts that can be applied to any KB.
+// platformadmin (role=admin) can create built-in templates shared with all.
+// useradmin can create own templates and share with specific users.
+// Regular users see templates shared with them + built-ins.
+model SystemPromptTemplate {
+  id               String   @id @default(cuid())
+  name             String
+  description      String?
+  category         String   // "general" | "devops" | "developer" | "solution_architect" | "security" | "custom"
+
+  // Core prompt content
+  systemPromptBase  String   // Main role + domain + rules text
+  responseStyle     String?  // "formal" | "technical" | "casual" | "bullet_points" | "concise"
+  toneInstructions  String?  // "Always use bullet points..." etc.
+  restrictionRules  String?  // "Only answer questions about X..."
+
+  // Ownership & visibility
+  ownerId           String   // Keycloak preferred_username (or "platform" for built-ins)
+  ownerUsername     String   // Display name
+  isBuiltIn         Boolean  @default(false)  // Platform-seeded, visible to all, not editable by users
+
+  // Sharing: "private" = owner only; "all" = everyone; "specific" = listed users
+  shareScope        String   @default("private")
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  shares            SystemPromptTemplateShare[]
+  knowledgeBases    RagKnowledgeBase[]
+
+  @@index([ownerId])
+  @@index([shareScope])
+  @@index([category])
+  @@index([isBuiltIn])
+}
+
+// Tracks which specific users a template is shared with (when shareScope = "specific")
+model SystemPromptTemplateShare {
+  id           String               @id @default(cuid())
+  templateId   String
+  template     SystemPromptTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  sharedWithId String  // Keycloak preferred_username of recipient
+  createdAt    DateTime @default(now())
+
+  @@unique([templateId, sharedWithId])
+  @@index([sharedWithId])
 }
 
 // ─── RAG Discussion Threads and Messages ─────────────────────────────────────

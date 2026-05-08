@@ -20,12 +20,14 @@ The sidebar currently shows:
 | Knowledge Connector | `/knowledge-connector` | all authenticated users |
 | RAG Assistant | `/rag-assistant` | all authenticated users |
 | Profile | `/profile` | all authenticated users |
+| AI Agent Prompt | `/ai-agent-prompt` | `admin`, `useradmin` |
+| RAG Stats | `/rag-stats` | `admin` only |
 | Logs | `/logs` | `admin` only |
-| Users | `/users` | `admin` only in sidebar |
+| Users | `/users` | `admin` only in sidebar; API supports useradmin-specific operations |
 | Secrets | `/secrets` | `admin` only |
 | Security Health | `/security` | `admin` only |
 
-The sidebar can be pinned/unpinned. The preference is stored in browser local storage under `platform-left-nav:pinned`.
+The sidebar is a mobile-friendly drawer controlled by the menu button. It closes after route changes.
 
 Compatibility routes:
 
@@ -36,7 +38,7 @@ Compatibility routes:
 
 Route: `/dashboard`
 
-The dashboard gives quick links for chat, source setup, logs, and admin tools. Some cards still use legacy route labels, but redirects keep them functional.
+The dashboard gives quick links for chat, source setup, logs, and admin tools.
 
 ## Knowledge Connector
 
@@ -52,6 +54,7 @@ Supported source types:
 | GitLab | OAuth or PAT, branch plus one or more document paths |
 | Google Drive | OAuth or token fields |
 | Web URL | No OAuth required |
+| Upload/manual | Stored as source metadata; no provider OAuth required |
 
 ### Creating A Source
 
@@ -101,6 +104,40 @@ DELETE /gateway/rag/knowledge-bases/:id/shares/:shareId
 ```
 
 Sharing grants chat access only. It does not share thread history.
+
+## AI Agent Prompt
+
+Route: `/ai-agent-prompt`
+
+Visibility: admin and useradmin.
+
+Purpose: manage reusable system prompt templates for KB agents.
+
+Capabilities:
+
+- view built-in, owned, and shared templates
+- create and edit private templates
+- duplicate existing templates
+- share templates with all users or specific users
+- generate or improve prompt text through the backend generator endpoint
+- apply a template to a knowledge base from the KB prompt/config flow
+
+Backed API routes:
+
+```text
+GET /gateway/rag/prompt-templates
+POST /gateway/rag/prompt-templates
+GET /gateway/rag/prompt-templates/:id
+PATCH /gateway/rag/prompt-templates/:id
+DELETE /gateway/rag/prompt-templates/:id
+POST /gateway/rag/prompt-templates/:id/duplicate
+POST /gateway/rag/prompt-templates/:id/share
+DELETE /gateway/rag/prompt-templates/:id/share/:userId
+POST /gateway/rag/prompt-templates/generate
+POST /gateway/rag/knowledge-bases/:id/apply-template
+GET /gateway/rag/knowledge-bases/default-prompt
+POST /gateway/rag/knowledge-bases/:id/generate-prompt
+```
 
 ### Manual Sync
 
@@ -242,6 +279,20 @@ POST /gateway/admin/security/certificates/:service/renew
 ```
 
 The gateway monitors default targets for api-gateway, workflow-service, logging-service, and keycloak. Extra targets can be supplied through `CERT_TARGETS`.
+
+## RAG Stats
+
+Route: `/rag-stats`
+
+Visibility: admin-only.
+
+The page calls:
+
+```text
+GET /gateway/rag/stats
+```
+
+It summarizes platform-wide RAG response timing from stored discussion/message data.
 
 ## Users
 

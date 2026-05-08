@@ -22,9 +22,9 @@ export default function LandingPage(): ReactElement {
       {/* ── Hero ────────────────────────────────────────────────────────── */}
       <section className="rr-hero">
         <div className="rr-hero-inner">
-          <p className="rr-eyebrow">End-to-end RAG in minutes</p>
+          <p className="rr-eyebrow"><span className="rr-eyebrow-dot">●</span> END-TO-END RAG IN MINUTES</p>
           <h1 className="rr-headline">
-            Stop building RAG.<br />Start answering.
+            Stop building RAG.<br /><span className="rr-headline-accent">Start answering.</span>
           </h1>
           <p className="rr-subheadline">
             RapidRAG turns your documentation — GitHub, Google Drive, SharePoint, Notion and more — into a smart answer engine, then deploys chatbots to Slack, Telegram, and WhatsApp in minutes. No custom code. No integration hell.

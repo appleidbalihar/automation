@@ -70,6 +70,7 @@ type ThreadRecord = {
   lastMessageAt: Date;
   expiresAt: Date;
   knowledgeBaseId?: string | null;
+  kbSessions?: Array<{ knowledgeBaseId: string }>;
 };
 
 type MessageRecord = {
@@ -77,17 +78,29 @@ type MessageRecord = {
   threadId: string;
   role: string;
   content: string;
+  kbResults?: unknown;
   createdAt: Date;
 };
 
 export function mapRagDiscussionMessage(record: MessageRecord): RagDiscussionMessage {
+  const kbResults = Array.isArray(record.kbResults) ? record.kbResults as RagDiscussionMessage["kbResults"] : undefined;
   return {
     id: record.id,
     threadId: record.threadId,
     role: record.role as RagDiscussionMessageRole,
     content: record.content,
-    createdAt: record.createdAt.toISOString()
+    createdAt: record.createdAt.toISOString(),
+    ...(kbResults ? { kbResults } : {})
   };
+}
+
+function threadKnowledgeBaseIds(thread: ThreadRecord): string[] | undefined {
+  const ids = [
+    ...(thread.knowledgeBaseId ? [thread.knowledgeBaseId] : []),
+    ...(thread.kbSessions ?? []).map((session) => session.knowledgeBaseId)
+  ];
+  const unique = [...new Set(ids.filter(Boolean))];
+  return unique.length ? unique : undefined;
 }
 
 export function mapRagDiscussionSummary(
@@ -104,6 +117,7 @@ export function mapRagDiscussionSummary(
     expiresAt: thread.expiresAt.toISOString(),
     preview: previewFromMessage(latestMessageContent),
     knowledgeBaseId: thread.knowledgeBaseId ?? undefined,
+    knowledgeBaseIds: threadKnowledgeBaseIds(thread),
     backend
   };
 }
@@ -118,6 +132,7 @@ export function mapRagDiscussionThread(thread: ThreadRecord, messages: MessageRe
     lastMessageAt: thread.lastMessageAt.toISOString(),
     expiresAt: thread.expiresAt.toISOString(),
     knowledgeBaseId: thread.knowledgeBaseId ?? undefined,
+    knowledgeBaseIds: threadKnowledgeBaseIds(thread),
     backend,
     messages: messages.map(mapRagDiscussionMessage)
   };

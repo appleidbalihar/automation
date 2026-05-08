@@ -169,7 +169,7 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                                 className="ops-action-btn ops-action-retry"
                                 onClick={() => onRetryFailedIndexing(integration.id)}
                                 disabled={busy === `retry:${integration.id}` || !integration.syncReady}
-                                title="Retry failed Dify indexing for this source"
+                                title="Retry failed AI indexing for this source"
                               >
                                 {busy === `retry:${integration.id}` ? "Retrying…" : "↺ Retry"}
                               </button>
@@ -235,7 +235,7 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                           className="ops-action-btn ops-action-cleanup"
                           onClick={() => void onCleanup(integration.id)}
                           disabled={busy === `cleanup:${integration.id}`}
-                          title="Remove all indexed documents and Dify knowledge base data for this source"
+                          title="Remove all indexed documents and AI knowledge base data for this source"
                         >
                           {busy === `cleanup:${integration.id}` ? "…" : "🗑 Cleanup"}
                         </button>

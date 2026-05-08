@@ -12,7 +12,8 @@ Microservice-based automation platform with execution checkpoint tracking and re
 
 ## Access points (containerized, secure-only)
 
-- Web UI: `https://<host-ip>:443`
+- Web UI through the compose ingress: `https://<host-ip>:3443`
+- Production deployments may place host Nginx or another edge proxy on `443` in front of the compose ingress.
 - API Gateway: `https://<host-ip>:4000`
 - Keycloak: `https://<host-ip>:8443`
 - RabbitMQ UI: `https://<host-ip>:15671`
@@ -35,6 +36,15 @@ For containerized runtime, keep:
 
 - The web app now uses Keycloak login directly from the UI (no manual token paste required).
 - Default seeded account: `platform-admin / admin123`
+
+## Current product surface
+
+- Knowledge Connector (`/knowledge-connector`): create GitHub, GitLab, Google Drive, web, or upload-backed knowledge sources; manage path filters, credentials, sharing, sync, cleanup, and retry jobs.
+- RAG Assistant (`/rag-assistant`): private Dify-backed discussion threads, including multi-KB answers.
+- AI Agent Prompt (`/ai-agent-prompt`): admin/useradmin prompt template management and template application to KBs.
+- Admin tools: `/rag-stats`, `/logs`, `/users`, `/secrets`, and `/security`.
+
+Flowise is not a current runtime dependency. Dify handles datasets/chat and n8n handles sync workflows.
 
 ## Workspace
 

@@ -1,0 +1,68 @@
+# docker-compose.dev.yml
+#
+# Development overrides for the automation platform.
+# Applies on top of docker-compose.yml.
+#
+# Usage:
+#   ENVIRONMENT=dev bash scripts/generate-runtime-env.sh
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#     --env-file .env --env-file .env.runtime up -d
+#   shred -u .env.runtime
+#
+# Dev differences from production:
+#   - Vault port 8200 exposed to host (for seed scripts and list-secrets.sh)
+#   - Internal service ports exposed to host (debugging)
+#   - Looser resource limits
+#   - Less strict security options (no read_only, no cap_drop)
+
+services:
+  vault:
+    ports:
+      - "8200:8200"   # Expose Vault for host-side seed scripts and CLI access
+
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    ports:
+      - "5671:5671"
+      - "15671:15671"
+
+  opensearch:
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+
+  minio:
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  keycloak:
+    ports:
+      - "8443:8443"
+
+  api-gateway:
+    ports:
+      - "4000:4000"
+
+  workflow-service:
+    ports:
+      - "4001:4001"
+
+  n8n:
+    ports:
+      - "5679:5678"
+
+  dify-api:
+    ports:
+      - "5001:5001"
+
+  dify-web:
+    ports:
+      - "3002:3000"
