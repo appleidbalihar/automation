@@ -33,6 +33,12 @@ import {
   mapRagDiscussionSummary,
   mapRagDiscussionThread
 } from "./rag-chat.js";
+import {
+  canModifyTemplate,
+  mapTemplateRow,
+  seedBuiltInTemplates,
+  visibleTemplatesWhere
+} from "./prompt-templates.js";
 
 const config = loadConfig("workflow-service", 4001);
 const tlsRuntime = createTlsRuntime({
@@ -5679,6 +5685,67 @@ app.get("/rag/knowledge-bases/default-prompt", async (request, reply) => {
       "This prompt is always applied to every knowledge base chat session. " +
       "You can add KB-specific instructions — they will be placed before these platform grounding rules."
   };
+  const categoryDesc = builtInCategoryDescriptions[category]
+    ?? (templateName
+      ? `${templateName}${description && mode === "recommend" ? ` — ${description.slice(0, 150)}` : ""}`
+      : "specialised knowledge base");
+
+  let metaPrompt: string;
+  if (mode === "recommend") {
+    metaPrompt =
+      `Generate a professional, complete system prompt for a RAG (Retrieval-Augmented Generation) chat assistant.\n\n` +
+      `Role: ${templateName || `${category} assistant`} — ${categoryDesc}\n\n` +
+      `Requirements:\n` +
+      `- Start with a ## Role section describing the assistant's expertise and domain\n` +
+      `- Include a ## Response Format section with numbered steps appropriate for the role\n` +
+      `- Include a ## Domain Rules section with 4-6 role-specific rules\n` +
+      `- Be concise, professional, and domain-appropriate\n` +
+      `- Do NOT include generic platform rules (source citations, credential security, faithfulness) — those are appended automatically\n` +
+      `- Use markdown headings (##) and bullet points\n` +
+      `- Aim for 150-250 words\n\n` +
+      `Output ONLY the system prompt text with no preamble, explanation, or surrounding quotes.`;
+  } else {
+    metaPrompt =
+      `Rewrite the following draft system prompt into a professional, RAG-optimised template for a ${categoryDesc} assistant.\n\n` +
+      `Draft:\n"${description}"\n\n` +
+      `Requirements:\n` +
+      `- Preserve the user's intent and domain focus\n` +
+      `- Add a ## Role section if missing\n` +
+      `- Add a ## Response Format section with numbered steps if missing\n` +
+      `- Add a ## Domain Rules section with role-specific rules if missing\n` +
+      `- Use markdown headings (##) and bullet points\n` +
+      `- Be concise and professional (aim for 150-300 words)\n` +
+      `- Do NOT include generic platform rules (source citations, credential security, faithfulness) — those are appended automatically\n\n` +
+      `Output ONLY the rewritten system prompt text with no preamble, explanation, or surrounding quotes.`;
+  }
+
+  try {
+    const userId = requesterUserId(headers);
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 1500,
+        messages: [{ role: "user", content: metaPrompt }]
+      })
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      return reply.code(502).send({ error: "LLM_CALL_FAILED", details: errText.slice(0, 300) });
+    }
+    const payload = await response.json() as Record<string, unknown>;
+    const suggestion = ((payload.choices as any)?.[0]?.message?.content ?? "").trim();
+    if (!suggestion) return reply.code(502).send({ error: "LLM_EMPTY_RESPONSE" });
+    logInfo("template_generated", { service: "workflow-service", category, mode, userId, outputLen: suggestion.length });
+    return { suggestion, mode, category };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return reply.code(502).send({ error: "TEMPLATE_GENERATION_FAILED", details: msg });
+  }
 });
 
 // ─── Prompt Template Generator (smart mode) ──────────────────────────────────

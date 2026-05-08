@@ -47,6 +47,15 @@ For containerized runtime, keep:
 
 Flowise is not a current runtime dependency. Dify handles datasets/chat and n8n handles sync workflows.
 
+## Current product surface
+
+- Knowledge Connector (`/knowledge-connector`): create GitHub, GitLab, Google Drive, web, or upload-backed knowledge sources; manage path filters, credentials, sharing, sync, cleanup, and retry jobs.
+- RAG Assistant (`/rag-assistant`): private Dify-backed discussion threads, including multi-KB answers.
+- AI Agent Prompt (`/ai-agent-prompt`): admin/useradmin prompt template management and template application to KBs.
+- Admin tools: `/rag-stats`, `/logs`, `/users`, `/secrets`, and `/security`.
+
+Flowise is not a current runtime dependency. Dify handles datasets/chat and n8n handles sync workflows.
+
 ## Workspace
 
 - `apps/*`: deployable services and UI

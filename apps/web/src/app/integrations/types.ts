@@ -71,6 +71,17 @@ export type IntegrationForm = {
   templateId: string;
 };
 
+/**
+ * Default template text for Knowledge Base Instructions.
+ * Pre-filled as actual value (not just placeholder) so users can edit directly.
+ */
+export const KB_INSTRUCTIONS_TEMPLATE =
+  "This knowledge base covers [describe your domain and topics].\n\n" +
+  "When answering questions:\n" +
+  "- Focus on [specific topics or document types in this KB]\n" +
+  "- Always mention which document or section the answer comes from\n" +
+  "- [Any other KB-specific instruction]";
+
 export const EMPTY_FORM: IntegrationForm = {
   name: "",
   projectName: "",
