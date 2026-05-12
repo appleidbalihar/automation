@@ -114,31 +114,37 @@ The platform runs the following Docker containers:
 - Image: `redis:7-alpine`
 - Port: `6379`
 - Purpose: Redis endpoint, configured for TLS through `infra/redis/redis.conf`.
+- Data volume: `redis_data`.
 
 ### `rabbitmq`
 
 - Image: `rabbitmq:3-management`
 - Ports: `5671` AMQPS, `15671` management UI
 - Purpose: platform event bus.
+- Data volume: `rabbitmq_data`.
 
 ### `opensearch`
 
 - Image: `opensearchproject/opensearch:2.14.0`
 - Ports: `9200`, `9600`
 - Purpose: optional search backend for logs.
+- Data volume: `opensearch_data`.
 
 ### `minio`
 
 - Image: `minio/minio:latest`
 - Ports: `9000`, `9001`
 - Purpose: S3-compatible object storage.
+- Data volume: `minio_data`.
 
 ### `keycloak`
 
 - Image: `quay.io/keycloak/keycloak:25.0`
 - Port: `8443`
 - Purpose: realm import, login, JWT issuance.
-- Realm import: `infra/keycloak/realm-export.json`.
+- Data volume: `keycloak_data`.
+- Realm import: `infra/keycloak/realm-export.json` is bootstrap-only. Users and runtime realm state live in `keycloak_data`.
+- Platform admin recovery: `ENVIRONMENT=dev bash scripts/seed-keycloak-platform-admin.sh`.
 
 ### `vault`
 
@@ -155,12 +161,14 @@ The platform runs the following Docker containers:
 - Image: `postgres:15-alpine`
 - Internal only
 - Purpose: Dify application database.
+- Data volume: `dify_db_data`.
 
 ### `dify-redis`
 
 - Image: `redis:6-alpine`
 - Internal only
 - Purpose: Dify worker queue/cache.
+- Data volume: `dify_redis_data`.
 
 ### `dify-migrate`
 
@@ -172,6 +180,7 @@ The platform runs the following Docker containers:
 - Image: `langgenius/dify-api:0.6.16`
 - Port: `5001`
 - Purpose: Dify API for app/dataset/chat/document indexing operations.
+- Storage volume: `dify_storage`.
 
 ### `dify-worker`
 
@@ -198,6 +207,7 @@ The platform runs the following Docker containers:
 - Image: `postgres:15-alpine`
 - Internal only
 - Purpose: n8n state database.
+- Data volume: `n8n_db_data`.
 
 ### `n8n`
 
@@ -205,6 +215,31 @@ The platform runs the following Docker containers:
 - Port: host `5679` -> container `5678`
 - Purpose: workflow runner for document sync and channel workflows.
 - Notes: `N8N_PATH` is `/n8n/`; `WEBHOOK_URL` defaults to `https://dev.eclassmanager.com/n8n/`.
+- Data volume: `n8n_data`.
+
+## Persistent Data Volumes
+
+Stateful services must keep their writable state in named Docker volumes. App/runtime containers are stateless and can be rebuilt or force-recreated safely.
+
+| Service | Persistent volume(s) | Protected data |
+|---|---|---|
+| `postgres` | `postgres_data` | Platform DB, including KB metadata, users' platform records, logs, and RAG state |
+| `redis` | `redis_data` | Redis AOF/RDB state for cache/nonce/session-adjacent runtime data |
+| `rabbitmq` | `rabbitmq_data` | RabbitMQ definitions, queues, and durable messages |
+| `opensearch` | `opensearch_data` | Search indexes |
+| `minio` | `minio_data` | Object storage buckets/data |
+| `keycloak` | `keycloak_data` | Realms, users, credentials, and login state |
+| `vault` | `vault_data` | Vault KV secrets, PKI material, AppRole ids, audit log |
+| `dify-db`, `dify-redis`, `dify-api`, `dify-worker` | `dify_db_data`, `dify_redis_data`, `dify_storage` | Dify DB, queue/cache state, local storage |
+| `n8n-db`, `n8n` | `n8n_db_data`, `n8n_data` | n8n DB and local workflow/config state |
+
+Start and restart through the platform wrapper so Vault-rendered runtime env files are generated and shredded automatically:
+
+```bash
+/home/bali/09_automationplatform/scripts/platform-containers.sh dev start
+/home/bali/09_automationplatform/scripts/platform-containers.sh dev restart keycloak web web-ingress
+/home/bali/09_automationplatform/scripts/platform-containers.sh dev status
+```
 
 ## Sidecars And Control Jobs
 

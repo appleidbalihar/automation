@@ -405,7 +405,7 @@ export function CreateSourceModal(props: Props): ReactElement | null {
               type="button"
               className="integrations-primary-button sync-btn-ready"
               onClick={() => void onSubmitOauth(oauthProvider, appClientId.trim() || appClientSecret.trim() ? { clientId: appClientId.trim(), clientSecret: appClientSecret.trim() } : null)}
-              disabled={busy || !form.name.trim() || !form.sourceUrl.trim()}
+              disabled={busy || !form.name.trim() || !form.sourceUrl.trim() || (isAdminOrUserAdmin && !form.templateId)}
             >
               {busy ? "Creating…" : `Create & Connect ${meta.label} →`}
             </button>
@@ -532,7 +532,7 @@ export function CreateSourceModal(props: Props): ReactElement | null {
           </div>
           <div className="ops-modal-footer-nav-spread" style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <button type="button" className="ops-modal-back-btn" onClick={() => setMode("choose")}>← Back</button>
-            <button type="button" className="integrations-primary-button sync-btn-ready" onClick={() => void onSubmitPat()} disabled={busy}>
+            <button type="button" className="integrations-primary-button sync-btn-ready" onClick={() => void onSubmitPat()} disabled={busy || (isAdminOrUserAdmin && !form.templateId)}>
               {busy ? "Saving…" : "Connect Source"}
             </button>
           </div>

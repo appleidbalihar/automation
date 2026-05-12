@@ -161,13 +161,15 @@ docker exec -e VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
 echo "Root token revoked."
 ```
 
-### 4.7 — Generate the runtime env file
+### 4.7 — Optional: Generate the runtime env file for inspection
 
 ```bash
 ENVIRONMENT=prod \
-OUTPUT_FILE=/run/platform-secrets/.env.runtime \
+OUTPUT_FILE=/run/platform-secrets/.env.prod.runtime \
 bash scripts/generate-runtime-env.sh
 ```
+
+For normal starts and restarts, use `scripts/platform-containers.sh`; it generates this runtime env file and shreds it automatically after Docker Compose returns.
 
 ---
 
@@ -185,16 +187,13 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml \
 ## Step 6 — Start the Full Stack
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-  --env-file .env.production \
-  --env-file /run/platform-secrets/.env.runtime \
-  up -d
-
-# Delete the runtime env file immediately after (it's in container memory now)
-shred -u /run/platform-secrets/.env.runtime
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod start
 
 # Verify all containers are up
-docker ps --format "table {{.Names}}\t{{.Status}}"
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod status
+
+# Confirm the short-lived runtime env was removed
+find /run/platform-secrets -maxdepth 1 -type f -name '.env.prod*' -print
 ```
 
 **Expected state after a clean start:**
@@ -207,62 +206,21 @@ docker ps --format "table {{.Names}}\t{{.Status}}"
 > docker logs $(docker ps -aqf name=db-migrate)
 > docker logs $(docker ps -aqf name=dify-migrate)
 > ```
-> Common cause: the runtime env file was missing. Re-generate it (Step 4.7) and re-run `up -d`.
+> Common cause: Vault-backed runtime env generation failed. Check Vault/AppRole access, then re-run the `platform-containers.sh prod start` command.
 
 ---
 
 ## Step 7 — Post-Start: Keycloak Admin User
 
-Create the `platform-admin` user via the Admin REST API (no browser required).
+Create or repair the `platform-admin` user with the repeatable seed script:
 
 ```bash
-# 1. Get the Keycloak admin password from Vault
-ENVIRONMENT=prod SHOW_VALUES=true PATH_FILTER=infra/keycloak bash scripts/list-secrets.sh
-# Note the admin_password value
-
-KC_ADMIN_PASS="<admin_password from above>"
-KC_URL="https://localhost:8443"
-
-# 2. Get admin token
-TOKEN=$(curl -sk -X POST "${KC_URL}/realms/master/protocol/openid-connect/token" \
-  -d "client_id=admin-cli&grant_type=password&username=admin&password=${KC_ADMIN_PASS}" \
-  | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
-
-# 3. Create platform-admin user
-curl -sk -o /dev/null -w "Create user: %{http_code}\n" \
-  -X POST "${KC_URL}/admin/realms/automation-platform/users" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"platform-admin","email":"platform-admin@platform.local","firstName":"Platform","lastName":"Admin","enabled":true,"emailVerified":true}'
-
-# 4. Get user ID
-USER_ID=$(curl -sk "${KC_URL}/admin/realms/automation-platform/users?username=platform-admin" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-echo "User ID: ${USER_ID}"
-
-# 5. Set a strong password (change PLATFORM_ADMIN_PASS to something secure)
-PLATFORM_ADMIN_PASS=$(openssl rand -base64 20 | tr -d '=+/' | head -c 24)
-echo "platform-admin password: ${PLATFORM_ADMIN_PASS}"  # Save this!
-
-curl -sk -o /dev/null -w "Set password: %{http_code}\n" \
-  -X PUT "${KC_URL}/admin/realms/automation-platform/users/${USER_ID}/reset-password" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "{\"type\":\"password\",\"value\":\"${PLATFORM_ADMIN_PASS}\",\"temporary\":false}"
-
-# 6. Assign admin role
-ROLE=$(curl -sk "${KC_URL}/admin/realms/automation-platform/roles/admin" \
-  -H "Authorization: Bearer ${TOKEN}")
-
-curl -sk -o /dev/null -w "Assign role: %{http_code}\n" \
-  -X POST "${KC_URL}/admin/realms/automation-platform/users/${USER_ID}/role-mappings/realm" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "[${ROLE}]"
+ENVIRONMENT=prod bash scripts/seed-keycloak-platform-admin.sh
 ```
 
-All three commands should print HTTP 201, 204, 204.
+The script is idempotent. It reads `platform_admin_password` from `platform/prod/infra/keycloak/config`, ensures the user exists with valid profile fields, resets the password, and assigns the realm `admin` role.
+
+Keycloak users live in the persistent `keycloak_data` Docker volume. `infra/keycloak/realm-export.json` is only a bootstrap import for an empty realm.
 
 ---
 
@@ -342,7 +300,7 @@ done
 ### 8.5 — Restart n8n to register webhooks
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml restart n8n
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod restart n8n
 
 # Wait for startup and verify webhook registration
 until docker logs $(docker ps -qf name=n8n-1) 2>&1 | grep -q "Editor is now accessible"; do
@@ -646,18 +604,15 @@ JSON does not support comments. A `_users_note` documentation field was present 
 
 ```bash
 # Stop all services
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-  --env-file .env.production down
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod down
 
 # Remove nginx config
 sudo rm /etc/nginx/sites-enabled/theaitools-rapidrag
 sudo nginx -s reload
 
 # Check logs for diagnosis
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-  --env-file .env.production logs web
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-  --env-file .env.production logs api-gateway
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod logs web
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod logs api-gateway
 ```
 
 To do a full clean rebuild (wipes all data volumes):

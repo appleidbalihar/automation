@@ -14,7 +14,10 @@
       "name": "Webhook Trigger",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 1,
-      "position": [250, 300],
+      "position": [
+        250,
+        300
+      ],
       "webhookId": "rag-sync-gitlab"
     },
     {
@@ -25,7 +28,10 @@
       "name": "Parse Sync Params",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [470, 300]
+      "position": [
+        470,
+        300
+      ]
     },
     {
       "id": "upload-to-dify",
@@ -36,7 +42,7 @@
         300
       ],
       "parameters": {
-        "jsCode": "const TEXT_EXTS = new Set(['md','markdown','txt','html','htm','xml','csv']);\nconst items = $input.all();\nconst results = [];\nfor (let itemIndex = 0; itemIndex < items.length; itemIndex++) {\n  const item = items[itemIndex];\n  const { filePath, fileExt, difyApiUrl, difyDatasetId, difyApiKey, isUpdate, difyDocumentId } = item.json;\n  const binaryFile = item.binary && item.binary.fileData ? item.binary.fileData : null;\n  let docId = null, difyBatch = null, uploadError = null;\n  try {\n    if (!binaryFile) {\n      uploadError = 'Fetch File Content did not return fileData for ' + filePath;\n    } else {\n      const fileBuffer = await this.helpers.getBinaryDataBuffer(itemIndex, 'fileData');\n      if (TEXT_EXTS.has(fileExt)) {\n        const text = fileBuffer.toString('utf8');\n        const endpoint = isUpdate && difyDocumentId ? `/v1/datasets/${difyDatasetId}/documents/${difyDocumentId}/update_by_text` : `/v1/datasets/${difyDatasetId}/document/create_by_text`;\n        const response = await this.helpers.httpRequest({\n          method: 'POST',\n          url: difyApiUrl + endpoint,\n          headers: {\n            Authorization: 'Bearer ' + difyApiKey,\n            'Content-Type': 'application/json',\n          },\n          body: {\n            name: filePath,\n            text,\n            indexing_technique: 'high_quality',\n            process_rule: {\n              mode: 'custom',\n              rules: {\n                pre_processing_rules: [\n                  { id: 'remove_extra_spaces', enabled: true },\n                  { id: 'remove_urls_emails', enabled: false },\n                ],\n                segmentation: { separator: '\\n\\n', max_tokens: 1000, chunk_overlap: 200 },\n              },\n            },\n          },\n          json: true,\n          returnFullResponse: true,\n        });\n        const payload = response.body ?? response;\n        docId = payload.document?.id ?? null;\n        difyBatch = payload.batch ?? null;\n        if (!docId || !difyBatch) {\n          uploadError = payload.message || 'Dify did not return a document id and batch';\n        }\n      } else {\n        const formData = {\n          file: { value: fileBuffer, options: { filename: filePath } },\n          data: JSON.stringify({\n            indexing_technique: 'high_quality',\n            process_rule: { mode: 'automatic' },\n          })\n        };\n        const endpoint = isUpdate && difyDocumentId ? `/v1/datasets/${difyDatasetId}/documents/${difyDocumentId}/update_by_file` : `/v1/datasets/${difyDatasetId}/document/create_by_file`;\n        const response = await this.helpers.httpRequest({\n          method: 'POST',\n          url: difyApiUrl + endpoint,\n          headers: { Authorization: 'Bearer ' + difyApiKey },\n          formData,\n          json: true,\n          returnFullResponse: true,\n        });\n        const payload = response.body ?? response;\n        docId = payload.document?.id ?? null;\n        difyBatch = payload.batch ?? null;\n        if (!docId || !difyBatch) {\n          uploadError = payload.message || 'Dify did not return a document id and batch';\n        }\n      }\n    }\n  } catch (e) {\n    uploadError = e?.response?.body?.message || e?.message || String(e);\n  }\n  results.push({ json: { ...item.json, difyDocId: docId, difyBatch, uploadError, uploadMethod: TEXT_EXTS.has(fileExt) ? 'text' : 'file' } });\n}\nreturn results;"
+        "jsCode": "const TEXT_EXTS = new Set(['md','markdown','txt','html','htm','xml','csv','rst','mdx']);\nconst MIME_TYPES = {\n  'pdf':  'application/pdf',\n  'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',\n  'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',\n  'xls':  'application/vnd.ms-excel',\n  'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',\n  'ppt':  'application/vnd.ms-powerpoint',\n  'epub': 'application/epub+zip',\n  'eml':  'message/rfc822',\n  'msg':  'application/vnd.ms-outlook',\n};\n// Dify standard ETL only accepts these extensions for binary file upload.\n// pptx, ppt, eml, msg, epub require Unstructured ETL (ETL_TYPE=Unstructured in Dify).\nconst DIFY_BINARY_EXTS = new Set(['pdf','docx','xlsx','xls']);\n\nfunction parseDifyPayload(statusCode, headers, raw) {\n  const contentType = String(headers['content-type'] || '');\n  let payload = raw;\n  if (contentType.includes('application/json') && raw) {\n    try { payload = JSON.parse(raw); } catch {}\n  }\n  if (statusCode < 200 || statusCode >= 300) {\n    const message = typeof payload === 'object' && payload !== null\n      ? (payload.message || payload.error || JSON.stringify(payload))\n      : (raw || ('HTTP ' + statusCode));\n    throw new Error('Dify upload failed ' + statusCode + ': ' + message);\n  }\n  return typeof payload === 'object' && payload !== null ? payload : JSON.parse(raw || '{}');\n}\n\nfunction multipartDifyRequest(urlString, apiKey, fileName, contentType, fileBuffer, data) {\n  const { Buffer } = require('buffer');\n  const http = require('http');\n  const https = require('https');\n  const { URL } = require('url');\n  const url = new URL(urlString);\n  const boundary = '----rapidrag-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2);\n  const safeName = String(fileName).replace(/[\"\\r\\n]/g, '_');\n  const dataJson = JSON.stringify(data);\n  const head = Buffer.from(\n    '--' + boundary + '\\r\\n' +\n    'Content-Disposition: form-data; name=\"file\"; filename=\"' + safeName + '\"\\r\\n' +\n    'Content-Type: ' + contentType + '\\r\\n\\r\\n'\n  );\n  const middle = Buffer.from(\n    '\\r\\n--' + boundary + '\\r\\n' +\n    'Content-Disposition: form-data; name=\"data\"\\r\\n\\r\\n' +\n    dataJson + '\\r\\n'\n  );\n  const tail = Buffer.from('--' + boundary + '--\\r\\n');\n  const body = Buffer.concat([head, fileBuffer, middle, tail]);\n  const transport = url.protocol === 'https:' ? https : http;\n  return new Promise((resolve, reject) => {\n    const req = transport.request(url, {\n      method: 'POST',\n      headers: {\n        Authorization: 'Bearer ' + apiKey,\n        'Content-Type': 'multipart/form-data; boundary=' + boundary,\n        'Content-Length': body.length,\n      },\n    }, (res) => {\n      const chunks = [];\n      res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));\n      res.on('end', () => {\n        const raw = Buffer.concat(chunks).toString('utf8');\n        try { resolve(parseDifyPayload(res.statusCode || 0, res.headers || {}, raw)); }\n        catch (error) { reject(error); }\n      });\n    });\n    req.on('error', reject);\n    req.write(body);\n    req.end();\n  });\n}\n\nconst items = $input.all();\nconst results = [];\nfor (let itemIndex = 0; itemIndex < items.length; itemIndex++) {\n  const item = items[itemIndex];\n  const { filePath, fileExt, difyApiUrl, difyDatasetId, difyApiKey, isUpdate, difyDocumentId } = item.json;\n  const binaryFile = item.binary && item.binary.fileData ? item.binary.fileData : null;\n  let docId = null, difyBatch = null, uploadError = null;\n  try {\n    if (!binaryFile) {\n      uploadError = 'Fetch File Content did not return fileData for ' + filePath;\n    } else if (!TEXT_EXTS.has(fileExt) && !DIFY_BINARY_EXTS.has(fileExt)) {\n      uploadError = '.' + fileExt + ' requires Unstructured ETL mode in Dify (set ETL_TYPE=Unstructured). Skipping: ' + filePath;\n    } else {\n      const fileBuffer = await this.helpers.getBinaryDataBuffer(itemIndex, 'fileData');\n      if (TEXT_EXTS.has(fileExt)) {\n        const text = fileBuffer.toString('utf8');\n        const endpoint = isUpdate && difyDocumentId\n          ? `/v1/datasets/${difyDatasetId}/documents/${difyDocumentId}/update_by_text`\n          : `/v1/datasets/${difyDatasetId}/document/create_by_text`;\n        const response = await this.helpers.httpRequest({\n          method: 'POST',\n          url: difyApiUrl + endpoint,\n          headers: {\n            Authorization: 'Bearer ' + difyApiKey,\n            'Content-Type': 'application/json',\n          },\n          body: {\n            name: filePath,\n            text,\n            indexing_technique: 'high_quality',\n            process_rule: {\n              mode: 'custom',\n              rules: {\n                pre_processing_rules: [\n                  { id: 'remove_extra_spaces', enabled: true },\n                  { id: 'remove_urls_emails', enabled: false },\n                ],\n                segmentation: { separator: '\\n\\n', max_tokens: 1000, chunk_overlap: 200 },\n              },\n            },\n          },\n          json: true,\n          returnFullResponse: true,\n        });\n        const payload = response.body ?? response;\n        docId = payload.document?.id ?? null;\n        difyBatch = payload.batch ?? null;\n        if (!docId || !difyBatch) {\n          uploadError = payload.message || 'Dify did not return a document id and batch';\n        }\n      } else {\n        const fileName = filePath.split('/').pop() || filePath;\n        const contentType = MIME_TYPES[fileExt] || binaryFile.mimeType || 'application/octet-stream';\n        const endpoint = isUpdate && difyDocumentId\n          ? `/v1/datasets/${difyDatasetId}/documents/${difyDocumentId}/update_by_file`\n          : `/v1/datasets/${difyDatasetId}/document/create_by_file`;\n        const payload = await multipartDifyRequest(difyApiUrl + endpoint, difyApiKey, fileName, contentType, fileBuffer, {\n          name: filePath,\n          indexing_technique: 'high_quality',\n          process_rule: { mode: 'automatic' },\n        });\n        docId = payload.document?.id ?? null;\n        difyBatch = payload.batch ?? null;\n        if (!docId || !difyBatch) {\n          uploadError = payload.message || 'Dify did not return a document id and batch';\n        }\n      }\n    }\n  } catch (e) {\n    uploadError = e?.response?.body?.message || e?.response?.body?.error || e?.message || String(e);\n  }\n  results.push({ json: { ...item.json, difyDocId: docId, difyBatch, uploadError, uploadMethod: TEXT_EXTS.has(fileExt) ? 'text' : 'file' } });\n}\nreturn results;"
       },
       "typeVersion": 2
     },
@@ -46,7 +52,10 @@
         "options": {
           "headers": {
             "entries": [
-              { "name": "PRIVATE-TOKEN", "value": "= {{ $json.sourceToken }}" }
+              {
+                "name": "PRIVATE-TOKEN",
+                "value": "= {{ $json.sourceToken }}"
+              }
             ]
           }
         }
@@ -55,7 +64,10 @@
       "name": "Get Repo File Tree",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [910, 300]
+      "position": [
+        910,
+        300
+      ]
     },
     {
       "id": "filter-files",
@@ -111,7 +123,10 @@
         "options": {
           "headers": {
             "entries": [
-              { "name": "PRIVATE-TOKEN", "value": "= {{ $json.sourceToken }}" }
+              {
+                "name": "PRIVATE-TOKEN",
+                "value": "= {{ $json.sourceToken }}"
+              }
             ]
           }
         }
@@ -120,7 +135,10 @@
       "name": "Fetch File Content",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [1130, 300]
+      "position": [
+        1130,
+        300
+      ]
     },
     {
       "id": "upload-start-cb",
@@ -141,7 +159,10 @@
         "options": {
           "headers": {
             "entries": [
-              { "name": "PRIVATE-TOKEN", "value": "= {{ $json.sourceToken }}" }
+              {
+                "name": "PRIVATE-TOKEN",
+                "value": "= {{ $json.sourceToken }}"
+              }
             ]
           },
           "response": {
@@ -156,7 +177,10 @@
       "name": "Fetch File Content",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [1500, 300],
+      "position": [
+        1500,
+        300
+      ],
       "continueOnFail": true
     },
     {
@@ -194,7 +218,10 @@
       "name": "Respond to Webhook",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [470, 500]
+      "position": [
+        470,
+        500
+      ]
     },
     {
       "parameters": {},
@@ -202,7 +229,10 @@
       "name": "Error Trigger",
       "type": "n8n-nodes-base.errorTrigger",
       "typeVersion": 1,
-      "position": [250, 600]
+      "position": [
+        250,
+        600
+      ]
     },
     {
       "parameters": {
@@ -230,39 +260,116 @@
       "name": "Report Failure Webhook",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [470, 600]
+      "position": [
+        470,
+        600
+      ]
     }
   ],
   "connections": {
     "Webhook Trigger": {
       "main": [
-        [{ "node": "Parse Sync Params", "type": "main", "index": 0 },
-         { "node": "Respond to Webhook", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Parse Sync Params",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Parse Sync Params": {
-      "main": [[{ "node": "Init Step Callback", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Init Step Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Init Step Callback": {
-      "main": [[{ "node": "Get Repo File Tree", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Get Repo File Tree",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Get Repo File Tree": {
-      "main": [[{ "node": "Filter Supported Files", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Filter Supported Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Filter Supported Files": {
-      "main": [[{ "node": "Map Diff Files", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Map Diff Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Map Diff Files": {
-      "main": [[{ "node": "Upload Start Callback", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Upload Start Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Upload Start Callback": {
-      "main": [[{ "node": "Fetch File Content", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Fetch File Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Fetch File Content": {
-      "main": [[{ "node": "Upload Doc to Dify", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Upload Doc to Dify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Upload Doc to Dify": {
-      "main": [[{ "node": "Report File Progress", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Report File Progress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Error Trigger": {
       "main": [

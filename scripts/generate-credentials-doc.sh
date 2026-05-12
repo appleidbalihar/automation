@@ -38,6 +38,7 @@ ENV="${ENVIRONMENT}"
 
 # ── Read all secrets ────────────────────────────────────────────────────────────
 KC_ADMIN_PASS=$(kv_field "platform/${ENV}/infra/keycloak/config" admin_password)
+KC_PLATFORM_ADMIN_PASS=$(kv_field "platform/${ENV}/infra/keycloak/config" platform_admin_password)
 MINIO_ACCESS=$(kv_field "platform/${ENV}/infra/minio/config" access_key)
 MINIO_SECRET=$(kv_field "platform/${ENV}/infra/minio/config" secret_key)
 OS_PASS=$(kv_field "platform/${ENV}/infra/opensearch/config" admin_password)
@@ -111,7 +112,7 @@ cat > "${OUTPUT_FILE}" <<EOF
 
 | Service | URL | Username | Password |
 |---------|-----|----------|----------|
-| **RapidRAG Web UI** | ${WEB_URL} | \`platform-admin\` | from Keycloak (set during Step 7) |
+| **RapidRAG Web UI** | ${WEB_URL} | \`platform-admin\` | \`${KC_PLATFORM_ADMIN_PASS}\` |
 
 ---
 
@@ -120,7 +121,7 @@ cat > "${OUTPUT_FILE}" <<EOF
 | Service | URL / Host | Username / Access Key | Password / Secret Key |
 |---------|------------|-----------------------|----------------------|
 | **Keycloak Admin Console** | ${KC_URL} | \`admin\` | \`${KC_ADMIN_PASS}\` |
-| **Keycloak Platform Realm** | ${KC_URL}/realms/automation-platform | \`platform-admin\` | set during Step 7 |
+| **Keycloak Platform Realm** | ${KC_URL}/realms/automation-platform | \`platform-admin\` | \`${KC_PLATFORM_ADMIN_PASS}\` |
 | **Vault** | ${VAULT_UI} | root token | \`${VAULT_TOKEN_OUT}\` |
 | **MinIO Console** | ${MINIO_URL} | \`${MINIO_ACCESS}\` | \`${MINIO_SECRET}\` |
 | **MinIO API** | https://localhost:9000 | \`${MINIO_ACCESS}\` | \`${MINIO_SECRET}\` |

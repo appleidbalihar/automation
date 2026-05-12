@@ -61,6 +61,81 @@ export interface RagDiscussionSendMessageResponse {
   assistantMessage: RagDiscussionMessage;
 }
 
+// ── Chat Channel (generic, all channel types) ───────────────────────────────
+export type ChannelOrigin = "slack" | "telegram" | "google_chat" | "web";
+
+export interface ChannelChatThreadSummary {
+  id: string;
+  origin: ChannelOrigin;
+  externalThreadKey: string;
+  externalUserId?: string;
+  activeKbIds: string[];
+  lastMessageAt: string;
+  expiresAt?: string;
+  messageCount?: number;
+}
+
+export interface ChannelChatHistoryResponse {
+  threads: ChannelChatThreadSummary[];
+  nextCursor?: string;
+}
+
+export interface ChannelChatMessageRecord {
+  id: string;
+  role: RagDiscussionMessageRole;
+  content: string;
+  kbResults?: RagDiscussionKbResult[];
+  createdAt: string;
+}
+
+export type SlackDeploymentStatus = "pending" | "active" | "error" | "disabled";
+export type SlackAccessMode = "channel" | "allowlist";
+export type SlackInstallMode = "oauth" | "manual";
+
+export interface SlackDeploymentKbSummary {
+  knowledgeBaseId: string;
+  knowledgeBaseName: string;
+}
+
+export interface SlackDeployment {
+  id: string;
+  deploymentName: string;
+  installMode: SlackInstallMode;
+  slackWorkspaceId?: string;
+  slackWorkspaceName?: string;
+  slackBotUserId?: string;
+  slackChannelId?: string;
+  slackChannelName?: string;
+  status: SlackDeploymentStatus;
+  accessMode: SlackAccessMode;
+  allowedSlackUserIds: string[];
+  kbMappings: SlackDeploymentKbSummary[];
+  webhookUrl?: string;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SlackDeploymentActivateRequest {
+  botToken?: string;
+  signingSecret?: string;
+  slackChannelId?: string;
+  slackChannelName?: string;
+  knowledgeBaseIds: string[];
+  accessMode: SlackAccessMode;
+  allowedSlackUserIds?: string[];
+}
+
+export interface SlackOAuthConnectResponse {
+  url: string;
+}
+
+export interface SlackTokenValidateResponse {
+  workspaceId: string;
+  workspaceName: string;
+  botUserId: string;
+}
+
 export const PlatformEvents = {
   logsIngest: "logs.ingest",
   certExpiryWarning: "cert.expiry.warning",

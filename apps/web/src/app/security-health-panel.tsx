@@ -1,9 +1,22 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import type { ReactElement } from "react";
-import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
+import { useEffect, useState } from "react";
 import { resolveApiBase } from "./api-base";
+import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
+
+// ─── Enterprise RAG Compliance Status ────────────────────────────────────────
+// Update each value to `true` once the corresponding item in
+// docs/plans/high-priority-implementation-plan.md is verified in production.
+// The compliance panel below will automatically show green badges as items ship.
+const COMPLIANCE_STATUS = {
+  H1_PII_REDACTION: false,          // PII Pre-Ingestion Redaction (n8n Function node + Prisma flag)
+  H2_OPENTELEMETRY: false,          // OpenTelemetry Distributed Tracing (OTel SDK + collector)
+  H3_RAGAS_QUALITY: false,          // RAG Answer Quality — RAGAS Faithfulness & Relevance scoring
+  H4_RETRIEVAL_METRICS: false,      // Retrieval Metrics — Recall@k and MRR evaluation
+  H5_POST_RETRIEVAL_AUTH: false,    // Post-Retrieval Authorization (getAccessibleKbIds re-check)
+  H6_OUTPUT_GATING: false,          // Output Gating / Output Validation (validateLlmOutput)
+} as const;
 
 interface CertServiceStatus {
   service: string;
@@ -226,7 +239,144 @@ export function SecurityHealthPanel(): ReactElement {
           </table>
         </div>
       </section>
+
+      {/* ─── Enterprise RAG Security Compliance Panel ──────────────────────────
+          Each badge below turns green when the corresponding implementation item
+          is completed and verified. To mark an item done, set its key to `true`
+          in the COMPLIANCE_STATUS constant at the top of this file.
+          Reference: docs/plans/high-priority-implementation-plan.md
+      ────────────────────────────────────────────────────────────────────────── */}
+      <section className="card">
+        <h3 style={{ marginTop: 0 }}>Enterprise RAG Security Compliance</h3>
+        <p style={{ marginBottom: 16, opacity: 0.8 }}>
+          Tracks implementation of the 6 enterprise RAG security and quality controls.
+          Each item turns green once verified in production.
+          See <code>docs/plans/high-priority-implementation-plan.md</code> for implementation details.
+        </p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 12 }}>
+          {(
+            [
+              {
+                key: "H1_PII_REDACTION" as const,
+                id: "H1",
+                title: "PII Pre-Ingestion Redaction",
+                description: "Emails, phone numbers, IPs, tokens and credit card patterns are stripped from documents before embedding into the vector store.",
+              },
+              {
+                key: "H2_OPENTELEMETRY" as const,
+                id: "H2",
+                title: "Distributed Tracing (OpenTelemetry)",
+                description: "Every RAG query generates a distributed trace across api-gateway, workflow-service, Dify, and the database with a shared traceId.",
+              },
+              {
+                key: "H3_RAGAS_QUALITY" as const,
+                id: "H3",
+                title: "Answer Quality Metrics (RAGAS)",
+                description: "Faithfulness and relevance scores are computed asynchronously after each RAG response and surfaced on the /rag-stats dashboard.",
+              },
+              {
+                key: "H4_RETRIEVAL_METRICS" as const,
+                id: "H4",
+                title: "Retrieval Metrics (Recall@k, MRR)",
+                description: "A golden Q&A evaluation dataset is maintained and weekly retrieval evaluation computes Recall@k and Mean Reciprocal Rank.",
+              },
+              {
+                key: "H5_POST_RETRIEVAL_AUTH" as const,
+                id: "H5",
+                title: "Post-Retrieval Authorization",
+                description: "KB permissions are re-checked before each Dify fan-out call, not just at thread creation, protecting against mid-session share revocations.",
+              },
+              {
+                key: "H6_OUTPUT_GATING" as const,
+                id: "H6",
+                title: "Output Gating & Prompt Injection Defense",
+                description: "LLM responses are scanned for leaked secrets and prompt injection markers before being returned to users or posted to Slack.",
+              },
+            ] as const
+          ).map(({ key, id, title, description }) => {
+            const done = COMPLIANCE_STATUS[key];
+            return (
+              <div
+                key={key}
+                style={{
+                  border: `2px solid ${done ? "#22c55e" : "#6b7280"}`,
+                  borderRadius: 8,
+                  padding: "12px 16px",
+                  background: done ? "rgba(34,197,94,0.08)" : "rgba(107,114,128,0.06)",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <span
+                    style={{
+                      display: "inline-block",
+                      width: 20,
+                      height: 20,
+                      borderRadius: "50%",
+                      background: done ? "#22c55e" : "#6b7280",
+                      flexShrink: 0,
+                      textAlign: "center",
+                      lineHeight: "20px",
+                      fontSize: 13,
+                      color: "#fff",
+                    }}
+                  >
+                    {done ? "✓" : "○"}
+                  </span>
+                  <strong style={{ fontSize: 14 }}>
+                    {id} — {title}
+                  </strong>
+                  <span
+                    style={{
+                      marginLeft: "auto",
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: "2px 8px",
+                      borderRadius: 4,
+                      background: done ? "#22c55e" : "#6b7280",
+                      color: "#fff",
+                      flexShrink: 0,
+                    }}
+                  >
+                    {done ? "COMPLIANT" : "PENDING"}
+                  </span>
+                </div>
+                <p style={{ margin: 0, fontSize: 12, opacity: 0.8, lineHeight: 1.5 }}>{description}</p>
+              </div>
+            );
+          })}
+        </div>
+        {Object.values(COMPLIANCE_STATUS).every(Boolean) ? (
+          <div
+            style={{
+              marginTop: 20,
+              padding: "12px 16px",
+              borderRadius: 8,
+              background: "rgba(34,197,94,0.12)",
+              border: "2px solid #22c55e",
+              fontWeight: 600,
+              color: "#22c55e",
+              textAlign: "center",
+            }}
+          >
+            ✅ All 6 enterprise RAG security controls are implemented and verified. Platform is fully compliant.
+          </div>
+        ) : (
+          <div
+            style={{
+              marginTop: 20,
+              padding: "10px 16px",
+              borderRadius: 8,
+              background: "rgba(107,114,128,0.08)",
+              border: "1px solid #6b7280",
+              fontSize: 13,
+              opacity: 0.8,
+            }}
+          >
+            {Object.values(COMPLIANCE_STATUS).filter(Boolean).length} / {Object.values(COMPLIANCE_STATUS).length} controls implemented.
+            See <code>docs/plans/high-priority-implementation-plan.md</code> for the implementation plan and tracking dashboard.
+          </div>
+        )}
+      </section>
     </>
   );
 }
-

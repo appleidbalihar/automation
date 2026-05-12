@@ -110,6 +110,7 @@ MINIO_SK="$(vault_field "infra/minio/config" "secret_key")"
 
 KC_ADMIN="$(vault_field "infra/keycloak/config" "admin_password")"
 KC_SECRET="$(vault_field "infra/keycloak/config" "client_secret")"
+KC_PLATFORM_ADMIN="$(vault_field "infra/keycloak/config" "platform_admin_password")"
 OAUTH_SECRET="$(vault_field "infra/keycloak/config" "platform_oauth_secret")"
 
 DIFY_SK="$(vault_field "app/dify/config" "secret_key")"
@@ -158,6 +159,8 @@ MINIO_SECRET_KEY=${MINIO_SK}
 KEYCLOAK_ADMIN_PASSWORD=${KC_ADMIN}
 KEYCLOAK_ADMIN_USERNAME=admin
 KEYCLOAK_CLIENT_SECRET=${KC_SECRET}
+KEYCLOAK_PLATFORM_ADMIN_USERNAME=platform-admin
+KEYCLOAK_PLATFORM_ADMIN_PASSWORD=${KC_PLATFORM_ADMIN}
 PLATFORM_OAUTH_SECRET=${OAUTH_SECRET}
 
 # ── Dify ───────────────────────────────────────────────────────────────────────

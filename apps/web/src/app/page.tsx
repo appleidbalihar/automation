@@ -8,7 +8,11 @@ export default function LandingPage(): ReactElement {
       <header className="rr-nav">
         <div className="rr-nav-inner">
           <span className="rr-logo">
-            <span className="rr-logo-mark">R</span>RapidRAG
+            <span className="rr-logo-mark">R</span>
+            <span style={{display:'flex',flexDirection:'column',lineHeight:'1.15'}}>
+              <span>RapidRAG</span>
+              <span style={{fontSize:'0.58em',fontWeight:400,letterSpacing:'0.06em',opacity:0.65,textTransform:'uppercase'}}>RAG-as-a-Service</span>
+            </span>
           </span>
           <nav className="rr-nav-links">
             <a href="#how-it-works">How it works</a>
@@ -22,12 +26,12 @@ export default function LandingPage(): ReactElement {
       {/* ── Hero ────────────────────────────────────────────────────────── */}
       <section className="rr-hero">
         <div className="rr-hero-inner">
-          <p className="rr-eyebrow"><span className="rr-eyebrow-dot">●</span> END-TO-END RAG IN MINUTES</p>
+          <p className="rr-eyebrow"><span className="rr-eyebrow-dot">●</span> RAG-AS-A-SERVICE · CLOUD OR ON-PREM · GO LIVE IN MINUTES</p>
           <h1 className="rr-headline">
-            Stop building RAG.<br /><span className="rr-headline-accent">Start answering.</span>
+            RAG-as-a-Service,<br /><span className="rr-headline-accent">ready out of the box.</span>
           </h1>
           <p className="rr-subheadline">
-            RapidRAG turns your documentation — GitHub, Google Drive, SharePoint, Notion and more — into a smart answer engine, then deploys chatbots to Slack, Telegram, and WhatsApp in minutes. No custom code. No integration hell.
+            Think of it as an AI assistant that actually knows your company&apos;s stuff. You plug in your docs, repos, websites, whatever — and anyone on your team can just ask questions in plain language and get real answers pulled straight from your own content. No more digging through folders or pinging the one guy who knows everything.
           </p>
           <div className="rr-hero-ctas">
             <Link href="/dashboard" className="rr-btn-primary">
@@ -43,6 +47,7 @@ export default function LandingPage(): ReactElement {
             <span className="rr-badge">Confluence &amp; Notion</span>
             <span className="rr-badge">Slack &amp; Telegram</span>
             <span className="rr-badge">WhatsApp</span>
+            <span className="rr-badge">On-prem available</span>
             <span className="rr-badge">20+ connectors</span>
           </div>
         </div>
@@ -84,30 +89,64 @@ export default function LandingPage(): ReactElement {
       {/* ── Solution ─────────────────────────────────────────────────────── */}
       <section className="rr-section">
         <div className="rr-container">
-          <p className="rr-section-eyebrow">The Solution</p>
-          <h2 className="rr-section-title">One roof. End-to-end RAG. Zero waste.</h2>
+          <p className="rr-section-eyebrow">The Platform</p>
+          <h2 className="rr-section-title">Fully managed RAG-as-a-Service. From ingestion to answer.</h2>
           <p className="rr-section-lead">
-            RapidRAG is the first fully integrated RAG operations platform that lets any team — not just engineering — connect document sources, sync them automatically, and deploy AI chatbots to the channels people already use.
+            RapidRAG is the complete RAG-as-a-Service layer for your organisation. We own the entire stack — document ingestion, chunking strategy, vector embedding, semantic retrieval, LLM orchestration, and chat delivery — so your team owns none of the complexity. You connect your sources; we keep them in sync and answering.
           </p>
           <div className="rr-checks">
             <div className="rr-check-item">
               <span className="rr-check">✅</span>
               <div>
-                <strong>No building</strong> — we handle chunking, embedding, retrieval, and LLM orchestration.
+                <strong>No infrastructure to manage</strong> — hosted pipeline with 99.9% uptime SLA, fully maintained for you.
               </div>
             </div>
             <div className="rr-check-item">
               <span className="rr-check">✅</span>
               <div>
-                <strong>No integration hassles</strong> — pre-built connectors for GitHub, GitLab, Google Drive, Confluence, Notion, and 20+ more.
+                <strong>No integration work</strong> — pre-built connectors for GitHub, GitLab, Google Drive, Confluence, Notion, and 20+ more.
               </div>
             </div>
             <div className="rr-check-item">
               <span className="rr-check">✅</span>
               <div>
-                <strong>No new UI to learn</strong> — your team asks questions in Slack or Telegram, gets cited answers back instantly.
+                <strong>No new tools to learn</strong> — answers land in Slack, Telegram, or WhatsApp where your team already works.
               </div>
             </div>
+            <div className="rr-check-item">
+              <span className="rr-check">✅</span>
+              <div>
+                <strong>Your deployment, your rules</strong> — run in our cloud or deploy on-prem inside your own infrastructure.
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── What's in the service ─────────────────────────────────────────── */}
+      <section className="rr-section rr-section-alt">
+        <div className="rr-container">
+          <p className="rr-section-eyebrow">What&apos;s in the service</p>
+          <h2 className="rr-section-title">Every layer. Fully managed. Always on.</h2>
+          <div style={{borderTop:'2px solid #e2e8f0',marginTop:'2rem'}}>
+            {[
+              { icon:'🔄', title:'Auto-sync pipeline',         desc:'Documents ingested and re-indexed on schedule or on push — zero manual re-runs.' },
+              { icon:'🧠', title:'Managed embeddings',         desc:'We choose and upgrade the embedding model so you never worry about model drift.' },
+              { icon:'🗄️', title:'Hosted vector store',        desc:'Production-grade vector DB included — no Pinecone or Weaviate bills.' },
+              { icon:'🤖', title:'LLM orchestration',          desc:'Retrieval, context assembly, and prompt management handled for you.' },
+              { icon:'🎯', title:'Smart AI system prompts',     desc:'Give your agent its own rules — define tone, scope, and response style per knowledge base. Your team\'s AI, your way.' },
+              { icon:'📡', title:'Chat channel delivery',       desc:'Bot tokens for Slack, Telegram, WhatsApp — live in minutes, no code required.' },
+              { icon:'📊', title:'Usage & audit dashboard',     desc:'Every query, answer, and source citation logged with role-based access control.' },
+              { icon:'🏠', title:'On-prem deployment',          desc:'Deploy entirely within your own infrastructure — full data sovereignty, no cloud dependency required.' },
+            ].map((item) => (
+              <div key={item.title} style={{display:'flex',alignItems:'flex-start',gap:'1.25rem',padding:'1.25rem 0',borderBottom:'1px solid #e2e8f0'}}>
+                <span style={{fontSize:'1.5rem',lineHeight:1,minWidth:'2rem',textAlign:'center',paddingTop:'0.15rem'}}>{item.icon}</span>
+                <div style={{flex:1,display:'flex',flexDirection:'column',gap:'0.2rem'}}>
+                  <span style={{fontWeight:600,fontSize:'1rem',color:'#1a202c'}}>{item.title}</span>
+                  <span style={{fontSize:'0.93rem',color:'#4a5568',lineHeight:'1.55'}}>{item.desc}</span>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       </section>
@@ -116,7 +155,7 @@ export default function LandingPage(): ReactElement {
       <section className="rr-section rr-section-dark" id="how-it-works">
         <div className="rr-container">
           <p className="rr-section-eyebrow rr-eyebrow-light">Simple as 1-2-3</p>
-          <h2 className="rr-section-title rr-title-light">How RapidRAG works</h2>
+          <h2 className="rr-section-title rr-title-light">How the service works</h2>
           <div className="rr-steps">
             <div className="rr-step">
               <div className="rr-step-num">1</div>
@@ -150,7 +189,7 @@ export default function LandingPage(): ReactElement {
               <div className="rr-benefit-icon">👨‍💻</div>
               <h3>For Developers</h3>
               <ul>
-                <li>Stop building infrastructure — we provide the full RAG pipeline.</li>
+                <li>Skip infrastructure — the full RAG pipeline is a service, not a library.</li>
                 <li>No vendor lock-in — export your vectors or bring your own LLM key.</li>
                 <li>Full logging &amp; security — every query visible, access controlled.</li>
               </ul>
@@ -169,7 +208,7 @@ export default function LandingPage(): ReactElement {
               <h3>For Team Leads</h3>
               <ul>
                 <li>Reduce repetitive questions — onboard new hires faster.</li>
-                <li>Measure knowledge gaps — see what's asked most often.</li>
+                <li>Define AI rules with smart system prompts — set tone, scope, and response style per team.</li>
                 <li>Save hours weekly — your team stops searching and starts doing.</li>
               </ul>
             </div>
@@ -177,7 +216,7 @@ export default function LandingPage(): ReactElement {
               <div className="rr-benefit-icon">🏢</div>
               <h3>For Companies</h3>
               <ul>
-                <li>Unify knowledge across silos — GitHub, Drive, Confluence in one layer.</li>
+                <li>One service unifies knowledge across GitHub, Drive, and Confluence.</li>
                 <li>Deploy to existing chat tools — Slack &amp; Teams are where work happens.</li>
                 <li>Scale without hiring — one platform serves hundreds with no extra engineering.</li>
               </ul>
@@ -265,6 +304,16 @@ export default function LandingPage(): ReactElement {
                   <td>Returns links, not answers</td>
                   <td className="rr-td-good">Answers directly in chat</td>
                 </tr>
+                <tr>
+                  <td>DIY vector DB (Pinecone / Weaviate)</td>
+                  <td>Ongoing cost + ops burden</td>
+                  <td className="rr-td-good">Hosted vector store included in service</td>
+                </tr>
+                <tr>
+                  <td>Most SaaS AI tools</td>
+                  <td>Cloud-only — your data leaves your walls</td>
+                  <td className="rr-td-good">On-prem deployment available — full data sovereignty</td>
+                </tr>
               </tbody>
             </table>
           </div>
@@ -280,9 +329,10 @@ export default function LandingPage(): ReactElement {
             <div className="rr-security-item">🔒 Encryption at rest and in transit</div>
             <div className="rr-security-item">👥 Role-based access control</div>
             <div className="rr-security-item">📋 Audit logs for every query and answer</div>
-            <div className="rr-security-item">🏠 Self-hosted option for enterprise</div>
+            <div className="rr-security-item">🏠 On-prem deployment — run entirely within your own infrastructure for full data sovereignty</div>
             <div className="rr-security-item">🔑 HashiCorp Vault for secrets management</div>
             <div className="rr-security-item">🛡️ SOC 2 Type II (in progress)</div>
+            <div className="rr-security-item">🔁 99.9% uptime SLA — production-grade managed service</div>
           </div>
         </div>
       </section>
@@ -290,8 +340,8 @@ export default function LandingPage(): ReactElement {
       {/* ── CTA ──────────────────────────────────────────────────────────── */}
       <section className="rr-section rr-section-dark rr-cta-section">
         <div className="rr-container rr-cta-inner">
-          <h2 className="rr-title-light">Ready to stop searching and start answering?</h2>
-          <p className="rr-cta-sub">Connect your first source in under 3 minutes. No credit card required.</p>
+          <h2 className="rr-title-light">Start using RAG as a Service today.</h2>
+          <p className="rr-cta-sub">No infrastructure. No maintenance. Connect your first source in under 3 minutes.</p>
           <Link href="/dashboard" className="rr-btn-primary rr-btn-large">
             🚀 Get started free
           </Link>
@@ -304,7 +354,7 @@ export default function LandingPage(): ReactElement {
           <span className="rr-logo">
             <span className="rr-logo-mark">R</span>RapidRAG
           </span>
-          <p>End-to-end RAG platform. Connect your docs. Deploy chatbots. Get answers instantly.</p>
+          <p>RAG-as-a-Service. Managed pipeline, instant answers, zero infrastructure.</p>
           <p className="rr-footer-copy">© {new Date().getFullYear()} RapidRAG. All rights reserved.</p>
         </div>
       </footer>

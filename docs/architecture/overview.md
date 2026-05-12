@@ -2,7 +2,9 @@
 
 ## What Is RapidRAG
 
-RapidRAG is a self-hosted RAG (Retrieval-Augmented Generation) operations platform. Operators connect document sources (GitHub, GitLab, Google Drive, web URLs, or manual/upload-style sources), sync supported files into Dify knowledge bases through n8n, and chat through the RAG Assistant. Administrators manage prompt templates, users, secrets, logs, RAG stats, and certificate health from the web UI.
+RapidRAG is a RAG-as-a-Service platform — a fully managed pipeline from document ingestion to conversational answers. Operators connect document sources (GitHub, GitLab, Google Drive, web URLs, or manual/upload-style sources), sync supported files into Dify knowledge bases through n8n, and chat through the RAG Assistant. The platform handles chunking, embedding, vector storage, retrieval, and LLM orchestration. Administrators manage prompt templates, users, secrets, logs, RAG stats, and certificate health from the web UI.
+
+RapidRAG can be deployed in the cloud or entirely on-prem within your own infrastructure for full data sovereignty.
 
 ## Quick Reference: Services and Ports
 
@@ -61,6 +63,7 @@ The authenticated platform UI lives at `https://<host>:3443` under these routes:
 | `/rag-assistant` | Dify-backed RAG chat | All roles |
 | `/profile` | User profile and password change | All roles |
 | `/ai-agent-prompt` | Reusable system prompt templates | admin, useradmin |
+| `/chat-channels` | Slack chat-channel deployments and history | admin, useradmin |
 | `/rag-stats` | RAG response timing and usage stats | admin only |
 | `/logs` | Platform log explorer | admin only |
 | `/users` | User management | admin, useradmin |
@@ -105,6 +108,11 @@ The platform database schema (`packages/db/prisma/schema.prisma`) contains these
 | `RagKbFileTracker` | Per-file SHA hash and Dify document ID for incremental sync |
 | `RagKbSyncJob` | Sync job lifecycle, steps, progress, and error state |
 | `RagChannelDeployment` | Channel deployment metadata |
+| `SlackDeployment` | Direct Slack bot deployment metadata |
+| `SlackDeploymentKb` | Slack deployment to knowledge-base mappings |
+| `ChannelChatThread` | Generic external-channel chat threads |
+| `ChannelChatMessage` | Messages for external-channel chat threads |
+| `ChannelChatKbSession` | Per-KB Dify conversation IDs for external-channel threads |
 | `SystemPromptTemplate` | Built-in, private, and shared AI agent system prompt templates |
 | `SystemPromptTemplateShare` | Per-user shares for prompt templates with `specific` share scope |
 | `RagDiscussionThread` | RAG chat thread records |
@@ -147,6 +155,34 @@ When an operator sends a message in the RAG Assistant:
 ```
 
 Discussion threads are private to the user who created them. Sharing a KB grants another user chat access to that KB, but it does not share discussion history.
+
+## How Slack Chat Channels Work
+
+Slack Chat Channels use a direct real-time path instead of n8n:
+
+```text
+Slack → /rapidrag/api/slack/events → api-gateway raw proxy → workflow-service
+  ↓
+Slack signature verification + deployment resolution
+  ↓
+Dify chat API
+  ↓
+Slack response_url or chat.postMessage
+```
+
+OAuth installs use the platform-owned RapidRAG Bot and resolve deployments by Slack workspace. Manual installs use customer-owned Slack apps and deployment-specific webhook URLs. Per-user bot conversation context is stored in the generic `ChannelChatThread` tables so later Telegram and Google Chat integrations can reuse the same history shape. Slack channels are not required in Phase 1.
+
+The OAuth callback also stays under the RapidRAG URL space:
+
+```text
+Slack OAuth → /rapidrag/api/slack/oauth/callback → api-gateway → workflow-service
+workflow-service → 302 /rapidrag/chat-channels?... → browser
+```
+
+api-gateway must preserve that upstream redirect instead of following it server-side.
+
+Developer details: `docs/developer/slack-chat-channel.md`.
+Operations runbook: `docs/operations/slack-chat-channel.md`.
 
 ## How Prompt Templates Work
 

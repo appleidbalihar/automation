@@ -88,9 +88,10 @@ vault_write "infra/minio/config" \
 # ── Infra: Keycloak ───────────────────────────────────────────────────────────
 KEYCLOAK_ADMIN_PASSWORD="$(openssl rand -base64 32 | tr -d '/+=')"
 KEYCLOAK_CLIENT_SECRET="$(openssl rand -hex 40)"
+KEYCLOAK_PLATFORM_ADMIN_PASSWORD="$(openssl rand -base64 32 | tr -d '/+=')"
 PLATFORM_OAUTH_SECRET="$(openssl rand -hex 40)"
 vault_write "infra/keycloak/config" \
-  "{\"admin_password\": \"${KEYCLOAK_ADMIN_PASSWORD}\", \"client_secret\": \"${KEYCLOAK_CLIENT_SECRET}\", \"platform_oauth_secret\": \"${PLATFORM_OAUTH_SECRET}\"}"
+  "{\"admin_password\": \"${KEYCLOAK_ADMIN_PASSWORD}\", \"client_secret\": \"${KEYCLOAK_CLIENT_SECRET}\", \"platform_admin_password\": \"${KEYCLOAK_PLATFORM_ADMIN_PASSWORD}\", \"platform_oauth_secret\": \"${PLATFORM_OAUTH_SECRET}\"}"
 
 # ── App: Dify ─────────────────────────────────────────────────────────────────
 DIFY_SECRET_KEY="$(openssl rand -hex 40)"

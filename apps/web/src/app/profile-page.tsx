@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { ReactElement } from "react";
 import { authHeaderFromStoredToken } from "./auth-client";
+import { appPath } from "./web-paths";
 
 export function ProfilePage(): ReactElement {
   const [currentPassword, setCurrentPassword] = useState<string>("");
@@ -26,7 +27,7 @@ export function ProfilePage(): ReactElement {
     setSubmitting(true);
     try {
       const authorization = authHeaderFromStoredToken();
-      const response = await fetch("/api/profile/password", {
+      const response = await fetch(appPath("/api/profile/password"), {
         method: "POST",
         headers: {
           "content-type": "application/json",

@@ -43,9 +43,9 @@
               scripts/generate-runtime-env.sh
                      │ writes to tmpfs
                      ▼
-              .env.runtime  (chmod 600, deleted after start)
+              .env.runtime  (chmod 600, shredded after start)
                      │
-              docker compose --env-file .env.runtime
+              platform-containers.sh -> docker compose --env-file .env.runtime
                      │
         ┌────────────┴─────────────┐
         │  Container environment   │
@@ -70,7 +70,7 @@ All secrets follow the pattern: `secret/data/platform/{env}/{category}/{service}
 | `platform/dev/infra/rabbitmq/config` | `username`, `password` | rabbitmq, api-gateway, workflow-service, logging-service |
 | `platform/dev/infra/opensearch/config` | `admin_password` | opensearch, workflow-service |
 | `platform/dev/infra/minio/config` | `access_key`, `secret_key` | minio |
-| `platform/dev/infra/keycloak/config` | `admin_password`, `client_secret`, `platform_oauth_secret` | keycloak, api-gateway, workflow-service, web |
+| `platform/dev/infra/keycloak/config` | `admin_password`, `client_secret`, `platform_admin_password`, `platform_oauth_secret` | keycloak, api-gateway, workflow-service, web, Keycloak seed script |
 | `platform/dev/app/dify/config` | `secret_key`, `db_password`, `redis_password` | dify-api, dify-worker, dify-db, dify-redis |
 | `platform/dev/app/n8n/config` | `encryption_key`, `db_password`, `webhook_token` | n8n, n8n-db |
 
@@ -126,13 +126,18 @@ ENVIRONMENT=dev bash scripts/list-secrets.sh
 ### Step 5 — Generate runtime env and start everything
 
 ```bash
-ENVIRONMENT=dev bash scripts/generate-runtime-env.sh
-
-docker compose -f docker-compose.yml -f docker-compose.dev.yml \
-  --env-file .env --env-file .env.runtime up -d
-
-shred -u .env.runtime
+/home/bali/09_automationplatform/scripts/platform-containers.sh dev start
 ```
+
+The wrapper generates the runtime env file from Vault, passes it to Docker Compose, and shreds it when Compose returns.
+
+### Step 6 — Ensure the platform Keycloak admin user
+
+```bash
+ENVIRONMENT=dev bash scripts/seed-keycloak-platform-admin.sh
+```
+
+The `automation-platform` realm import is bootstrap-only. Keycloak users and credentials persist in `keycloak_data`; this seed script is safe to re-run and restores `platform-admin` from Vault if the realm is rebuilt.
 
 ---
 
@@ -202,28 +207,16 @@ echo "Root token revoked."
 ### Step 6 — Generate runtime env and start everything
 
 ```bash
-ENVIRONMENT=prod \
-OUTPUT_FILE=/run/platform-secrets/.env.runtime \
-bash scripts/generate-runtime-env.sh
-
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-  --env-file .env.production \
-  --env-file /run/platform-secrets/.env.runtime \
-  up -d
-
-shred -u /run/platform-secrets/.env.runtime
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod start
 ```
 
 ### Step 7 — Create first Keycloak admin user
 
-1. Open `https://theaitools.ca:8443` in a browser
-2. Log in as `admin` using the password from Vault:
-   ```bash
-   ENVIRONMENT=prod SHOW_VALUES=true PATH_FILTER=infra/keycloak bash scripts/list-secrets.sh
-   ```
-3. Switch to realm **automation-platform** → Users → Add User
-4. Username: `platform-admin`, assign realm role `admin`
-5. Set a strong password in the Credentials tab (temporary: off)
+```bash
+ENVIRONMENT=prod bash scripts/seed-keycloak-platform-admin.sh
+```
+
+This creates or updates `platform-admin`, resets its password from `platform/prod/infra/keycloak/config.platform_admin_password`, and assigns the realm `admin` role.
 
 ---
 
@@ -244,7 +237,7 @@ ENVIRONMENT=prod bash scripts/list-secrets.sh
 [OK] platform/prod/infra/rabbitmq/config   — fields: username, password
 [OK] platform/prod/infra/opensearch/config — fields: admin_password
 [OK] platform/prod/infra/minio/config      — fields: access_key, secret_key
-[OK] platform/prod/infra/keycloak/config   — fields: admin_password, client_secret, platform_oauth_secret
+[OK] platform/prod/infra/keycloak/config   — fields: admin_password, client_secret, platform_admin_password, platform_oauth_secret
 [OK] platform/prod/app/dify/config         — fields: secret_key, db_password, redis_password
 [OK] platform/prod/app/n8n/config          — fields: encryption_key, db_password, webhook_token
 ```
@@ -281,32 +274,18 @@ vault kv get -field=password secret/platform/prod/infra/postgres/config
 
 ## Daily Deploy Flow
 
-Every time you restart or redeploy services, you need a fresh `.env.runtime`. The tokens are short-lived and the file is deleted after use.
+Every time you restart or redeploy services, use the platform wrapper. It creates a short-lived runtime env from Vault, runs Docker Compose, and deletes the runtime env file after use.
 
 ### Dev
 
 ```bash
-ENVIRONMENT=dev bash scripts/generate-runtime-env.sh
-
-docker compose -f docker-compose.yml -f docker-compose.dev.yml \
-  --env-file .env --env-file .env.runtime up -d
-
-shred -u .env.runtime
+/home/bali/09_automationplatform/scripts/platform-containers.sh dev start
 ```
 
 ### Production
 
 ```bash
-ENVIRONMENT=prod \
-OUTPUT_FILE=/run/platform-secrets/.env.runtime \
-bash scripts/generate-runtime-env.sh
-
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-  --env-file .env.production \
-  --env-file /run/platform-secrets/.env.runtime \
-  up -d
-
-shred -u /run/platform-secrets/.env.runtime
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod start
 ```
 
 ---
@@ -347,18 +326,8 @@ ENVIRONMENT=prod ROTATE_ALL=true bash scripts/rotate-secret.sh
 ### After rotating — redeploy affected services
 
 ```bash
-# Regenerate runtime env with new values
-ENVIRONMENT=prod \
-OUTPUT_FILE=/run/platform-secrets/.env.runtime \
-bash scripts/generate-runtime-env.sh
-
 # Restart only the affected service (example: postgres password change)
-docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-  --env-file .env.production \
-  --env-file /run/platform-secrets/.env.runtime \
-  up -d --force-recreate postgres api-gateway workflow-service logging-service
-
-shred -u /run/platform-secrets/.env.runtime
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod restart postgres api-gateway workflow-service logging-service
 ```
 
 ### Services affected by each secret
@@ -372,6 +341,7 @@ shred -u /run/platform-secrets/.env.runtime
 | `infra/minio/config` | minio |
 | `infra/keycloak/config.admin_password` | keycloak |
 | `infra/keycloak/config.client_secret` | api-gateway, workflow-service, web |
+| `infra/keycloak/config.platform_admin_password` | `scripts/seed-keycloak-platform-admin.sh` |
 | `infra/keycloak/config.platform_oauth_secret` | api-gateway, workflow-service |
 | `app/dify/config.db_password` | dify-db (`ALTER USER`), dify-api, dify-worker, dify-migrate |
 | `app/dify/config.redis_password` | dify-redis, dify-api, dify-worker |
@@ -505,7 +475,7 @@ curl -sk -X POST \
 ### Force-renew all certificates (restart the Vault Agent sidecars)
 
 ```bash
-docker compose restart \
+/home/bali/09_automationplatform/scripts/platform-containers.sh prod restart \
   api-gateway-vault-agent \
   workflow-service-vault-agent \
   logging-service-vault-agent \
@@ -558,7 +528,7 @@ docker exec $(docker ps -qf name=vault) vault status | grep Sealed
 
 2. **Never print secrets in scripts or logs.** The seed scripts do not echo generated values. Use `list-secrets.sh` with `SHOW_VALUES=true` if you need to see a value.
 
-3. **Delete `.env.runtime` immediately after `docker compose up`.** The deploy scripts use `shred -u` which overwrites before deleting.
+3. **Use `platform-containers.sh` for starts and restarts.** It creates the runtime env on tmpfs and uses `shred -u` after Docker Compose returns.
 
 4. **Revoke the Vault root token after seeding.** The root token is needed only for initial seeding. All runtime operations use short-lived AppRole tokens.
 
@@ -581,7 +551,7 @@ Run through this before going live:
 - [ ] Port 8200 is NOT open in the host firewall (`sudo firewall-cmd --list-ports | grep 8200` should return nothing)
 - [ ] Ports 5432, 6379, 5671, 9200 are NOT open in the host firewall
 - [ ] Only ports 80, 443, 8443 are publicly accessible
-- [ ] `/run/platform-secrets/.env.runtime` does NOT exist (should be deleted by deploy script)
+- [ ] `/run/platform-secrets/.env.prod.runtime` does NOT exist (should be deleted by deploy script)
 - [ ] `docker inspect <service> | grep -i env` shows no plaintext passwords in any running container
 - [ ] `grep -rE "(guest:guest|platformredis|DevAdmin123|minioadmin|admin123)" docker-compose.yml` returns nothing
 - [ ] All containers are using `docker-compose.prod.yml` (check via `docker inspect <container> | grep -i labels`)

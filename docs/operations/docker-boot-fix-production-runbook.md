@@ -219,7 +219,7 @@ ExecStartPre=/bin/bash -c '\
 
 ExecStart=/bin/bash /home/bali/09_automationplatform/infra/scripts/phased-startup.sh
 
-ExecStop=/usr/bin/docker compose down --timeout 30
+ExecStop=/bin/bash /home/bali/09_automationplatform/scripts/platform-containers.sh prod down
 
 Restart=on-failure
 RestartSec=120s
@@ -254,13 +254,15 @@ chmod +x /path/to/infra/scripts/phased-startup.sh
 
 **The 6 phases:**
 ```
-Phase 1: vault, opensearch, dify-db, dify-redis, n8n-db, dify-sandbox
+Phase 1: vault
          → Gate: wait for vault port :8200 to be open
 
 Phase 2: vault-bootstrap + all 13 vault-agents + cert-rotation-controller
-         → Gate: wait for vault PKI bootstrap complete + 15s TLS cert issuance
+         → Gate: wait for vault PKI bootstrap complete + 15s TLS cert issuance,
+           then generate the short-lived production runtime env from Vault
 
-Phase 3: postgres, redis, rabbitmq, minio, keycloak, n8n, dify-migrate
+Phase 3: opensearch, dify-db, dify-redis, n8n-db, dify-sandbox,
+         postgres, redis, rabbitmq, minio, keycloak, n8n, dify-migrate
          → Gate: wait for postgres to become healthy (WAL recovery ~90-120s on HDD)
 
 Phase 4: db-migrate (Prisma) → then dify-api + dify-worker
@@ -370,7 +372,7 @@ ExecStartPre=/bin/bash -c 'echo "Waiting for Docker to be ready..."; for i in \$
 
 ExecStart=/bin/bash ${APP_DIR}/infra/scripts/phased-startup.sh
 
-ExecStop=/usr/bin/docker compose down --timeout 30
+ExecStop=/bin/bash ${APP_DIR}/scripts/platform-containers.sh prod down
 
 Restart=on-failure
 RestartSec=120s

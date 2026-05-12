@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
 import { loadIntegrations } from "./integrations/api";
 import type { Integration } from "./integrations/types";
+import { appPath } from "./web-paths";
 
 type Identity = { userId: string; roles: string[] };
 type DashboardStats = {
@@ -17,6 +18,15 @@ type DashboardStats = {
   needsSync: number;
   documents: number;
   users: number | null;
+};
+
+type StatTileProps = {
+  label: string;
+  value: string | number;
+  detail: string;
+  icon: string;
+  trend: string;
+  tone?: "good" | "warn" | "neutral";
 };
 
 function latestDocumentCount(integration: Integration): number {
@@ -57,7 +67,7 @@ function calculateStats(integrations: Integration[], users: number | null): Dash
 async function fetchUserCount(identity: Identity): Promise<number | null> {
   if (!identity.roles.includes("admin")) return null;
   const authorization = authHeaderFromStoredToken();
-  const response = await fetch("/api/admin/users", {
+  const response = await fetch(appPath("/api/admin/users"), {
     headers: authorization ? { authorization } : {},
     cache: "no-store"
   });
@@ -66,9 +76,26 @@ async function fetchUserCount(identity: Identity): Promise<number | null> {
   return Array.isArray(payload.users) ? payload.users.length : null;
 }
 
-function StatTile({ label, value, detail }: { label: string; value: string | number; detail: string }): ReactElement {
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function syncStatus(integration: Integration): { label: string; tone: "good" | "warn" | "neutral" } {
+  if (!integration.syncReady) return { label: "Setup needed", tone: "warn" };
+  const status = String(integration.latestSyncJob?.status ?? "never_synced").toLowerCase();
+  if (status === "completed") return { label: "Synced", tone: "good" };
+  if (status === "running" || status === "pending") return { label: "Syncing", tone: "neutral" };
+  if (status === "failed") return { label: "Review", tone: "warn" };
+  return { label: "Ready", tone: "neutral" };
+}
+
+function StatTile({ label, value, detail, icon, trend, tone = "neutral" }: StatTileProps): ReactElement {
   return (
     <section className="dashboard-stat-card">
+      <div className="dashboard-stat-topline">
+        <span className="dashboard-stat-icon">{icon}</span>
+        <span className={`dashboard-trend dashboard-trend-${tone}`}>{trend}</span>
+      </div>
       <p className="dashboard-stat-label">{label}</p>
       <p className="dashboard-stat-value">{value}</p>
       <p className="dashboard-stat-detail">{detail}</p>
@@ -77,7 +104,6 @@ function StatTile({ label, value, detail }: { label: string; value: string | num
 }
 
 export function DashboardOverview(): ReactElement {
-  const [identity, setIdentity] = useState<Identity | null>(null);
   const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [userCount, setUserCount] = useState<number | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -95,7 +121,6 @@ export function DashboardOverview(): ReactElement {
           fetchUserCount(currentIdentity)
         ]);
         if (!active) return;
-        setIdentity(currentIdentity);
         setIntegrations(loadedIntegrations);
         setUserCount(loadedUserCount);
       } catch (loadError) {
@@ -113,23 +138,26 @@ export function DashboardOverview(): ReactElement {
 
   const stats = useMemo(() => calculateStats(integrations, userCount), [integrations, userCount]);
   const defaultConnector = integrations.find((integration) => integration.isDefault);
+  const syncedPercent = stats.connectors > 0 ? Math.round((stats.synced / stats.connectors) * 100) : 0;
+  const readyPercent = stats.connectors > 0 ? Math.round((stats.syncReady / stats.connectors) * 100) : 0;
   const attentionItems = integrations
     .filter((integration) => !integration.syncReady || String(integration.latestSyncJob?.status ?? "").toLowerCase() === "failed")
     .slice(0, 4);
+  const visibleKnowledge = integrations.slice(0, 4);
+  const recentActivity = integrations.slice(0, 5);
 
   return (
     <div className="dashboard-page">
       <section className="dashboard-hero">
         <div>
           <p className="dashboard-eyebrow">Platform Overview</p>
-          <h1>RAG operations dashboard</h1>
-          <p>
-            Track connector readiness, sync health, indexed documents, and user coverage from one place.
-          </p>
+          <h1>Welcome back to RapidRAG</h1>
+          <p>Monitor your knowledge sources, sync health, assistant readiness, and team access in one workspace.</p>
         </div>
-        <div className="dashboard-user-pill">
-          <span>Signed in</span>
-          <strong>{identity?.userId ?? "loading..."}</strong>
+        <div className="dashboard-hero-actions">
+          <Link href="/knowledge-connector" className="dashboard-primary-action">
+            Add knowledge source
+          </Link>
         </div>
       </section>
 
@@ -137,32 +165,56 @@ export function DashboardOverview(): ReactElement {
       {loading ? <p className="ops-status-line">Loading dashboard stats...</p> : null}
 
       <div className="dashboard-stat-grid">
-        <StatTile label="Connectors" value={stats.connectors} detail={`${stats.connected} with credentials configured`} />
-        <StatTile label="Sync Ready" value={stats.syncReady} detail={`${stats.synced} synced, ${stats.syncing} syncing`} />
-        <StatTile label="Needs Sync" value={stats.needsSync} detail="Never synced, failed, or waiting for setup" />
-        <StatTile label="Documents" value={stats.documents} detail="Latest processed or discovered source files" />
-        <StatTile label="Users" value={stats.users ?? "N/A"} detail={stats.users === null ? "Visible to platform admins" : "Keycloak users in realm"} />
+        <StatTile label="Knowledge sources" value={stats.connectors} detail={`${stats.connected} credentials configured`} icon="KB" trend={`${readyPercent}% ready`} tone="good" />
+        <StatTile label="Indexed documents" value={formatNumber(stats.documents)} detail="Latest processed or discovered files" icon="DOC" trend="+ live" tone="neutral" />
+        <StatTile label="Sync coverage" value={`${syncedPercent}%`} detail={`${stats.synced} synced, ${stats.syncing} in progress`} icon="SYNC" trend={`${stats.syncReady} ready`} tone="good" />
+        <StatTile label="Needs review" value={stats.needsSync} detail="Waiting for setup, sync, or retry" icon="!" trend={stats.needsSync ? "Action" : "Clear"} tone={stats.needsSync ? "warn" : "good"} />
       </div>
 
-      <div className="dashboard-action-grid">
-        <section className="dashboard-panel">
-          <h2>Knowledge status</h2>
-          <p>
-            {defaultConnector
-              ? `Default knowledge base: ${defaultConnector.name}.`
-              : "No default knowledge base is selected yet."}
-          </p>
-          <Link href="/knowledge-connector">Manage connectors</Link>
+      <div className="dashboard-main-grid">
+        <section className="dashboard-panel dashboard-knowledge-panel">
+          <div className="dashboard-panel-header">
+            <h2>Knowledge sources</h2>
+            <Link href="/knowledge-connector">View all</Link>
+          </div>
+          <div className="dashboard-source-list">
+            {visibleKnowledge.length > 0 ? (
+              visibleKnowledge.map((integration) => {
+                const status = syncStatus(integration);
+                return (
+                  <div className="dashboard-source-row" key={integration.id}>
+                    <div>
+                      <strong>{integration.name}</strong>
+                      <span>{formatNumber(latestDocumentCount(integration))} files tracked</span>
+                    </div>
+                    <span className={`dashboard-status-chip dashboard-status-${status.tone}`}>{status.label}</span>
+                  </div>
+                );
+              })
+            ) : (
+              <p className="dashboard-empty-copy">Connect your first source to start building searchable company knowledge.</p>
+            )}
+          </div>
         </section>
 
-        <section className="dashboard-panel">
-          <h2>RAG Assistant</h2>
-          <p>Ask grounded questions across your connected and synced knowledge bases.</p>
-          <Link href="/rag-assistant">Open RAG Assistant</Link>
+        <section className="dashboard-assistant-card">
+          <div className="dashboard-assistant-header">
+            <span>AI</span>
+            <strong>Online</strong>
+          </div>
+          <h2>Ask across your connected knowledge.</h2>
+          <p>Use grounded answers from indexed sources, citations, and your team&apos;s current sync state.</p>
+          <div className="dashboard-prompt-preview">Try: Which sources changed since the last sync?</div>
+          <Link href="/rag-assistant">Open assistant</Link>
         </section>
 
-        <section className="dashboard-panel">
-          <h2>Attention needed</h2>
+        <section className="dashboard-panel dashboard-health-panel">
+          <div className="dashboard-panel-header">
+            <h2>{attentionItems.length ? "Needs attention" : "All clear"}</h2>
+            <span className={`dashboard-status-chip dashboard-status-${attentionItems.length ? "warn" : "good"}`}>
+              {attentionItems.length ? `${attentionItems.length} issue${attentionItems.length === 1 ? "" : "s"}` : "Healthy"}
+            </span>
+          </div>
           {attentionItems.length > 0 ? (
             <ul className="dashboard-attention-list">
               {attentionItems.map((integration) => (
@@ -177,8 +229,55 @@ export function DashboardOverview(): ReactElement {
               ))}
             </ul>
           ) : (
-            <p>All visible connectors are ready or synced.</p>
+            <ul className="dashboard-check-list">
+              <li>{stats.connected} sources have credentials configured</li>
+              <li>{stats.syncReady} sources are ready for retrieval</li>
+              <li>No failed sync jobs need review</li>
+            </ul>
           )}
+        </section>
+      </div>
+
+      <div className="dashboard-bottom-grid">
+        <section className="dashboard-panel dashboard-activity-panel">
+          <div className="dashboard-panel-header">
+            <h2>Recent source activity</h2>
+            <Link href="/logs">View logs</Link>
+          </div>
+          <ul className="dashboard-timeline">
+            {recentActivity.length > 0 ? (
+              recentActivity.map((integration) => {
+                const status = syncStatus(integration);
+                return (
+                  <li key={integration.id}>
+                    <span className={`dashboard-timeline-dot dashboard-timeline-${status.tone}`} />
+                    <div>
+                      <strong>{integration.name}</strong>
+                      <span>{status.label} - {formatNumber(latestDocumentCount(integration))} tracked files</span>
+                    </div>
+                  </li>
+                );
+              })
+            ) : (
+              <li>
+                <span className="dashboard-timeline-dot dashboard-timeline-neutral" />
+                <div>
+                  <strong>No source activity yet</strong>
+                  <span>Add a source and sync it to populate this feed.</span>
+                </div>
+              </li>
+            )}
+          </ul>
+        </section>
+
+        <section className="dashboard-panel dashboard-quick-panel">
+          <h2>Quick actions</h2>
+          <div className="dashboard-quick-actions">
+            <Link href="/knowledge-connector"><span>+</span><strong>Connect a source</strong></Link>
+            <Link href="/chat-channels"><span>#</span><strong>Deploy chat channels</strong></Link>
+            <Link href="/ai-agent-prompt"><span>AI</span><strong>Tune assistant prompts</strong></Link>
+            <Link href="/rag-stats"><span>%</span><strong>Review analytics</strong></Link>
+          </div>
         </section>
       </div>
     </div>

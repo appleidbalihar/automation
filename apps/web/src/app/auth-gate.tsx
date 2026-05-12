@@ -1,19 +1,14 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import type { ReactElement, ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { AUTH_SESSION_CLEARED_EVENT, clearStoredToken, fetchIdentity, saveStoredToken } from "./auth-client";
-
-interface Identity {
-  userId: string;
-  roles: string[];
-}
+import { appPath } from "./web-paths";
 
 function LoginPanel({
   onSignedIn
 }: {
-  onSignedIn: (identity: Identity) => void;
+  onSignedIn: () => void;
 }): ReactElement {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState<string>("");
@@ -30,12 +25,12 @@ function LoginPanel({
     setError("");
     setStatus("");
     try {
-      const response = await fetch("/api/auth/token", {
+      const response = await fetch(appPath("/api/auth/token"), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ username, password })
       });
-      const payload = (await response.json()) as {
+      const payload = (await response.json().catch(() => ({}))) as {
         accessToken?: string;
         refreshToken?: string;
         expiresIn?: number;
@@ -47,8 +42,8 @@ function LoginPanel({
         return;
       }
       saveStoredToken(payload.accessToken, payload.refreshToken, payload.expiresIn);
-      const identity = await fetchIdentity();
-      onSignedIn(identity);
+      await fetchIdentity();
+      onSignedIn();
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Login request failed");
     } finally {
@@ -61,7 +56,7 @@ function LoginPanel({
     setError("");
     setStatus("");
     try {
-      const response = await fetch("/api/auth/register", {
+      const response = await fetch(appPath("/api/auth/register"), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -72,7 +67,7 @@ function LoginPanel({
           lastName
         })
       });
-      const payload = (await response.json()) as { created?: boolean; error?: string; details?: string };
+      const payload = (await response.json().catch(() => ({}))) as { created?: boolean; error?: string; details?: string };
       if (!response.ok || !payload.created) {
         setError(payload.details ?? payload.error ?? "Registration failed");
         return;
@@ -240,28 +235,24 @@ function LoginPanel({
 }
 
 export function AuthGate({ children }: { children: ReactNode }): ReactElement {
-  const router = useRouter();
   const [status, setStatus] = useState<"checking" | "signed-in" | "signed-out">("checking");
-  const [identity, setIdentity] = useState<Identity | null>(null);
 
   useEffect(() => {
     let mounted = true;
+    // Listen for session-cleared events emitted by auth-client when the token expires
     function handleSessionCleared(): void {
       if (!mounted) return;
-      setIdentity(null);
       setStatus("signed-out");
     }
     window.addEventListener(AUTH_SESSION_CLEARED_EVENT, handleSessionCleared);
     fetchIdentity()
-      .then((result) => {
+      .then(() => {
         if (!mounted) return;
-        setIdentity(result);
         setStatus("signed-in");
       })
       .catch(() => {
         if (!mounted) return;
         clearStoredToken();
-        setIdentity(null);
         setStatus("signed-out");
       });
     return () => {
@@ -284,31 +275,13 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
   if (status === "signed-out") {
     return (
       <LoginPanel
-        onSignedIn={(result) => {
-          setIdentity(result);
+        onSignedIn={() => {
           setStatus("signed-in");
         }}
       />
     );
   }
 
-  return (
-    <>
-      <div className="session-banner">
-        Signed in as <strong>{identity?.userId ?? "unknown"}</strong> ({(identity?.roles ?? []).join(", ") || "viewer"})
-        <button
-          type="button"
-          onClick={() => {
-            clearStoredToken();
-            setIdentity(null);
-            setStatus("signed-out");
-            router.refresh();
-          }}
-        >
-          Sign Out
-        </button>
-      </div>
-      {children}
-    </>
-  );
+  // Session banner removed — sign-out is handled in NavigationSidebar footer
+  return <>{children}</>;
 }

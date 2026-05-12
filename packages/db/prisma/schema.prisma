@@ -31,42 +31,43 @@ model PlatformLog {
 // in Vault at:
 //   secret/data/platform/users/{ownerId}/sources/{id}
 model RagKnowledgeBase {
-  id            String   @id @default(cuid())
-  name          String
-  description   String?
+  id          String  @id @default(cuid())
+  name        String
+  description String?
 
   // Document source configuration (non-secret — credentials go in Vault)
-  sourceType    String   // "github" | "gitlab" | "googledrive" | "web" | "upload"
-  sourceUrl     String   // Repo URL, Drive folder URL, web URL, or "manual"
-  sourceBranch  String?   // For git sources: "main", "master"
-  sourcePath    String?   // Optional subfolder filter: "docs/" (legacy, kept for compat)
-  sourcePaths   String[]  @default([]) // Array of subfolder filters (e.g. ["docs/operations", "docs/architecture"])
-  syncSchedule  String?   // Cron expression or null (manual only). e.g. "0 */6 * * *"
+  sourceType   String // "github" | "gitlab" | "googledrive" | "web" | "upload"
+  sourceUrl    String // Repo URL, Drive folder URL, web URL, or "manual"
+  sourceBranch String? // For git sources: "main", "master"
+  sourcePath   String? // Optional subfolder filter: "docs/" (legacy, kept for compat)
+  sourcePaths  String[] @default([]) // Array of subfolder filters (e.g. ["docs/operations", "docs/architecture"])
+  syncSchedule String? // Cron expression or null (manual only). e.g. "0 */6 * * *"
 
   // Dify app config (non-secret — API key goes in Vault)
-  difyAppUrl    String   @default("http://dify-api:5001")
-  difyDatasetId String?  // Dify Knowledge Base dataset ID (set after first sync)
+  difyAppUrl    String  @default("http://dify-api:5001")
+  difyDatasetId String? // Dify Knowledge Base dataset ID (set after first sync)
 
   // Ownership — every KB has an owner (Keycloak preferred_username)
   // No global scope: admins own KBs and share them explicitly via RagKbShare
-  ownerId       String   // Keycloak preferred_username of the creator
-  ownerUsername String   // Display username (matches ownerId; kept separate for auditability)
-  isDefault     Boolean  @default(false)   // User's personal default KB for new threads
-  createdById   String   // Same as ownerId at creation time
+  ownerId       String // Keycloak preferred_username of the creator
+  ownerUsername String // Display username (matches ownerId; kept separate for auditability)
+  isDefault     Boolean @default(false) // User's personal default KB for new threads
+  createdById   String // Same as ownerId at creation time
 
   // AI Agent prompt template linked to this KB (optional — falls back to platform default)
-  templateId    String?              // FK to SystemPromptTemplate
-  template      SystemPromptTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  templateId String? // FK to SystemPromptTemplate
+  template   SystemPromptTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
 
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   threads       RagDiscussionThread[]
   config        RagKnowledgeBaseConfig?
   syncJobs      RagKbSyncJob[]
   deployments   RagChannelDeployment[]
-  shares        RagKbShare[]           // Users this KB is shared with
-  trackedFiles  RagKbFileTracker[]     // Files successfully synced to Dify
+  slackMappings SlackDeploymentKb[]
+  shares        RagKbShare[] // Users this KB is shared with
+  trackedFiles  RagKbFileTracker[] // Files successfully synced to Dify
 
   @@index([ownerId])
   @@index([isDefault])
@@ -78,40 +79,41 @@ model RagKnowledgeBase {
 // Tracks which users a KB owner (or platform admin) has granted chat access to.
 // Shared users can query the KB but cannot edit, delete, or trigger syncs.
 model RagKbShare {
-  id                String           @id @default(cuid())
-  knowledgeBaseId   String
-  knowledgeBase     RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  id              String           @id @default(cuid())
+  knowledgeBaseId String
+  knowledgeBase   RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
 
-  sharedWithId      String           // Keycloak preferred_username of the recipient
-  sharedById        String           // Keycloak preferred_username of the granter (owner or admin)
-  permission        String           @default("chat")  // "chat" — extensible for future "write"
+  sharedWithId String // Keycloak preferred_username of the recipient
+  sharedById   String // Keycloak preferred_username of the granter (owner or admin)
+  permission   String @default("chat") // "chat" — extensible for future "write"
 
-  createdAt         DateTime         @default(now())
+  createdAt DateTime @default(now())
 
-  @@unique([knowledgeBaseId, sharedWithId])  // one share record per user per KB
+  @@unique([knowledgeBaseId, sharedWithId]) // one share record per user per KB
   @@index([sharedWithId])
   @@index([knowledgeBaseId])
 }
 
 // Per-KB configuration: admin sets platform defaults, users can override selectively.
 model RagKnowledgeBaseConfig {
-  id                String           @id @default(cuid())
-  knowledgeBaseId   String           @unique
-  knowledgeBase     RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  id              String           @id @default(cuid())
+  knowledgeBaseId String           @unique
+  knowledgeBase   RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
 
   // Admin-controlled platform defaults
-  systemPromptBase  String?  // Base system prompt template set by admin
-  llmModel          String?  // e.g. "gpt-4o-mini"
-  temperature       Float?   // 0.0 – 1.0, default 0.2
-  topK              Int?     // Number of chunks retrieved, default 6
+  systemPromptBase String? // Base system prompt template set by admin
+  llmModel         String? // e.g. "gpt-4o-mini"
+  temperature      Float? // 0.0 – 1.0, default 0.2
+  topK             Int? // Number of chunks retrieved, default 4
+  scoreThreshold   Float? // Minimum retrieval similarity score 0.0–1.0, default 0.4
 
   // User-customizable overrides (users can adjust these without admin)
-  responseStyle     String?  // "formal" | "casual" | "technical" | "friendly"
-  toneInstructions  String?  // Free-text: "Always be concise, use bullet points"
-  restrictionRules  String?  // "Only answer questions about topic X"
-  welcomeMessage    String?  // Custom greeting shown at chat start
+  responseStyle    String? // "formal" | "casual" | "technical" | "friendly"
+  toneInstructions String? // Free-text: "Always be concise, use bullet points"
+  restrictionRules String? // "Only answer questions about topic X"
+  welcomeMessage   String? // Custom greeting shown at chat start
 
-  updatedAt         DateTime @updatedAt
+  updatedAt DateTime @updatedAt
 
   @@index([knowledgeBaseId])
 }
@@ -119,15 +121,15 @@ model RagKnowledgeBaseConfig {
 // Tracks individual files that have been successfully synced to Dify.
 // Used for incremental syncing (skip unchanged, update changed, delete removed).
 model RagKbFileTracker {
-  id                String           @id @default(cuid())
-  knowledgeBaseId   String
-  knowledgeBase     RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  id              String           @id @default(cuid())
+  knowledgeBaseId String
+  knowledgeBase   RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
 
-  filePath          String           // Path in the repository (e.g. "docs/operations/runbook.md")
-  fileSha           String           // Git blob SHA (to detect modifications)
-  difyDocumentId    String           // The document ID in Dify (to perform update_by_text or delete)
+  filePath       String // Path in the repository (e.g. "docs/operations/runbook.md")
+  fileSha        String // Git blob SHA (to detect modifications)
+  difyDocumentId String // The document ID in Dify (to perform update_by_text or delete)
 
-  syncedAt          DateTime         @default(now())
+  syncedAt DateTime @default(now())
 
   @@unique([knowledgeBaseId, filePath])
   @@index([knowledgeBaseId])
@@ -136,59 +138,96 @@ model RagKbFileTracker {
 // Tracks each document sync job — used to show progress in the UI.
 // Created when a sync is triggered; updated by n8n webhook callbacks.
 model RagKbSyncJob {
-  id                String           @id @default(cuid())
-  knowledgeBaseId   String
-  knowledgeBase     RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  id              String           @id @default(cuid())
+  knowledgeBaseId String
+  knowledgeBase   RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
 
-  trigger           String           // "manual" | "scheduled" | "webhook"
-  triggeredById     String?          // userId who triggered (null = scheduled)
-  status            String           @default("pending") // "pending"|"running"|"completed"|"failed"
+  trigger       String // "manual" | "scheduled" | "webhook"
+  triggeredById String? // userId who triggered (null = scheduled)
+  status        String  @default("pending") // "pending"|"running"|"completed"|"failed"
 
   // Progress tracking (updated by n8n callbacks)
-  filesTotal        Int?
-  filesProcessed    Int              @default(0)
-  chunksTotal       Int?
-  chunksProcessed   Int              @default(0)
-  errorMessage      String?
+  filesTotal      Int?
+  filesProcessed  Int     @default(0)
+  chunksTotal     Int?
+  chunksProcessed Int     @default(0)
+  errorMessage    String?
 
   // n8n execution reference for traceability
-  n8nExecutionId    String?
-  n8nWebhookUrl     String?
+  n8nExecutionId String?
+  n8nWebhookUrl  String?
 
   // Dynamic workflow step tracking — populated by n8n progress callbacks
   // JSON array of: [{name, status, startedAt, completedAt, errorMessage, logRef}]
-  stepsJson         Json?
+  stepsJson Json?
 
-  startedAt         DateTime?
-  completedAt       DateTime?
-  createdAt         DateTime         @default(now())
-  lastProgressAt    DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  lastProgressAt DateTime?
 
   @@index([knowledgeBaseId, createdAt])
   @@index([status])
   @@index([triggeredById])
 }
 
-// Channel deployment — tracks where a KB is deployed for chat delivery.
-// Phase 2: n8n activates a pre-built workflow for each channel type.
+// Legacy channel deployment — tracks where a single KB is deployed through n8n.
+// Real-time Slack Phase 1 uses SlackDeployment below instead of this n8n stub.
 model RagChannelDeployment {
   id              String           @id @default(cuid())
   knowledgeBaseId String
   knowledgeBase   RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
 
-  channelType     String   // "slack" | "discord" | "whatsapp" | "telegram" | "google_chat"
-  channelName     String   // User-defined label: "My Company Slack"
-  n8nWorkflowId   String?  // n8n workflow ID (set after activation)
-  status          String   @default("pending") // "pending"|"active"|"error"|"disabled"
-  ownerId         String   // User who configured this channel
-  errorMessage    String?
+  channelType   String // "slack" | "discord" | "whatsapp" | "telegram" | "google_chat"
+  channelName   String // User-defined label: "My Company Slack"
+  n8nWorkflowId String? // n8n workflow ID (set after activation)
+  status        String  @default("pending") // "pending"|"active"|"error"|"disabled"
+  ownerId       String // User who configured this channel
+  errorMessage  String?
 
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([ownerId, channelType])
   @@index([knowledgeBaseId])
   @@index([status])
+}
+
+model SlackDeployment {
+  id                  String   @id @default(cuid())
+  ownerId             String
+  deploymentName      String
+  installMode         String   @default("oauth") // "oauth" | "manual"
+  slackWorkspaceId    String?
+  slackWorkspaceName  String?
+  slackBotUserId      String?
+  slackChannelId      String?
+  slackChannelName    String?
+  status              String   @default("pending") // "pending" | "active" | "error" | "disabled"
+  accessMode          String   @default("channel") // "channel" | "allowlist"
+  allowedSlackUserIds String[] @default([])
+  errorMessage        String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  kbMappings     SlackDeploymentKb[]
+  channelThreads ChannelChatThread[]
+
+  @@index([ownerId])
+  @@index([slackWorkspaceId])
+  @@index([status])
+}
+
+model SlackDeploymentKb {
+  id              String           @id @default(cuid())
+  deploymentId    String
+  deployment      SlackDeployment  @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  knowledgeBaseId String
+  knowledgeBase   RagKnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  @@unique([deploymentId, knowledgeBaseId])
+  @@index([deploymentId])
+  @@index([knowledgeBaseId])
 }
 
 // ─── AI Agent System Prompt Templates ───────────────────────────────────────
@@ -197,30 +236,30 @@ model RagChannelDeployment {
 // useradmin can create own templates and share with specific users.
 // Regular users see templates shared with them + built-ins.
 model SystemPromptTemplate {
-  id               String   @id @default(cuid())
-  name             String
-  description      String?
-  category         String   // "general" | "devops" | "developer" | "solution_architect" | "security" | "custom"
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  category    String // "general" | "devops" | "developer" | "solution_architect" | "security" | "custom"
 
   // Core prompt content
-  systemPromptBase  String   // Main role + domain + rules text
-  responseStyle     String?  // "formal" | "technical" | "casual" | "bullet_points" | "concise"
-  toneInstructions  String?  // "Always use bullet points..." etc.
-  restrictionRules  String?  // "Only answer questions about X..."
+  systemPromptBase String // Main role + domain + rules text
+  responseStyle    String? // "formal" | "technical" | "casual" | "bullet_points" | "concise"
+  toneInstructions String? // "Always use bullet points..." etc.
+  restrictionRules String? // "Only answer questions about X..."
 
   // Ownership & visibility
-  ownerId           String   // Keycloak preferred_username (or "platform" for built-ins)
-  ownerUsername     String   // Display name
-  isBuiltIn         Boolean  @default(false)  // Platform-seeded, visible to all, not editable by users
+  ownerId       String // Keycloak preferred_username (or "platform" for built-ins)
+  ownerUsername String // Display name
+  isBuiltIn     Boolean @default(false) // Platform-seeded, visible to all, not editable by users
 
   // Sharing: "private" = owner only; "all" = everyone; "specific" = listed users
-  shareScope        String   @default("private")
+  shareScope String @default("private")
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  shares            SystemPromptTemplateShare[]
-  knowledgeBases    RagKnowledgeBase[]
+  shares         SystemPromptTemplateShare[]
+  knowledgeBases RagKnowledgeBase[]
 
   @@index([ownerId])
   @@index([shareScope])
@@ -230,11 +269,11 @@ model SystemPromptTemplate {
 
 // Tracks which specific users a template is shared with (when shareScope = "specific")
 model SystemPromptTemplateShare {
-  id           String               @id @default(cuid())
-  templateId   String
-  template     SystemPromptTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  id         String               @id @default(cuid())
+  templateId String
+  template   SystemPromptTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
 
-  sharedWithId String  // Keycloak preferred_username of recipient
+  sharedWithId String // Keycloak preferred_username of recipient
   createdAt    DateTime @default(now())
 
   @@unique([templateId, sharedWithId])
@@ -246,28 +285,28 @@ model SystemPromptTemplateShare {
 // Sharing a KB does NOT share thread history — each user has their own sessions.
 // Multi-KB threads use RagDiscussionKbSession to track per-KB Dify conversation IDs.
 model RagDiscussionThread {
-  id                 String                   @id @default(cuid())
-  ownerId            String                   // Strict: only this user sees this thread
+  id      String @id @default(cuid())
+  ownerId String // Strict: only this user sees this thread
 
   // Optional link to a single knowledge base (kept for legacy compatibility)
-  knowledgeBaseId    String?
-  knowledgeBase      RagKnowledgeBase?        @relation(fields: [knowledgeBaseId], references: [id], onDelete: SetNull)
+  knowledgeBaseId String?
+  knowledgeBase   RagKnowledgeBase? @relation(fields: [knowledgeBaseId], references: [id], onDelete: SetNull)
 
   // Multi-KB sessions: one entry per KB selected for this thread
-  kbSessions         RagDiscussionKbSession[]
+  kbSessions RagDiscussionKbSession[]
 
   title              String
   // Legacy: Flowise session ID for pre-Dify threads
-  flowiseSessionId   String                   @unique
+  flowiseSessionId   String  @unique
   // Legacy single-KB Dify conversation ID (kept for backward compat)
   difyConversationId String?
 
-  lastMessageAt      DateTime
-  expiresAt          DateTime
-  createdAt          DateTime                 @default(now())
-  updatedAt          DateTime                 @updatedAt
+  lastMessageAt DateTime
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  messages           RagDiscussionMessage[]
+  messages RagDiscussionMessage[]
 
   @@index([ownerId, lastMessageAt])
   @@index([expiresAt])
@@ -277,13 +316,13 @@ model RagDiscussionThread {
 // Per-KB Dify session within a multi-KB discussion thread.
 // Each selected KB has its own Dify conversation_id for follow-up context continuity.
 model RagDiscussionKbSession {
-  id                  String              @id @default(cuid())
-  threadId            String
-  thread              RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  id       String              @id @default(cuid())
+  threadId String
+  thread   RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 
-  knowledgeBaseId     String
-  knowledgeBaseName   String              // Snapshot of KB name at session creation time
-  difyConversationId  String?             // Dify's conversation_id for this KB in this thread
+  knowledgeBaseId    String
+  knowledgeBaseName  String // Snapshot of KB name at session creation time
+  difyConversationId String? // Dify's conversation_id for this KB in this thread
 
   @@unique([threadId, knowledgeBaseId])
   @@index([threadId])
@@ -292,13 +331,60 @@ model RagDiscussionKbSession {
 // Discussion messages — stores both user questions and assistant answers.
 // For multi-KB responses, kbResults holds the per-KB labeled answers as JSON.
 model RagDiscussionMessage {
-  id         String              @id @default(cuid())
-  threadId   String
-  role       String              // "user" | "assistant"
-  content    String              // Combined/formatted content (all KBs merged for display)
-  kbResults  Json?               // Array: [{knowledgeBaseId, knowledgeBaseName, ownerUsername, answer}]
-  createdAt  DateTime            @default(now())
-  thread     RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  id        String              @id @default(cuid())
+  threadId  String
+  role      String // "user" | "assistant"
+  content   String // Combined/formatted content (all KBs merged for display)
+  kbResults Json? // Array: [{knowledgeBaseId, knowledgeBaseName, ownerUsername, answer}]
+  createdAt DateTime            @default(now())
+  thread    RagDiscussionThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 
   @@index([threadId, createdAt])
+}
+
+// Generic chat history shared across channel types (Slack, Telegram, Google Chat, Web).
+model ChannelChatThread {
+  id                  String           @id @default(cuid())
+  origin              String // "slack" | "telegram" | "google_chat" | "web"
+  externalThreadKey   String // deployment-scoped native thread ID
+  channelDeploymentId String? // SlackDeployment.id for Slack; nullable for future web reuse
+  channelDeployment   SlackDeployment? @relation(fields: [channelDeploymentId], references: [id], onDelete: Cascade)
+  externalUserId      String?
+  activeKbIds         String[]         @default([])
+  lastMessageAt       DateTime
+  expiresAt           DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  messages   ChannelChatMessage[]
+  kbSessions ChannelChatKbSession[]
+
+  @@unique([origin, channelDeploymentId, externalThreadKey])
+  @@index([channelDeploymentId])
+  @@index([origin, lastMessageAt])
+  @@index([expiresAt])
+}
+
+model ChannelChatMessage {
+  id        String            @id @default(cuid())
+  threadId  String
+  thread    ChannelChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  role      String // "user" | "assistant"
+  content   String
+  kbResults Json?
+  createdAt DateTime          @default(now())
+
+  @@index([threadId, createdAt])
+}
+
+model ChannelChatKbSession {
+  id                 String            @id @default(cuid())
+  threadId           String
+  thread             ChannelChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  knowledgeBaseId    String
+  knowledgeBaseName  String
+  difyConversationId String?
+
+  @@unique([threadId, knowledgeBaseId])
+  @@index([threadId])
 }

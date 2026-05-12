@@ -17,6 +17,8 @@ async function proxyRequest(request: NextRequest, path: string[]): Promise<NextR
     if (authorization) {
       headers.set("authorization", authorization);
     }
+    headers.set("x-forwarded-host", request.headers.get("x-forwarded-host") ?? request.headers.get("host") ?? "");
+    headers.set("x-forwarded-proto", request.headers.get("x-forwarded-proto") ?? "https");
     const contentType = request.headers.get("content-type");
     if (contentType) {
       headers.set("content-type", contentType);

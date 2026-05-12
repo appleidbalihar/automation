@@ -85,9 +85,9 @@ export function IntegrationsPage(): ReactElement {
     setIntegrations((prev) => prev.map((i) => (i.id === kbId ? { ...i, latestSyncJob: job } : i)));
   }, []);
 
-  const onMergeKbConfig = useCallback((kbId: string, config: KbConfig) => {
-    setIntegrations((prev) => prev.map((i) => (i.id === kbId ? { ...i, config: { ...(i.config ?? {}), ...config } } : i)));
-    setEditTarget((current) => (current?.id === kbId ? { ...current, config: { ...(current.config ?? {}), ...config } } : current));
+  const onMergeKbConfig = useCallback((kbId: string, config: KbConfig, template?: Pick<Integration, "templateId" | "templateName">) => {
+    setIntegrations((prev) => prev.map((i) => (i.id === kbId ? { ...i, ...template, config: { ...(i.config ?? {}), ...config } } : i)));
+    setEditTarget((current) => (current?.id === kbId ? { ...current, ...template, config: { ...(current.config ?? {}), ...config } } : current));
   }, []);
 
   // ── Create (PAT) ────────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ export function IntegrationsPage(): ReactElement {
         sourcePaths: filteredPaths.length > 0 ? filteredPaths : undefined,
         sourcePath: filteredPaths[0] ?? undefined,
         setDefault: form.setDefault,
-        systemPromptBase: form.systemPromptBase.trim() || undefined,
+        templateId: form.templateId || undefined,
         credentials: {
           githubToken: form.githubToken.trim() || undefined,
           gitlabToken: form.gitlabToken.trim() || undefined,
@@ -146,7 +146,7 @@ export function IntegrationsPage(): ReactElement {
         sourcePaths: filteredPaths.length > 0 ? filteredPaths : undefined,
         sourcePath: filteredPaths[0] ?? undefined,
         setDefault: form.setDefault,
-        systemPromptBase: form.systemPromptBase.trim() || undefined
+        templateId: form.templateId || undefined
       });
       // Save app credentials per-integration (after integration exists)
       if (appCredentials?.clientId || appCredentials?.clientSecret) {
@@ -598,7 +598,7 @@ export function IntegrationsPage(): ReactElement {
                 initialConfig={integrations.find((i) => i.id === promptTargetId)?.config}
                 templateId={integrations.find((i) => i.id === promptTargetId)?.templateId}
                 templateName={integrations.find((i) => i.id === promptTargetId)?.templateName}
-                onSaved={(config) => onMergeKbConfig(promptTargetId, config)}
+                onSaved={(config, template) => onMergeKbConfig(promptTargetId, config, template)}
               />
             </div>
           </div>

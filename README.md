@@ -1,6 +1,6 @@
-# Enterprise Automation Platform
+# RapidRAG — RAG-as-a-Service
 
-Microservice-based automation platform with execution checkpoint tracking and resume support.
+RapidRAG is a fully managed RAG-as-a-Service platform. Connect your docs, repos, and websites — and anyone on your team can ask questions in plain language and get real answers pulled straight from your own content. Deploy to Slack, Telegram, or WhatsApp in minutes. Run in the cloud or on-prem inside your own infrastructure.
 
 ## Quick start
 
@@ -8,7 +8,8 @@ Microservice-based automation platform with execution checkpoint tracking and re
 2. `corepack prepare pnpm@9.15.0 --activate`
 3. `pnpm install`
 4. `cp .env.example .env`
-5. `pnpm compose:up`
+5. `/home/bali/09_automationplatform/scripts/platform-containers.sh dev start`
+6. `ENVIRONMENT=dev bash scripts/seed-keycloak-platform-admin.sh`
 
 ## Access points (containerized, secure-only)
 
@@ -35,7 +36,7 @@ For containerized runtime, keep:
 ## Web Sign-In
 
 - The web app now uses Keycloak login directly from the UI (no manual token paste required).
-- Default seeded account: `platform-admin / admin123`
+- Default seeded account: `platform-admin` with the Vault-backed `platform_admin_password` from `platform/dev/infra/keycloak/config`.
 
 ## Current product surface
 

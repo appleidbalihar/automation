@@ -1,6 +1,6 @@
 # Web UI Operations Guide
 
-This guide describes the current RapidRAG web UI under `apps/web`.
+This guide describes the RapidRAG RAG-as-a-Service web UI under `apps/web`.
 
 ## Access
 

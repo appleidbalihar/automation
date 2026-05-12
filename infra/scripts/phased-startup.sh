@@ -14,9 +14,9 @@
 # between each phase. Containers within a phase start in parallel.
 #
 # STARTUP ORDER:
-#   Phase 1: Core infrastructure (vault, opensearch, isolated DBs, sandbox)
+#   Phase 1: Vault only (needed before runtime secrets can be generated)
 #   Phase 2: Vault agents + cert controller (all need vault running)
-#   Phase 3: Data stores + n8n + dify-migrate (need TLS certs from agents)
+#   Phase 3: Core infrastructure + data stores + n8n + dify-migrate
 #   Phase 4: DB migrations + dify-api/worker (need postgres healthy)
 #   Phase 5: Backend services + dify-web (need migrations complete)
 #   Phase 6: API gateway + web frontend + nginx ingress (last mile)
@@ -30,6 +30,76 @@ set -euo pipefail
 
 COMPOSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$COMPOSE_DIR"
+
+ENVIRONMENT="${ENVIRONMENT:-prod}"
+if [[ "$ENVIRONMENT" != "dev" && "$ENVIRONMENT" != "prod" ]]; then
+  echo "ERROR: ENVIRONMENT must be 'dev' or 'prod'" >&2
+  exit 1
+fi
+
+if [[ "$ENVIRONMENT" == "prod" ]]; then
+  BASE_ENV_FILE=".env.production"
+  OVERRIDE_FILE="docker-compose.prod.yml"
+else
+  BASE_ENV_FILE=".env"
+  OVERRIDE_FILE="docker-compose.dev.yml"
+fi
+
+RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-/run/platform-secrets/.env.${ENVIRONMENT}.runtime}"
+mkdir -p "$(dirname "$RUNTIME_ENV_FILE")"
+
+cleanup_runtime_env() {
+  if [[ -f "$RUNTIME_ENV_FILE" ]]; then
+    shred -u "$RUNTIME_ENV_FILE" >/dev/null 2>&1 || rm -f "$RUNTIME_ENV_FILE"
+  fi
+}
+trap cleanup_runtime_env EXIT
+
+write_placeholder_runtime_env() {
+  umask 077
+  cat > "$RUNTIME_ENV_FILE" <<'EOF'
+POSTGRES_USER=placeholder
+POSTGRES_PASSWORD=placeholder
+POSTGRES_DB=automation
+DATABASE_URL=postgresql://placeholder:placeholder@postgres:5432/automation
+REDIS_PASSWORD=placeholder
+REDIS_URL=redis://redis:6379
+RABBITMQ_DEFAULT_USER=placeholder
+RABBITMQ_DEFAULT_PASS=placeholder
+RABBITMQ_URL=amqp://placeholder:placeholder@rabbitmq:5672
+OPENSEARCH_INITIAL_ADMIN_PASSWORD=Placeholder123!
+OPENSEARCH_URL=http://opensearch:9200
+MINIO_ACCESS_KEY=placeholder
+MINIO_SECRET_KEY=placeholder
+KEYCLOAK_ADMIN_PASSWORD=placeholder
+KEYCLOAK_ADMIN_USERNAME=admin
+KEYCLOAK_CLIENT_SECRET=placeholder
+KEYCLOAK_PLATFORM_ADMIN_USERNAME=platform-admin
+KEYCLOAK_PLATFORM_ADMIN_PASSWORD=placeholder
+PLATFORM_OAUTH_SECRET=placeholder
+DIFY_SECRET_KEY=placeholder
+DIFY_DB_PASSWORD=placeholder
+DIFY_REDIS_PASSWORD=placeholder
+N8N_ENCRYPTION_KEY=placeholder
+N8N_DB_PASSWORD=placeholder
+N8N_WEBHOOK_TOKEN=placeholder
+EOF
+  chmod 600 "$RUNTIME_ENV_FILE"
+}
+
+load_runtime_env_from_vault() {
+  ENVIRONMENT="$ENVIRONMENT" OUTPUT_FILE="$RUNTIME_ENV_FILE" bash "$COMPOSE_DIR/scripts/generate-runtime-env.sh"
+}
+
+write_placeholder_runtime_env
+
+DOCKER_COMPOSE=(
+  docker compose
+  -f "$COMPOSE_DIR/docker-compose.yml"
+  -f "$COMPOSE_DIR/$OVERRIDE_FILE"
+  --env-file "$COMPOSE_DIR/$BASE_ENV_FILE"
+  --env-file "$RUNTIME_ENV_FILE"
+)
 
 # Color output for visibility in journalctl
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -140,19 +210,13 @@ wait_for_vault_bootstrap() {
 
 phase1() {
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  info "PHASE 1: Core Infrastructure (no dependencies)"
-  info "  Starting: vault, opensearch, dify-db, dify-redis, n8n-db, dify-sandbox"
+  info "PHASE 1: Vault (needed before runtime secrets can be generated)"
+  info "  Starting: vault"
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  docker compose up -d \
-    vault \
-    opensearch \
-    dify-db \
-    dify-redis \
-    n8n-db \
-    dify-sandbox
+  "${DOCKER_COMPOSE[@]}" up -d vault
 
-  log "Phase 1 containers started"
+  log "Phase 1 container started"
 
   # Gate: wait for vault to be ready before proceeding
   wait_for_vault 120
@@ -164,7 +228,7 @@ phase2() {
   info "  Starting: vault-bootstrap, all *-vault-agent sidecars, cert-rotation-controller"
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  docker compose up -d \
+  "${DOCKER_COMPOSE[@]}" up -d \
     vault-bootstrap \
     postgres-vault-agent \
     redis-vault-agent \
@@ -193,11 +257,16 @@ phase2() {
 
 phase3() {
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  info "PHASE 3: Data Stores + n8n + Dify Migration"
-  info "  Starting: postgres, redis, rabbitmq, minio, keycloak, n8n, dify-migrate"
+  info "PHASE 3: Core Infrastructure + Data Stores + n8n + Dify Migration"
+  info "  Starting: opensearch, dify-db, dify-redis, n8n-db, dify-sandbox, postgres, redis, rabbitmq, minio, keycloak, n8n, dify-migrate"
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  docker compose up -d \
+  "${DOCKER_COMPOSE[@]}" up -d \
+    opensearch \
+    dify-db \
+    dify-redis \
+    n8n-db \
+    dify-sandbox \
     postgres \
     redis \
     rabbitmq \
@@ -221,7 +290,7 @@ phase4() {
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
   # Run platform DB migration first
-  docker compose up -d db-migrate
+  "${DOCKER_COMPOSE[@]}" up -d db-migrate
   wait_for_container_exit 09_automationplatform-db-migrate-1 180
 
   # Wait for dify-migrate to complete (started in phase 3 alongside postgres)
@@ -230,7 +299,7 @@ phase4() {
   wait_for_container_exit 09_automationplatform-dify-migrate-1 720
 
   # Now start dify-api and dify-worker (migrations are done)
-  docker compose up -d dify-api dify-worker
+  "${DOCKER_COMPOSE[@]}" up -d dify-api dify-worker
 
   log "Phase 4 complete — migrations done, dify-api/worker starting"
 }
@@ -241,7 +310,7 @@ phase5() {
   info "  Starting: workflow-service, logging-service, dify-web"
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  docker compose up -d \
+  "${DOCKER_COMPOSE[@]}" up -d \
     workflow-service \
     logging-service \
     dify-web
@@ -259,7 +328,7 @@ phase6() {
   info "  Starting: api-gateway, web, web-ingress"
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  docker compose up -d \
+  "${DOCKER_COMPOSE[@]}" up -d \
     api-gateway \
     web \
     web-ingress
@@ -274,11 +343,14 @@ phase6() {
 info "============================================================"
 info "Automation Platform — Phased Startup"
 info "Working directory: $COMPOSE_DIR"
+info "Environment: $ENVIRONMENT"
 info "Starting from phase: $START_PHASE"
+info "Runtime env: $RUNTIME_ENV_FILE"
 info "============================================================"
 
 [[ "$START_PHASE" -le 1 ]] && phase1
 [[ "$START_PHASE" -le 2 ]] && phase2
+load_runtime_env_from_vault
 [[ "$START_PHASE" -le 3 ]] && phase3
 [[ "$START_PHASE" -le 4 ]] && phase4
 [[ "$START_PHASE" -le 5 ]] && phase5
@@ -287,4 +359,4 @@ info "============================================================"
 info "============================================================"
 log "ALL PHASES COMPLETE — Automation Platform is running"
 info "============================================================"
-docker compose ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null | head -40 || true
+"${DOCKER_COMPOSE[@]}" ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null | head -40 || true

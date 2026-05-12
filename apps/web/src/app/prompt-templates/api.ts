@@ -57,6 +57,6 @@ export async function generateTemplatePrompt(opts: {
   return requestJson("/rag/prompt-templates/generate", "POST", opts);
 }
 
-export async function applyTemplateToKb(kbId: string, templateId: string): Promise<{ applied: boolean; difyPromptUpdated: boolean }> {
+export async function applyTemplateToKb(kbId: string, templateId: string): Promise<{ applied: boolean; templateId: string; templateName?: string; difyPromptUpdated: boolean }> {
   return requestJson(`/rag/knowledge-bases/${kbId}/apply-template`, "POST", { templateId });
 }

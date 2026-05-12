@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import type { ReactElement } from "react";
 import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
+import { appPath } from "./web-paths";
 
 interface ManagedUser {
   id: string;
@@ -46,7 +47,7 @@ export function UsersAdminPanel(): ReactElement {
 
   async function requestJson<T>(url: string, method: "GET" | "POST" | "PATCH" | "DELETE", body?: unknown): Promise<T> {
     const authorization = authHeaderFromStoredToken();
-    const response = await fetch(url, {
+    const response = await fetch(appPath(url), {
       method,
       headers: {
         ...(authorization ? { authorization } : {}),

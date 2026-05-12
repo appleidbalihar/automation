@@ -11,6 +11,7 @@ import Redis from "ioredis";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { appendFile, mkdir } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import { connect as connectTls } from "node:tls";
 
 const config = loadConfig("api-gateway", 4000);
@@ -30,6 +31,24 @@ const tlsRuntime = createTlsRuntime({
 const app: any = Fastify({
   logger: false,
   https: tlsRuntime.getServerOptions()
+});
+
+app.addHook("preParsing", (request: any, _reply: any, payload: any, done: any) => {
+  const url = request.raw.url ?? "";
+  if (!url.startsWith("/slack/events")) return done(null, payload);
+  const pass = new PassThrough();
+  const chunks: Buffer[] = [];
+  payload.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+  payload.on("end", () => {
+    request.rawBody = Buffer.concat(chunks);
+  });
+  payload.on("error", (error: Error) => pass.destroy(error));
+  payload.pipe(pass);
+  done(null, pass);
+});
+
+app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_request: any, body: string, done: any) => {
+  done(null, Object.fromEntries(new URLSearchParams(String(body))));
 });
 
 type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -326,6 +345,12 @@ async function proxy(
   const headers: Record<string, string> = {
     "x-correlation-id": String(request.headers["x-correlation-id"] ?? "")
   };
+  if (request.headers["x-forwarded-host"] || request.headers.host) {
+    headers["x-forwarded-host"] = String(request.headers["x-forwarded-host"] ?? request.headers.host).split(",")[0].trim();
+  }
+  if (request.headers["x-forwarded-proto"]) {
+    headers["x-forwarded-proto"] = String(request.headers["x-forwarded-proto"]).split(",")[0].trim();
+  }
   if (request.auth?.userId) {
     headers["x-user-id"] = request.auth.userId;
     // x-user-name carries the same preferred_username for display purposes.
@@ -341,7 +366,8 @@ async function proxy(
 
   const init: RequestInit = {
     method,
-    headers
+    headers,
+    redirect: "manual"
   };
   // Only set content-type and body for requests that actually have a body.
   // DELETE requests without a body must NOT set content-type: application/json
@@ -355,6 +381,13 @@ async function proxy(
 
   try {
     const response = await tlsFetch(tlsRuntime, url, init);
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (location) {
+        reply.redirect(location, response.status);
+        return;
+      }
+    }
     const raw = await response.text();
     const payload = raw.length > 0 ? JSON.parse(raw) : {};
     reply.code(response.status).send(payload);
@@ -363,6 +396,45 @@ async function proxy(
       error: "UPSTREAM_UNAVAILABLE",
       target: url.toString(),
       details: error instanceof Error ? error.message : "Unknown upstream error"
+    });
+  }
+}
+
+async function proxyRawSlackRequest(request: any, reply: any, baseUrl: string, path: string): Promise<void> {
+  const url = new URL(path, baseUrl);
+  const rawBody = request.rawBody as Buffer | undefined;
+  const headers: Record<string, string> = {};
+  for (const name of [
+    "content-type",
+    "x-slack-signature",
+    "x-slack-request-timestamp",
+    "x-slack-retry-num",
+    "x-slack-retry-reason",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "host"
+  ]) {
+    const value = request.headers[name];
+    if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(",") : String(value);
+  }
+  try {
+    const response = await tlsFetch(tlsRuntime, url, {
+      method: "POST",
+      headers,
+      body: rawBody ?? Buffer.alloc(0)
+    } as any);
+    const raw = await response.text();
+    const contentType = response.headers.get("content-type") ?? "";
+    reply.code(response.status);
+    if (contentType.includes("application/json") && raw) {
+      reply.send(JSON.parse(raw));
+    } else {
+      reply.send(raw);
+    }
+  } catch (error) {
+    reply.code(502).send({
+      error: "UPSTREAM_UNAVAILABLE",
+      detail: error instanceof Error ? error.message : String(error)
     });
   }
 }
@@ -1223,6 +1295,43 @@ app.post("/rag/channels", { preHandler: requireAnyRole(["admin", "useradmin", "o
 app.delete("/rag/channels/:id", { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request, reply) => {
   const id = (request.params as { id: string }).id;
   await proxy(request, reply, "DELETE", config.workflowServiceUrl, `/rag/channels/${id}`);
+});
+
+// ─── Slack Bot Routes ───────────────────────────────────────────────────────
+for (const [method, path] of [
+  ["GET", "/slack/deployments"],
+  ["POST", "/slack/deployments"],
+  ["GET", "/slack/deployments/:id"],
+  ["PUT", "/slack/deployments/:id"],
+  ["DELETE", "/slack/deployments/:id"],
+  ["GET", "/slack/oauth/connect"],
+  ["POST", "/slack/deployments/:id/activate"],
+  ["POST", "/slack/deployments/:id/deactivate"],
+  ["POST", "/slack/validate-token"],
+  ["GET", "/channels/history/:deploymentId"],
+  ["GET", "/channels/history/:deploymentId/thread/:threadId"],
+  ["DELETE", "/channels/history/:deploymentId/thread/:threadId"],
+  ["DELETE", "/channels/history/:deploymentId"]
+] as Array<[HttpMethod, string]>) {
+  app[method.toLowerCase()](path, { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request: any, reply: any) => {
+    let upstreamPath = path;
+    for (const [key, value] of Object.entries(request.params ?? {})) {
+      upstreamPath = upstreamPath.replace(`:${key}`, encodeURIComponent(String(value)));
+    }
+    await proxy(request, reply, method, config.workflowServiceUrl, upstreamPath);
+  });
+}
+
+app.get("/slack/oauth/callback", async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/slack/oauth/callback");
+});
+
+app.post("/slack/events", async (request, reply) => {
+  await proxyRawSlackRequest(request, reply, config.workflowServiceUrl, "/slack/events");
+});
+
+app.post("/slack/events/:deploymentId", async (request, reply) => {
+  await proxyRawSlackRequest(request, reply, config.workflowServiceUrl, `/slack/events/${(request.params as any).deploymentId}`);
 });
 
 // ─── RAG Discussion Routes ────────────────────────────────────────────────────

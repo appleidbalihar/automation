@@ -95,6 +95,7 @@ services:
       - "6379:6379"
     volumes:
       - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis_data:/data
       - tls_redis:/tls:ro
     depends_on:
       redis-vault-agent:
@@ -122,6 +123,7 @@ services:
       - "5671:5671"
       - "15671:15671"
     volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
       - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
       - tls_rabbitmq:/tls:ro
     depends_on:
@@ -203,6 +205,7 @@ services:
     ports:
       - "8443:8443"
     volumes:
+      - keycloak_data:/opt/keycloak/data
       - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
       - tls_keycloak:/tls:ro
     depends_on:
@@ -586,6 +589,7 @@ services:
     volumes:
       - tls_dify_api:/tls:ro
       - dify_storage:/app/storage
+      - ./infra/dify/patches/word_extractor.py:/app/api/core/rag/extractor/word_extractor.py:ro
     ports:
       - "5001:5001"
     depends_on:
@@ -630,6 +634,7 @@ services:
     volumes:
       - tls_dify_api:/tls:ro
       - dify_storage:/app/storage
+      - ./infra/dify/patches/word_extractor.py:/app/api/core/rag/extractor/word_extractor.py:ro
     depends_on:
       dify-api-vault-agent:
         condition: service_started
@@ -727,6 +732,8 @@ services:
       WEBHOOK_URL: ${N8N_WEBHOOK_BASE_URL:-https://dev.eclassmanager.com/n8n/}
       N8N_USER_MANAGEMENT_DISABLED: "true"
       NODE_EXTRA_CA_CERTS: /tls/ca.pem
+      # Needed by Code nodes that build native multipart uploads for Dify files.
+      NODE_FUNCTION_ALLOW_BUILTIN: buffer,http,https,url
     ports:
       - "5679:5678"   # Admin UI on host:5679 for initial setup and template import
     volumes:
@@ -743,8 +750,11 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
+  rabbitmq_data:
   opensearch_data:
   minio_data:
+  keycloak_data:
   vault_data:
   tls_api_gateway:
   tls_workflow_service:

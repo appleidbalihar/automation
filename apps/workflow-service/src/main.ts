@@ -8,8 +8,12 @@ import type {
 import { prisma } from "@platform/db";
 import { logInfo } from "@platform/observability";
 import { createTlsRuntime, tlsFetch } from "@platform/tls-runtime";
+import { WebClient } from "@slack/web-api";
 import Fastify from "fastify";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import Redis from "ioredis";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { PassThrough } from "node:stream";
 import type { DifyProvisioningConfig } from "./dify-config.js";
 import {
   DEFAULT_WORKFLOW_IDS,
@@ -17,18 +21,18 @@ import {
   resolveDifyWorkflowId
 } from "./dify-config.js";
 import {
+  canModifyTemplate,
+  mapTemplateRow,
+  seedBuiltInTemplates,
+  visibleTemplatesWhere
+} from "./prompt-templates.js";
+import {
   buildRagThreadExpiry,
   deriveRagThreadTitle,
   mapRagDiscussionMessage,
   mapRagDiscussionSummary,
   mapRagDiscussionThread
 } from "./rag-chat.js";
-import {
-  canModifyTemplate,
-  mapTemplateRow,
-  seedBuiltInTemplates,
-  visibleTemplatesWhere
-} from "./prompt-templates.js";
 
 const config = loadConfig("workflow-service", 4001);
 const tlsRuntime = createTlsRuntime({
@@ -45,6 +49,57 @@ const tlsRuntime = createTlsRuntime({
   diagnosticsToken: config.securityDiagnosticsToken
 });
 const app = Fastify({ logger: false, https: tlsRuntime.getServerOptions() } as any);
+
+function tryReadFile(path: string): Buffer | undefined {
+  try {
+    return readFileSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+function createRedisClient(): Redis | null {
+  const url = String(process.env.REDIS_URL ?? "").trim();
+  if (!url) return null;
+  const tls = url.startsWith("rediss://") ? {
+    cert: tryReadFile(config.tlsCertPath),
+    key: tryReadFile(config.tlsKeyPath),
+    ca: tryReadFile(config.tlsCaPath),
+    rejectUnauthorized: false
+  } : undefined;
+  const client = new Redis(url, {
+    tls,
+    lazyConnect: true,
+    maxRetriesPerRequest: 2,
+    enableReadyCheck: false,
+    connectTimeout: 5000
+  });
+  client.on("error", (error) => logInfo("SLACK_REDIS_CLIENT_ERROR", {
+    service: "workflow-service",
+    error: error instanceof Error ? error.message : String(error)
+  }));
+  return client;
+}
+
+const redis = createRedisClient();
+
+app.addHook("preParsing", (request: any, _reply, payload, done) => {
+  const url = request.raw.url ?? "";
+  if (!url.startsWith("/slack/events")) return done(null, payload);
+
+  const pass = new PassThrough();
+  const chunks: Buffer[] = [];
+  payload.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+  payload.on("end", () => {
+    request.rawBody = Buffer.concat(chunks);
+  });
+  payload.on("error", (error) => pass.destroy(error));
+  payload.pipe(pass);
+  done(null, pass);
+});
+app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_request, body, done) => {
+  done(null, Object.fromEntries(new URLSearchParams(String(body))));
+});
 
 const VAULT_KV_MOUNT = String(process.env.VAULT_KV_MOUNT ?? "secret").trim() || "secret";
 function requesterUserId(headers: Record<string, unknown>): string {
@@ -137,6 +192,105 @@ async function readVaultKvMetadata(logicalPath: string): Promise<{ version: numb
   };
 }
 
+function slackDeploymentSecretPath(ownerId: string, deploymentId: string): string {
+  return `platform/users/${ownerId}/slack/${deploymentId}`;
+}
+
+async function readSlackGlobalSecret(key: "client_id" | "client_secret" | "signing_secret"): Promise<string> {
+  const data: Record<string, unknown> = await readVaultKv("platform/global/slack/oauth").catch(() => ({}));
+  const envName = key === "client_id" ? "SLACK_CLIENT_ID" : key === "client_secret" ? "SLACK_CLIENT_SECRET" : "SLACK_SIGNING_SECRET";
+  return String(data[key] ?? process.env[envName] ?? "").trim();
+}
+
+function safeString(input: unknown): string {
+  return String(input ?? "").trim();
+}
+
+function safeArray(input: unknown): string[] {
+  return Array.isArray(input) ? input.map((value) => String(value).trim()).filter(Boolean) : [];
+}
+
+function isPlaceholderSlackOAuthValue(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return !normalized || normalized.startsWith("dev-") || normalized.includes("placeholder") || normalized.includes("<");
+}
+
+function buildAbsoluteApiUrl(request: any, path: string): string {
+  const proto = String(request.headers["x-forwarded-proto"] ?? "https").split(",")[0].trim() || "https";
+  const forwardedHost = String(request.headers["x-forwarded-host"] ?? "").split(",")[0].trim();
+  const requestHost = String(request.headers.host ?? "").split(",")[0].trim();
+  const host = forwardedHost || (/^(workflow-service|api-gateway)(:|$)/i.test(requestHost) ? "" : requestHost);
+  return host ? `${proto}://${host}/rapidrag/api${path}` : `/rapidrag/api${path}`;
+}
+
+function signSlackState(payload: Record<string, unknown>, secret: string): string {
+  const json = JSON.stringify(payload);
+  const encoded = Buffer.from(json, "utf8").toString("base64url");
+  const sig = createHmac("sha256", secret).update(encoded).digest("base64url");
+  return `${encoded}.${sig}`;
+}
+
+function verifySlackState(state: string, secret: string): Record<string, unknown> | null {
+  const [encoded, sig] = state.split(".");
+  if (!encoded || !sig) return null;
+  const expected = createHmac("sha256", secret).update(encoded).digest("base64url");
+  const left = Buffer.from(sig);
+  const right = Buffer.from(expected);
+  if (left.length !== right.length || !timingSafeEqual(left, right)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as Record<string, unknown>;
+    const exp = Number(payload.exp ?? 0);
+    if (!exp || exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function verifySlackSignature(rawBody: Buffer, signingSecret: string, signature: string, timestamp: string): boolean {
+  if (!rawBody.length || !signingSecret || !signature || !timestamp) return false;
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts) || Math.abs(Math.floor(Date.now() / 1000) - ts) > 300) return false;
+  const base = `v0:${timestamp}:${rawBody.toString("utf8")}`;
+  const expected = `v0=${createHmac("sha256", signingSecret).update(base).digest("hex")}`;
+  const left = Buffer.from(signature);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+async function claimRedisKey(key: string, ttlSeconds: number): Promise<boolean> {
+  if (!redis) return true;
+  try {
+    const result = await redis.set(key, "1", "EX", ttlSeconds, "NX");
+    return result === "OK";
+  } catch (error) {
+    logInfo("SLACK_REDIS_DEDUP_UNAVAILABLE", {
+      service: "workflow-service",
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return true;
+  }
+}
+
+async function isSlackRateLimited(deploymentId: string): Promise<boolean> {
+  const perMinute = Math.max(1, Number(process.env.SLACK_WEBHOOK_RATE_LIMIT_PER_MINUTE ?? "30"));
+  const burst = Math.max(0, Number(process.env.SLACK_WEBHOOK_RATE_LIMIT_BURST ?? "10"));
+  if (!redis) return false;
+  try {
+    const key = `slack:ratelimit:${deploymentId}:${Math.floor(Date.now() / 60000)}`;
+    const count = await redis.incr(key);
+    if (count === 1) await redis.expire(key, 90);
+    return count > perMinute + burst;
+  } catch (error) {
+    logInfo("SLACK_RATE_LIMIT_UNAVAILABLE", {
+      service: "workflow-service",
+      deploymentId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return false;
+  }
+}
+
 async function listVaultChildren(prefix: string): Promise<string[]> {
   const response = await vaultCall("GET", `${VAULT_KV_MOUNT}/metadata/${prefix}?list=true`);
   if (response.status === 404) return [];
@@ -227,7 +381,10 @@ function normalizeSourceType(sourceType: string, sourceUrl?: string): string {
 
 function supportedDocumentPath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase();
-  return Boolean(ext && ["md", "markdown", "txt", "html", "htm", "xml", "csv", "pdf", "docx", "xlsx", "xls", "pptx", "ppt", "eml", "msg", "epub", "rst", "mdx"].includes(ext));
+  // Text path (create_by_text): md, markdown, txt, html, htm, xml, csv, rst, mdx
+  // Binary path (create_by_file, Dify standard ETL): pdf, docx, xlsx, xls
+  // pptx, ppt, eml, msg, epub require Dify Unstructured ETL (ETL_TYPE=Unstructured) — excluded
+  return Boolean(ext && ["md", "markdown", "txt", "html", "htm", "xml", "csv", "pdf", "docx", "xlsx", "xls", "rst", "mdx"].includes(ext));
 }
 
 function normalizeSourcePath(value: unknown): string | null {
@@ -693,12 +850,34 @@ async function createDifyDataset(session: DifyConsoleSession, name: string): Pro
   return datasetId;
 }
 
-async function configureDifyDatasetEmbedding(session: DifyConsoleSession, datasetId: string): Promise<void> {
+async function configureDifyDatasetEmbedding(
+  session: DifyConsoleSession,
+  datasetId: string,
+  kbConfig?: { topK?: number | null; scoreThreshold?: number | null } | null
+): Promise<void> {
   const existing = await difyConsoleFetch(session.baseUrl, `/datasets/${datasetId}`, {
     method: "GET",
     token: session.token
   });
   const dataset = existing.payload;
+
+  // Always push retrieval settings so score_threshold / top_k stay current
+  await difyConsoleFetch(session.baseUrl, `/datasets/${datasetId}`, {
+    method: "PATCH",
+    token: session.token,
+    body: {
+      retrieval_model: {
+        search_method: "hybrid_search",
+        reranking_enable: false,
+        top_k: kbConfig?.topK ?? 4,
+        score_threshold_enabled: true,
+        score_threshold: kbConfig?.scoreThreshold ?? 0.4
+      }
+    }
+  });
+
+  // Only re-send embedding config when it actually needs to change to avoid
+  // triggering unnecessary re-indexing on Dify's side.
   const indexingTechnique = nonEmptyString(dataset.indexing_technique) ?? "high_quality";
   const embeddingModel = nonEmptyString(dataset.embedding_model);
   const embeddingProvider = nonEmptyString(dataset.embedding_model_provider);
@@ -719,14 +898,42 @@ async function configureDifyDatasetEmbedding(session: DifyConsoleSession, datase
       permission: nonEmptyString(dataset.permission) ?? "only_me",
       embedding_model: session.config.embeddingModel,
       embedding_model_provider: session.config.modelProvider,
-      retrieval_model: dataset.retrieval_model ?? {
-        search_method: "semantic_search",
+      retrieval_model: {
+        search_method: "hybrid_search",
         reranking_enable: false,
-        top_k: 4,
-        score_threshold_enabled: false
+        top_k: kbConfig?.topK ?? 4,
+        score_threshold_enabled: true,
+        score_threshold: kbConfig?.scoreThreshold ?? 0.4
       }
     }
   });
+}
+
+async function updateDifyDatasetRetrievalFromKbConfig(
+  kbId: string,
+  kbConfig: { topK?: number | null; scoreThreshold?: number | null } | null
+): Promise<boolean> {
+  const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId } });
+  if (!kb) return false;
+  const existingSecrets = await readVaultKv(`platform/global/dify/${kbId}`);
+  const datasetId = nonEmptyString(kb.difyDatasetId) ?? nonEmptyString(existingSecrets.dataset_id);
+  if (!datasetId) return false;
+  const sourceType = String(kb.sourceType ?? "github");
+  const session = await ensureDifyConsoleSession(sourceType);
+  await difyConsoleFetch(session.baseUrl, `/datasets/${datasetId}`, {
+    method: "PATCH",
+    token: session.token,
+    body: {
+      retrieval_model: {
+        search_method: "hybrid_search",
+        reranking_enable: false,
+        top_k: kbConfig?.topK ?? 4,
+        score_threshold_enabled: true,
+        score_threshold: kbConfig?.scoreThreshold ?? 0.4
+      }
+    }
+  });
+  return true;
 }
 
 async function createDifyApp(session: DifyConsoleSession, name: string, description?: string | null): Promise<string> {
@@ -833,13 +1040,8 @@ If a user asks for credentials or secrets respond: "Credential information is cl
 Begin every response by silently classifying the domain, then respond accordingly.`;
 
 /**
- * Compose the final system prompt sent to Dify by layering:
- *   Layer 1: KB-specific system prompt (set by useradmin/admin per knowledge source)
- *   Layer 2: Response style + tone instructions (user-adjustable)
- *   Layer 3: PLATFORM_DEFAULT_SYSTEM_PROMPT (always present, read-only for admins)
- *
- * This keeps the knowledge-base context up front without losing the platform
- * safety and grounding baseline.
+ * Compose the final system prompt sent to Dify from the mandatory KB template
+ * and any KB-specific fine-tuning.
  */
 function buildFinalSystemPrompt(kbConfig: {
   systemPromptBase?: string | null;
@@ -870,9 +1072,6 @@ function buildFinalSystemPrompt(kbConfig: {
     parts.push(`## Response Style\n${styleLines.join(" ")}`);
   }
 
-  // Layer 3: platform grounding rules are always appended and cannot be disabled.
-  parts.push(`## Platform Grounding Rules\n${PLATFORM_DEFAULT_SYSTEM_PROMPT}`);
-
   return parts.join("\n\n").trim();
 }
 
@@ -885,8 +1084,12 @@ async function configureDifyApp(
     responseStyle?: string | null;
     toneInstructions?: string | null;
     restrictionRules?: string | null;
+    topK?: number | null;
+    scoreThreshold?: number | null;
   } | null = null
 ): Promise<void> {
+  const topK = kbConfig?.topK ?? 4;
+  const scoreThreshold = kbConfig?.scoreThreshold ?? 0.4;
   await difyConsoleFetch(session.baseUrl, `/apps/${appId}/model-config`, {
     method: "POST",
     token: session.token,
@@ -908,6 +1111,12 @@ async function configureDifyApp(
       pre_prompt: buildFinalSystemPrompt(kbConfig),
       dataset_configs: {
         retrieval_model: "multiple",
+        reranking_enable: false,
+        reranking_model: { provider: "", model: "" },
+        weights: null,
+        top_k: topK,
+        score_threshold_enabled: true,
+        score_threshold: scoreThreshold,
         datasets: {
           strategy: "router",
           datasets: [
@@ -938,6 +1147,8 @@ async function updateDifyAppPromptFromKbConfig(kbId: string, kbConfig: {
   responseStyle?: string | null;
   toneInstructions?: string | null;
   restrictionRules?: string | null;
+  topK?: number | null;
+  scoreThreshold?: number | null;
 } | null): Promise<boolean> {
   const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId } });
   if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
@@ -1454,6 +1665,101 @@ async function sendToDify(
   // Extract token usage from Dify's metadata — used for observability/cost tracking
   const tokenUsage = extractDifyTokenUsage(payload);
   return { answer, conversationId, tokenUsage, timingMs: { vaultFetchMs, difyCallMs } };
+}
+
+// ─── H6: Output Gating / Output Validation ───────────────────────────────────
+// Scans every LLM answer for leaked secrets and prompt-injection markers before
+// it is stored in the DB or returned to the user / Slack.
+// To disable temporarily: set OUTPUT_GATING_ENABLED=false in the service env.
+const OUTPUT_GATING_ENABLED = String(process.env.OUTPUT_GATING_ENABLED ?? "true").trim().toLowerCase() !== "false";
+
+const _SECRET_PATTERNS: RegExp[] = [
+  /(sk-[a-zA-Z0-9_-]{10,})/g,
+  /(ghp_[a-zA-Z0-9_-]{10,})/g,
+  /(glpat-[a-zA-Z0-9_-]{10,})/g,
+  /(xox[baprs]-[a-zA-Z0-9_-]{10,})/g,
+];
+
+const _INJECTION_MARKERS: RegExp[] = [
+  /ignore (all )?(previous|prior) instructions/i,
+  /disregard (your|the) (previous|prior|system)/i,
+  /you are now in (unrestricted|developer|jailbreak)/i,
+  /act as (a|an) (different|new|unrestricted|evil|uncensored)/i,
+];
+
+function validateLlmOutput(answer: string, kbId: string, context: { threadId?: string }): {
+  safe: boolean;
+  sanitized: string;
+  flags: string[];
+} {
+  if (!OUTPUT_GATING_ENABLED) return { safe: true, sanitized: answer, flags: [] };
+  const flags: string[] = [];
+  let sanitized = answer;
+
+  // Check for secret patterns — redact if found
+  for (const pattern of _SECRET_PATTERNS) {
+    if (pattern.test(answer)) {
+      flags.push("SECRET_PATTERN_DETECTED");
+      sanitized = sanitized.replace(pattern, "[SECRET REDACTED]");
+    }
+    pattern.lastIndex = 0; // Reset global regex state
+  }
+
+  // Check for prompt injection markers
+  for (const marker of _INJECTION_MARKERS) {
+    if (marker.test(answer)) {
+      flags.push("PROMPT_INJECTION_MARKER_DETECTED");
+      break; // One flag is enough for injection detection
+    }
+  }
+
+  if (flags.length > 0) {
+    // Log flags without exposing the answer content
+    void (prisma as any).platformLog.create({
+      data: {
+        severity: "WARN",
+        source: "workflow-service",
+        message: "output_gate_flag",
+        maskedPayload: {
+          kbId,
+          threadId: context.threadId ?? null,
+          flags,
+          answerLen: answer.length
+        }
+      }
+    }).catch(() => undefined);
+    logInfo("output_gate_flag", {
+      service: "workflow-service",
+      kbId,
+      threadId: context.threadId ?? null,
+      flags
+    });
+  }
+
+  const safe = !flags.includes("PROMPT_INJECTION_MARKER_DETECTED");
+  return { safe, sanitized, flags };
+}
+
+// ─── H5: Post-Retrieval Authorization Helper ──────────────────────────────────
+// Returns the IDs of all KBs the requesting user can access (own or shared-with).
+// Call this before fanning out to Dify to re-check permissions mid-session,
+// catching cases where a KB share was revoked after the thread was created.
+async function getAccessibleKbIds(userId: string, isPrivileged: boolean): Promise<string[]> {
+  if (isPrivileged) {
+    const all = await (prisma as any).ragKnowledgeBase.findMany({ select: { id: true } });
+    return all.map((kb: { id: string }) => kb.id);
+  }
+  const sharedRows = await (prisma as any).ragKbShare.findMany({
+    where: { sharedWithId: userId },
+    select: { knowledgeBaseId: true }
+  });
+  const sharedIds = sharedRows.map((s: { knowledgeBaseId: string }) => s.knowledgeBaseId);
+  const owned = await (prisma as any).ragKnowledgeBase.findMany({
+    where: { ownerId: userId },
+    select: { id: true }
+  });
+  const ownedIds = owned.map((kb: { id: string }) => kb.id);
+  return [...new Set([...ownedIds, ...sharedIds])];
 }
 
 function isDifyConversationNotFound(raw: string): boolean {
@@ -2092,7 +2398,33 @@ async function appendRagDiscussionMessage(
       ? [legacyRequestedId]
       : fallbackThreadIds;
 
-  const knowledgeBases = await resolveVisibleKnowledgeBasesForDiscussion(ownerId, headers, requestedIds);
+  // ── H5: Post-Retrieval Authorization ────────────────────────────────────────
+  // Re-check which KBs the user still has access to before sending to Dify.
+  // This catches mid-session share revocations — the KB list was filtered at thread
+  // creation time, but shares can be revoked between thread creation and message send.
+  const resolvedKnowledgeBases = await resolveVisibleKnowledgeBasesForDiscussion(ownerId, headers, requestedIds);
+  const accessibleIds = await getAccessibleKbIds(ownerId, isPlatformAdmin(headers));
+  const accessibleIdSet = new Set(accessibleIds);
+  const droppedKbs = resolvedKnowledgeBases.filter((kb) => !accessibleIdSet.has(kb.id));
+  if (droppedKbs.length > 0) {
+    logInfo("post_retrieval_auth_drop", {
+      service: "workflow-service",
+      threadId,
+      userId: ownerId,
+      droppedKbIds: droppedKbs.map((kb) => kb.id)
+    });
+    void (prisma as any).platformLog.create({
+      data: {
+        severity: "WARN",
+        source: "workflow-service",
+        message: "post_retrieval_auth_drop",
+        maskedPayload: { threadId, userId: ownerId, droppedKbIds: droppedKbs.map((kb) => kb.id) }
+      }
+    }).catch(() => undefined);
+  }
+  const knowledgeBases = resolvedKnowledgeBases.filter((kb) => accessibleIdSet.has(kb.id));
+  // ────────────────────────────────────────────────────────────────────────────
+
   if (knowledgeBases.length === 0) {
     throw new Error(requestedIds?.length ? "KNOWLEDGE_BASE_NOT_VISIBLE" : "OPERATIONS_AI_NOT_CONFIGURED");
   }
@@ -2120,11 +2452,15 @@ async function appendRagDiscussionMessage(
         knowledgeBase.difyAppUrl,
         ownerId
       );
+      // ── H6: Output Gating — scan answer before storing or returning ─────────
+      const gateResult = validateLlmOutput(result.answer, knowledgeBase.id, { threadId });
+      const finalAnswer = gateResult.safe ? gateResult.sanitized : "The knowledge base returned a response that could not be safely displayed. Please rephrase your question.";
+      // ────────────────────────────────────────────────────────────────────────
       kbResults.push({
         knowledgeBaseId: knowledgeBase.id,
         knowledgeBaseName: knowledgeBase.name,
         ownerUsername: knowledgeBase.ownerUsername ?? undefined,
-        answer: result.answer
+        answer: finalAnswer
       });
       sessionUpdates.push({
         knowledgeBaseId: knowledgeBase.id,
@@ -2356,6 +2692,8 @@ async function buildIntegrationResponse(
     isDefault: String(userConfig.default_kb_id ?? "").trim() === kb.id,
     latestSyncJob: Array.isArray(kb.syncJobs) ? kb.syncJobs[0] ?? null : null,
     config: kb.config ?? null,
+    templateId: kb.templateId ?? null,
+    templateName: kb.template?.name ?? null,
     authMethod,
     oauthAppConfigured,
     oauthClientIdLast4
@@ -2367,7 +2705,7 @@ async function getVisibleKnowledgeBases(userId: string, isPrivileged: boolean) {
   // Regular users see: KBs they own + KBs explicitly shared with them via RagKbShare.
   if (isPrivileged) {
     return (prisma as any).ragKnowledgeBase.findMany({
-      include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }, shares: true },
+      include: { template: true, config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }, shares: true },
       orderBy: { createdAt: "desc" }
     });
   }
@@ -2384,7 +2722,7 @@ async function getVisibleKnowledgeBases(userId: string, isPrivileged: boolean) {
         { id: { in: sharedIds } }
       ]
     },
-    include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }, shares: { where: { sharedWithId: userId } } },
+    include: { template: true, config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }, shares: { where: { sharedWithId: userId } } },
     orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }]
   });
 }
@@ -2696,6 +3034,7 @@ app.get("/rag/integrations", async (request) => {
   const ownedKbs = await prisma.ragKnowledgeBase.findMany({
     where: { ownerId: userId },
     include: {
+      template: true,
       config: true,
       syncJobs: {
         orderBy: { createdAt: "desc" },
@@ -2725,6 +3064,7 @@ app.post("/rag/integrations", async (request, reply) => {
     toneInstructions?: string;
     restrictionRules?: string;
     systemPromptBase?: string;
+    templateId?: string;
   };
 
   const name = nonEmptyString(body.name);
@@ -2736,6 +3076,11 @@ app.post("/rag/integrations", async (request, reply) => {
   const sourceSecrets = buildSourceSecretPayload(sourceType, body.credentials);
   const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
   const sourcePaths = normalizeSourcePaths(body.sourcePaths, body.sourcePath);
+  const templateId = nonEmptyString(body.templateId);
+  const template = templateId
+    ? await (prisma as any).systemPromptTemplate.findUnique({ where: { id: templateId } })
+    : null;
+  if (templateId && !template) return reply.code(404).send({ error: "TEMPLATE_NOT_FOUND" });
 
   try {
     const kb = await (prisma as any).ragKnowledgeBase.create({
@@ -2752,9 +3097,11 @@ app.post("/rag/integrations", async (request, reply) => {
         ownerId: userId,
         ownerUsername: requesterUserName(headers),
         isDefault: false,
-        createdById: userId
+        createdById: userId,
+        templateId: template?.id ?? null
       },
       include: {
+        template: true,
         config: true,
         syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
       }
@@ -2769,14 +3116,24 @@ app.post("/rag/integrations", async (request, reply) => {
       n8n_workflow_id: defaults.workflowId
     });
 
-    if (body.systemPromptBase || body.responseStyle || body.toneInstructions || body.restrictionRules) {
-      await (prisma as any).ragKnowledgeBaseConfig.create({
-        data: {
-          knowledgeBaseId: kb.id,
+    const configPatch = template
+      ? {
+          systemPromptBase: template.systemPromptBase ?? null,
+          responseStyle: template.responseStyle ?? null,
+          toneInstructions: template.toneInstructions ?? null,
+          restrictionRules: template.restrictionRules ?? null
+        }
+      : {
           systemPromptBase: body.systemPromptBase ?? null,
           responseStyle: body.responseStyle ?? null,
           toneInstructions: body.toneInstructions ?? null,
           restrictionRules: body.restrictionRules ?? null
+        };
+    if (template || body.systemPromptBase || body.responseStyle || body.toneInstructions || body.restrictionRules) {
+      await (prisma as any).ragKnowledgeBaseConfig.create({
+        data: {
+          knowledgeBaseId: kb.id,
+          ...configPatch
         }
       });
     }
@@ -2805,6 +3162,7 @@ app.post("/rag/integrations", async (request, reply) => {
     const reloaded = await (prisma as any).ragKnowledgeBase.findUnique({
       where: { id: kb.id },
       include: {
+        template: true,
         config: true,
         syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
       }
@@ -2861,6 +3219,7 @@ app.patch("/rag/integrations/:id", async (request, reply) => {
         ...(body.syncSchedule !== undefined ? { syncSchedule: body.syncSchedule || null } : {})
       },
       include: {
+        template: true,
         config: true,
         syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
       }
@@ -2939,6 +3298,7 @@ app.patch("/rag/integrations/:id", async (request, reply) => {
     const reloaded = await (prisma as any).ragKnowledgeBase.findUnique({
       where: { id },
       include: {
+        template: true,
         config: true,
         syncJobs: { orderBy: { createdAt: "desc" }, take: 1 }
       }
@@ -3123,7 +3483,7 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
 
     const reloaded = await (prisma as any).ragKnowledgeBase.findUnique({
       where: { id: kb.id },
-      include: { config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 } }
+      include: { template: true, config: true, syncJobs: { orderBy: { createdAt: "desc" }, take: 1 } }
     });
     return reply.code(201).send(await buildIntegrationResponse(reloaded, userId));
   } catch (error) {
@@ -3155,8 +3515,11 @@ app.patch("/rag/knowledge-bases/:id/config", async (request, reply) => {
     ...(body.systemPromptBase !== undefined ? { systemPromptBase: nonEmptyString(body.systemPromptBase) ?? null } : {}),
     ...(body.responseStyle !== undefined ? { responseStyle: nonEmptyString(body.responseStyle) ?? null } : {}),
     ...(body.toneInstructions !== undefined ? { toneInstructions: nonEmptyString(body.toneInstructions) ?? null } : {}),
-    ...(body.restrictionRules !== undefined ? { restrictionRules: nonEmptyString(body.restrictionRules) ?? null } : {})
+    ...(body.restrictionRules !== undefined ? { restrictionRules: nonEmptyString(body.restrictionRules) ?? null } : {}),
+    ...(body.topK !== undefined ? { topK: typeof body.topK === "number" ? Math.min(20, Math.max(1, body.topK)) : null } : {}),
+    ...(body.scoreThreshold !== undefined ? { scoreThreshold: typeof body.scoreThreshold === "number" ? Math.min(0.9, Math.max(0.1, body.scoreThreshold)) : null } : {})
   };
+  const retrievalChanged = body.topK !== undefined || body.scoreThreshold !== undefined;
   try {
     const updated = await (prisma as any).ragKnowledgeBaseConfig.upsert({
       where: { knowledgeBaseId: id },
@@ -3168,6 +3531,9 @@ app.patch("/rag/knowledge-bases/:id/config", async (request, reply) => {
     let difyPromptError: string | undefined;
     try {
       difyPromptUpdated = await updateDifyAppPromptFromKbConfig(id, updated);
+      if (retrievalChanged) {
+        await updateDifyDatasetRetrievalFromKbConfig(id, updated);
+      }
     } catch (error) {
       difyPromptError = error instanceof Error ? error.message : String(error);
       logInfo("dify_prompt_update_failed", {
@@ -3379,12 +3745,17 @@ app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
     const sourcePathsArr = normalizeSourcePaths(kb.sourcePaths, basePathStr);
 
     const validCurrentFiles = new Map<string, { path: string; sha: string }>();
+    const skippedUnsupported: { path: string; ext: string }[] = [];
 
     for (const item of tree) {
       const path = String(item.path ?? "");
       const sha = String(item.sha ?? "");
 
-      if (item.type !== "blob" || !supportedDocumentPath(path) || !matchesSourcePaths(path, basePathStr, sourcePathsArr)) {
+      if (item.type !== "blob" || !matchesSourcePaths(path, basePathStr, sourcePathsArr)) {
+        continue;
+      }
+      if (!supportedDocumentPath(path)) {
+        skippedUnsupported.push({ path, ext: path.split(".").pop()?.toLowerCase() ?? "" });
         continue;
       }
       validCurrentFiles.set(path, { path, sha });
@@ -3511,7 +3882,7 @@ app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
       data: { filesTotal: filesToUpload.length }
     });
 
-    return { ok: true, files: filesToUpload };
+    return { ok: true, files: filesToUpload, skippedFiles: skippedUnsupported };
 
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -3892,6 +4263,634 @@ app.delete("/rag/channels/:id", async (request, reply) => {
   if (deleted.count === 0) return reply.code(404).send({ error: "CHANNEL_NOT_FOUND" });
   return { deleted: true };
 });
+
+function mapSlackDeployment(row: any, request?: any) {
+  const path = row.installMode === "manual" ? `/slack/events/${row.id}` : "/slack/events";
+  return {
+    id: row.id,
+    deploymentName: row.deploymentName,
+    installMode: row.installMode,
+    slackWorkspaceId: row.slackWorkspaceId ?? undefined,
+    slackWorkspaceName: row.slackWorkspaceName ?? undefined,
+    slackBotUserId: row.slackBotUserId ?? undefined,
+    slackChannelId: row.slackChannelId ?? undefined,
+    slackChannelName: row.slackChannelName ?? undefined,
+    status: row.status,
+    accessMode: row.accessMode,
+    allowedSlackUserIds: row.allowedSlackUserIds ?? [],
+    errorMessage: row.errorMessage ?? undefined,
+    webhookUrl: request ? buildAbsoluteApiUrl(request, path) : path,
+    createdAt: row.createdAt?.toISOString?.() ?? String(row.createdAt),
+    updatedAt: row.updatedAt?.toISOString?.() ?? String(row.updatedAt),
+    kbMappings: (row.kbMappings ?? []).map((mapping: any) => ({
+      knowledgeBaseId: mapping.knowledgeBaseId,
+      knowledgeBaseName: mapping.knowledgeBase?.name ?? mapping.knowledgeBaseName ?? mapping.knowledgeBaseId
+    }))
+  };
+}
+
+function slackDeploymentInclude() {
+  return { kbMappings: { include: { knowledgeBase: true } } };
+}
+
+async function getSlackDeploymentToken(deployment: any): Promise<string> {
+  const secrets = await readVaultKv(slackDeploymentSecretPath(deployment.ownerId, deployment.id));
+  return safeString(secrets.bot_token);
+}
+
+async function validateSlackBotToken(botToken: string) {
+  const auth = await new WebClient(botToken).auth.test();
+  return {
+    workspaceId: safeString((auth as any).team_id),
+    workspaceName: safeString((auth as any).team),
+    botUserId: safeString((auth as any).bot_id || (auth as any).user_id)
+  };
+}
+
+app.get("/slack/deployments", async (request) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const rows = await (prisma as any).slackDeployment.findMany({
+    where: { ownerId },
+    include: slackDeploymentInclude(),
+    orderBy: { createdAt: "desc" }
+  });
+  return rows.map((row: any) => mapSlackDeployment(row, request));
+});
+
+app.post("/slack/deployments", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const body = (request.body ?? {}) as { deploymentName?: string; installMode?: string };
+  const deploymentName = safeString(body.deploymentName) || "Slack KB Bot";
+  const installMode = safeString(body.installMode) === "manual" ? "manual" : "oauth";
+  const row = await (prisma as any).slackDeployment.create({
+    data: { ownerId, deploymentName, installMode, status: "pending" },
+    include: slackDeploymentInclude()
+  });
+  return reply.code(201).send(mapSlackDeployment(row, request));
+});
+
+app.get("/slack/deployments/:id", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+  const row = await (prisma as any).slackDeployment.findFirst({
+    where: { id, ownerId },
+    include: slackDeploymentInclude()
+  });
+  if (!row) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  const missingActiveField = row.status === "active" && (!row.slackWorkspaceId || !row.slackWorkspaceName || !row.slackBotUserId || row.kbMappings.length === 0);
+  return { ...mapSlackDeployment(row, request), consistencyWarning: missingActiveField ? "ACTIVE_DEPLOYMENT_MISSING_REQUIRED_FIELDS" : undefined };
+});
+
+app.put("/slack/deployments/:id", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+  const body = (request.body ?? {}) as { deploymentName?: string; knowledgeBaseIds?: string[]; accessMode?: string; allowedSlackUserIds?: string[] };
+  const existing = await (prisma as any).slackDeployment.findFirst({ where: { id, ownerId } });
+  if (!existing) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  await (prisma as any).$transaction(async (tx: any) => {
+    if (Array.isArray(body.knowledgeBaseIds)) {
+      await tx.slackDeploymentKb.deleteMany({ where: { deploymentId: id } });
+      if (body.knowledgeBaseIds.length > 0) {
+        await tx.slackDeploymentKb.createMany({
+          data: body.knowledgeBaseIds.map((knowledgeBaseId) => ({ deploymentId: id, knowledgeBaseId })),
+          skipDuplicates: true
+        });
+      }
+    }
+    await tx.slackDeployment.update({
+      where: { id },
+      data: {
+        ...(body.deploymentName !== undefined ? { deploymentName: safeString(body.deploymentName) || existing.deploymentName } : {}),
+        ...(body.accessMode !== undefined ? { accessMode: safeString(body.accessMode) === "allowlist" ? "allowlist" : "channel" } : {}),
+        ...(body.allowedSlackUserIds !== undefined ? { allowedSlackUserIds: safeArray(body.allowedSlackUserIds) } : {})
+      }
+    });
+  });
+  const row = await (prisma as any).slackDeployment.findUnique({ where: { id }, include: slackDeploymentInclude() });
+  return mapSlackDeployment(row, request);
+});
+
+app.delete("/slack/deployments/:id", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+  const existing = await (prisma as any).slackDeployment.findFirst({ where: { id, ownerId }, select: { id: true } });
+  if (!existing) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  await (prisma as any).$transaction(async (tx: any) => {
+    await tx.channelChatThread.deleteMany({ where: { channelDeploymentId: id } });
+    await tx.slackDeployment.delete({ where: { id } });
+  });
+  return { deleted: true };
+});
+
+app.get("/slack/oauth/connect", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const deploymentId = safeString((request.query as any).deploymentId);
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id: deploymentId, ownerId, installMode: "oauth" } });
+  if (!deployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  const clientId = await readSlackGlobalSecret("client_id");
+  const clientSecret = await readSlackGlobalSecret("client_secret");
+  if (isPlaceholderSlackOAuthValue(clientId) || isPlaceholderSlackOAuthValue(clientSecret)) {
+    return reply.code(500).send({
+      error: "SLACK_OAUTH_NOT_CONFIGURED",
+      details: "Slack OAuth is not configured. Add real client_id, client_secret, and signing_secret at platform/global/slack/oauth, then retry Add to Slack."
+    });
+  }
+  const nonce = randomBytes(18).toString("hex");
+  const redirectUri = buildAbsoluteApiUrl(request, "/slack/oauth/callback");
+  const state = signSlackState({ deploymentId, ownerId, nonce, redirectUri, exp: Math.floor(Date.now() / 1000) + 600 }, clientSecret);
+  const claimed = await claimRedisKey(`slack:oauth:state:${nonce}`, 600);
+  if (!claimed) return reply.code(409).send({ error: "SLACK_OAUTH_STATE_CONFLICT" });
+  const url = new URL("https://slack.com/oauth/v2/authorize");
+  url.searchParams.set("client_id", clientId);
+  url.searchParams.set("scope", "chat:write,commands,im:history");
+  url.searchParams.set("redirect_uri", redirectUri);
+  url.searchParams.set("state", state);
+  return { url: url.toString() };
+});
+
+app.get("/slack/oauth/callback", async (request, reply) => {
+  const query = request.query as any;
+  const code = safeString(query.code);
+  const state = safeString(query.state);
+  const clientId = await readSlackGlobalSecret("client_id");
+  const clientSecret = await readSlackGlobalSecret("client_secret");
+  const signingSecret = await readSlackGlobalSecret("signing_secret");
+  const payload = clientSecret ? verifySlackState(state, clientSecret) : null;
+  if (!code || !payload || !signingSecret) return reply.code(400).send({ error: "INVALID_SLACK_OAUTH_CALLBACK" });
+  const nonce = safeString(payload.nonce);
+  if (redis) {
+    const used = await redis.del(`slack:oauth:state:${nonce}`);
+    if (!used) return reply.code(400).send({ error: "SLACK_OAUTH_STATE_REPLAYED" });
+  }
+  const ownerId = safeString(payload.ownerId);
+  const deploymentId = safeString(payload.deploymentId);
+  const redirectUri = safeString(payload.redirectUri) || buildAbsoluteApiUrl(request, "/slack/oauth/callback");
+  const response = await fetch("https://slack.com/api/oauth.v2.access", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri })
+  });
+  const oauth = (await response.json()) as any;
+  if (!oauth.ok) {
+    await (prisma as any).slackDeployment.updateMany({ where: { id: deploymentId, ownerId }, data: { status: "error", errorMessage: safeString(oauth.error) || "Slack OAuth failed" } });
+    return reply.redirect(`/rapidrag/chat-channels?slack_connected=false&deploymentId=${encodeURIComponent(deploymentId)}`);
+  }
+  await writeVaultKv(slackDeploymentSecretPath(ownerId, deploymentId), {
+    bot_token: oauth.access_token,
+    signing_secret: signingSecret
+  });
+  await (prisma as any).slackDeployment.updateMany({
+    where: { id: deploymentId, ownerId },
+    data: {
+      installMode: "oauth",
+      slackWorkspaceId: safeString(oauth.team?.id),
+      slackWorkspaceName: safeString(oauth.team?.name),
+      slackBotUserId: safeString(oauth.bot_user_id),
+      status: "pending",
+      errorMessage: null
+    }
+  });
+  return reply.redirect(`/rapidrag/chat-channels?slack_connected=true&deploymentId=${encodeURIComponent(deploymentId)}`);
+});
+
+app.post("/slack/validate-token", async (request, reply) => {
+  const botToken = safeString((request.body as any)?.botToken);
+  if (!botToken) return reply.code(400).send({ error: "BOT_TOKEN_REQUIRED" });
+  try {
+    return await validateSlackBotToken(botToken);
+  } catch {
+    return reply.code(400).send({ error: "INVALID_SLACK_BOT_TOKEN" });
+  }
+});
+
+app.post("/slack/deployments/:id/activate", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+  const body = (request.body ?? {}) as any;
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id, ownerId } });
+  if (!deployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  const knowledgeBaseIds = safeArray(body.knowledgeBaseIds);
+  if (knowledgeBaseIds.length === 0) return reply.code(400).send({ error: "ACTIVATION_FIELDS_REQUIRED" });
+
+  let tokenInfo = {
+    workspaceId: safeString(deployment.slackWorkspaceId),
+    workspaceName: safeString(deployment.slackWorkspaceName),
+    botUserId: safeString(deployment.slackBotUserId)
+  };
+  if (deployment.installMode === "manual") {
+    const botToken = safeString(body.botToken);
+    const signingSecret = safeString(body.signingSecret);
+    if (!botToken || !signingSecret) return reply.code(400).send({ error: "MANUAL_SLACK_SECRETS_REQUIRED" });
+    try {
+      tokenInfo = await validateSlackBotToken(botToken);
+      await writeVaultKv(slackDeploymentSecretPath(ownerId, id), { bot_token: botToken, signing_secret: signingSecret });
+    } catch {
+      await (prisma as any).slackDeployment.update({ where: { id }, data: { status: "error", errorMessage: "Invalid Slack bot token" } });
+      return reply.code(400).send({ error: "INVALID_SLACK_BOT_TOKEN" });
+    }
+  } else {
+    const secrets = await readVaultKv(slackDeploymentSecretPath(ownerId, id));
+    if (!safeString(secrets.bot_token) || !safeString(secrets.signing_secret) || !tokenInfo.workspaceId) {
+      return reply.code(400).send({ error: "SLACK_OAUTH_INSTALL_REQUIRED" });
+    }
+    const duplicate = await (prisma as any).slackDeployment.findFirst({
+      where: { id: { not: id }, installMode: "oauth", status: "active", slackWorkspaceId: tokenInfo.workspaceId }
+    });
+    if (duplicate) return reply.code(409).send({ error: "SLACK_WORKSPACE_ALREADY_ACTIVE" });
+  }
+
+  await (prisma as any).$transaction(async (tx: any) => {
+    await tx.slackDeploymentKb.deleteMany({ where: { deploymentId: id } });
+    await tx.slackDeploymentKb.createMany({
+      data: knowledgeBaseIds.map((knowledgeBaseId) => ({ deploymentId: id, knowledgeBaseId })),
+      skipDuplicates: true
+    });
+    await tx.slackDeployment.update({
+      where: { id },
+      data: {
+        slackWorkspaceId: tokenInfo.workspaceId,
+        slackWorkspaceName: tokenInfo.workspaceName,
+        slackBotUserId: tokenInfo.botUserId,
+        slackChannelId: null,
+        slackChannelName: null,
+        accessMode: safeString(body.accessMode) === "allowlist" ? "allowlist" : "channel",
+        allowedSlackUserIds: safeArray(body.allowedSlackUserIds),
+        status: "active",
+        errorMessage: null
+      }
+    });
+  });
+  const row = await (prisma as any).slackDeployment.findUnique({ where: { id }, include: slackDeploymentInclude() });
+  return mapSlackDeployment(row, request);
+});
+
+app.post("/slack/deployments/:id/deactivate", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+  const updated = await (prisma as any).slackDeployment.updateMany({ where: { id, ownerId }, data: { status: "disabled" } });
+  if (updated.count === 0) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  return { deactivated: true };
+});
+
+app.get("/channels/history/:deploymentId", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const deploymentId = (request.params as { deploymentId: string }).deploymentId;
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id: deploymentId, ownerId } });
+  if (!deployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  const limit = Math.min(Math.max(Number((request.query as any).limit ?? 50), 1), 100);
+  const cursor = safeString((request.query as any).cursor);
+  const rows = await (prisma as any).channelChatThread.findMany({
+    where: { channelDeploymentId: deploymentId, ...(cursor ? { lastMessageAt: { lt: new Date(cursor) } } : {}) },
+    orderBy: { lastMessageAt: "desc" },
+    take: limit + 1,
+    include: { _count: { select: { messages: true } } }
+  });
+  const page = rows.slice(0, limit);
+  return {
+    threads: page.map((row: any) => ({
+      id: row.id,
+      origin: row.origin,
+      externalThreadKey: row.externalThreadKey,
+      externalUserId: row.externalUserId ?? undefined,
+      activeKbIds: row.activeKbIds ?? [],
+      lastMessageAt: row.lastMessageAt.toISOString(),
+      expiresAt: row.expiresAt?.toISOString?.(),
+      messageCount: row._count?.messages ?? 0
+    })),
+    nextCursor: rows.length > limit ? page[page.length - 1]?.lastMessageAt.toISOString() : undefined
+  };
+});
+
+app.get("/channels/history/:deploymentId/thread/:threadId", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const { deploymentId, threadId } = request.params as { deploymentId: string; threadId: string };
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id: deploymentId, ownerId } });
+  if (!deployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  const thread = await (prisma as any).channelChatThread.findFirst({
+    where: { id: threadId, channelDeploymentId: deploymentId },
+    include: { messages: { orderBy: { createdAt: "asc" } }, kbSessions: true }
+  });
+  if (!thread) return reply.code(404).send({ error: "CHANNEL_THREAD_NOT_FOUND" });
+  return thread;
+});
+
+app.delete("/channels/history/:deploymentId/thread/:threadId", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const { deploymentId, threadId } = request.params as { deploymentId: string; threadId: string };
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id: deploymentId, ownerId } });
+  if (!deployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  const deleted = await (prisma as any).channelChatThread.deleteMany({ where: { id: threadId, channelDeploymentId: deploymentId } });
+  if (deleted.count === 0) return reply.code(404).send({ error: "CHANNEL_THREAD_NOT_FOUND" });
+  return { deleted: true };
+});
+
+app.delete("/channels/history/:deploymentId", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const deploymentId = (request.params as { deploymentId: string }).deploymentId;
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id: deploymentId, ownerId } });
+  if (!deployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  const deleted = await (prisma as any).channelChatThread.deleteMany({ where: { channelDeploymentId: deploymentId } });
+  return { deleted: deleted.count };
+});
+
+function isExplicitReset(text: string): boolean {
+  return /^(\/new|\/reset|\/clear|\/start)\b|(^|\b)(start over|new topic|new question|forget (that|previous|everything)|ignore previous|starting fresh|reset context)/i.test(text.trim());
+}
+
+function isFollowUpQuestion(previousQuestion: string, currentQuestion: string): boolean {
+  const current = currentQuestion.toLowerCase().trim();
+  const previous = previousQuestion.toLowerCase().trim();
+
+  // Explicit follow-up starters
+  if (/^(what about|and |also |similarly[,\s]|regarding that|following up|continuing with|and the|can you (also|more|further|explain|clarify|elaborate)|how about|tell me more|elaborate|clarify|what does (that|this|it)|why (is|does|did|would)|what (is|are|was|were) (that|this|it|those)|show me more|give me more|more (about|detail)|going back)/i.test(current)) return true;
+
+  // Back-references — pronouns/demonstratives that imply prior context
+  if (/\b(step \d+|point \d+|number \d+|the above|as mentioned|previous(ly)?|same command|same step)\b/i.test(current)) return true;
+  if (/^(explain|elaborate|clarify|expand on|more on|what about|tell me|show me|describe) (that|this|it|those|them|the above)\b/i.test(current)) return true;
+
+  // Keyword overlap — shared meaningful words between previous and current question
+  const stop = new Set(['what', 'how', 'when', 'where', 'why', 'who', 'which', 'is', 'are', 'was', 'were', 'the', 'a', 'an', 'to', 'for', 'of', 'in', 'on', 'at', 'by', 'do', 'does', 'did', 'can', 'could', 'would', 'should', 'will', 'have', 'has', 'had', 'be', 'been', 'being', 'get', 'got', 'with', 'from', 'about', 'into', 'through', 'please', 'need', 'want', 'tell', 'show', 'give', 'make', 'your', 'you', 'we', 'our', 'use', 'used', 'using', 'also', 'just', 'then', 'than', 'that', 'this', 'some', 'more', 'very']);
+  const keywords = (text: string) => text.split(/\W+/).filter(w => w.length > 3 && !stop.has(w));
+
+  const prevKw = new Set(keywords(previous));
+  const currKw = keywords(current);
+  if (prevKw.size === 0 || currKw.length === 0) return false;
+
+  const overlap = currKw.filter(w => prevKw.has(w)).length;
+  return (overlap / Math.max(currKw.length, 1)) >= 0.35;
+}
+
+async function pruneExpiredChannelChatThreads(): Promise<void> {
+  const expired = await (prisma as any).channelChatThread.findMany({
+    where: { expiresAt: { lt: new Date() } },
+    orderBy: { expiresAt: "asc" },
+    take: 1000,
+    select: { id: true }
+  });
+  if (expired.length === 0) return;
+  await (prisma as any).channelChatThread.deleteMany({ where: { id: { in: expired.map((row: any) => row.id) } } });
+}
+
+setInterval(() => {
+  pruneExpiredChannelChatThreads().catch((error) => logInfo("SLACK_CHANNEL_HISTORY_PRUNE_FAILED", {
+    service: "workflow-service",
+    error: error instanceof Error ? error.message : String(error)
+  }));
+}, 15 * 60 * 1000).unref();
+
+function getSlackTeamId(body: any): string {
+  return safeString(body.team_id ?? body.team?.id);
+}
+
+function getSlackChannelId(body: any): string {
+  return safeString(body.channel_id ?? body.event?.channel);
+}
+
+function getSlackUserId(body: any): string {
+  return safeString(body.user_id ?? body.event?.user);
+}
+
+async function postSlackReply(deployment: any, channelId: string, text: string, responseUrl?: string): Promise<void> {
+  if (responseUrl) {
+    await fetch(responseUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ response_type: "ephemeral", text })
+    });
+    return;
+  }
+  const token = await getSlackDeploymentToken(deployment);
+  await new WebClient(token).chat.postMessage({ channel: channelId, text });
+}
+
+async function handleSlackCommand(deployment: any, body: any): Promise<void> {
+  const teamId = getSlackTeamId(body);
+  const channelId = getSlackChannelId(body);
+  const userId = getSlackUserId(body);
+  const responseUrl = safeString(body.response_url);
+  const externalThreadKey = `${teamId}#${userId}`;
+  const text = safeString(body.text);
+  const [verb, ...rest] = text.split(/\s+/).filter(Boolean);
+  const kbMappings = deployment.kbMappings ?? [];
+  const allKbIds = kbMappings.map((mapping: any) => mapping.knowledgeBaseId);
+  const now = new Date();
+  const thread = await (prisma as any).channelChatThread.upsert({
+    where: { origin_channelDeploymentId_externalThreadKey: { origin: "slack", channelDeploymentId: deployment.id, externalThreadKey } },
+    create: {
+      origin: "slack",
+      channelDeploymentId: deployment.id,
+      externalThreadKey,
+      externalUserId: userId,
+      activeKbIds: allKbIds,
+      lastMessageAt: now,
+      expiresAt: new Date(now.getTime() + 30 * 60 * 1000)
+    },
+    update: { lastMessageAt: now, expiresAt: new Date(now.getTime() + 30 * 60 * 1000) }
+  });
+
+  if (!verb || verb === "help") {
+    await postSlackReply(deployment, channelId, "`/kb list`, `/kb use <name-or-number>`, `/kb all`, `/kb status`, `/kb reset`, or ask with `/kb <question>`.", responseUrl);
+    return;
+  }
+  if (verb === "list") {
+    const lines = kbMappings.map((mapping: any, index: number) => `${index + 1}. ${mapping.knowledgeBase?.name ?? mapping.knowledgeBaseId}`);
+    await postSlackReply(deployment, channelId, lines.length ? lines.join("\n") : "No knowledge bases are mapped to this Slack bot yet.", responseUrl);
+    return;
+  }
+  if (verb === "status") {
+    const active = kbMappings.filter((mapping: any) => (thread.activeKbIds ?? []).includes(mapping.knowledgeBaseId));
+    await postSlackReply(deployment, channelId, active.length ? `Active KBs: ${active.map((mapping: any) => mapping.knowledgeBase?.name ?? mapping.knowledgeBaseId).join(", ")}` : "No active KBs selected.", responseUrl);
+    return;
+  }
+  if (verb === "all") {
+    await (prisma as any).channelChatThread.update({ where: { id: thread.id }, data: { activeKbIds: allKbIds } });
+    await postSlackReply(deployment, channelId, "Using all mapped knowledge bases.", responseUrl);
+    return;
+  }
+  if (verb === "use") {
+    const selector = rest.join(" ").toLowerCase();
+    const selected = kbMappings.find((mapping: any, index: number) => String(index + 1) === selector || String(mapping.knowledgeBase?.name ?? "").toLowerCase() === selector);
+    if (!selected) {
+      await postSlackReply(deployment, channelId, "I couldn't find that knowledge base. Use `/kb list` to see available options.", responseUrl);
+      return;
+    }
+    await (prisma as any).channelChatThread.update({ where: { id: thread.id }, data: { activeKbIds: [selected.knowledgeBaseId] } });
+    await postSlackReply(deployment, channelId, `Using ${selected.knowledgeBase?.name ?? selected.knowledgeBaseId}.`, responseUrl);
+    return;
+  }
+  if (verb === "reset") {
+    await (prisma as any).channelChatKbSession.deleteMany({ where: { threadId: thread.id } });
+    await postSlackReply(deployment, channelId, "Conversation reset. Your next question will start a fresh context.", responseUrl);
+    return;
+  }
+
+  await handleSlackMessage(deployment, teamId, userId, channelId, text, responseUrl);
+}
+
+async function handleSlackMessage(deployment: any, slackTeamId: string, slackUserId: string, slackChannelId: string, text: string, responseUrl?: string): Promise<void> {
+  await pruneExpiredChannelChatThreads();
+  const externalThreadKey = `${slackTeamId}#${slackUserId}`;
+  const now = new Date();
+  const allKbIds = (deployment.kbMappings ?? []).map((mapping: any) => mapping.knowledgeBaseId);
+  const thread = await (prisma as any).channelChatThread.upsert({
+    where: { origin_channelDeploymentId_externalThreadKey: { origin: "slack", channelDeploymentId: deployment.id, externalThreadKey } },
+    create: {
+      origin: "slack",
+      channelDeploymentId: deployment.id,
+      externalThreadKey,
+      externalUserId: slackUserId,
+      activeKbIds: allKbIds,
+      lastMessageAt: now,
+      expiresAt: new Date(now.getTime() + 30 * 60 * 1000)
+    },
+    update: { lastMessageAt: now, expiresAt: new Date(now.getTime() + 30 * 60 * 1000) },
+    include: {
+      kbSessions: true,
+      messages: { where: { role: "user" }, orderBy: { createdAt: "desc" }, take: 1 }
+    }
+  });
+  const activeKbIds = (thread.activeKbIds?.length ? thread.activeKbIds : allKbIds) as string[];
+  const activeMappings = (deployment.kbMappings ?? []).filter((mapping: any) => activeKbIds.includes(mapping.knowledgeBaseId));
+  if (activeMappings.length === 0) {
+    await postSlackReply(deployment, slackChannelId, "No knowledge bases are mapped to this Slack bot yet.", responseUrl);
+    return;
+  }
+
+  const lastUserQuestion: string | null = thread.messages?.[0]?.content ?? null;
+  const isReset = isExplicitReset(text);
+  const isFollowUp = !isReset && lastUserQuestion ? isFollowUpQuestion(lastUserQuestion, text) : false;
+
+  await (prisma as any).channelChatMessage.create({ data: { threadId: thread.id, role: "user", content: text } });
+  const results: RagDiscussionKbResult[] = [];
+  for (const mapping of activeMappings) {
+    const kb = mapping.knowledgeBase;
+    const session = (thread.kbSessions ?? []).find((item: any) => item.knowledgeBaseId === mapping.knowledgeBaseId);
+    const conversationIdToUse = isFollowUp ? (session?.difyConversationId ?? null) : null;
+    try {
+      const result = await sendToDify(text, conversationIdToUse, mapping.knowledgeBaseId, kb?.difyAppUrl ?? "http://dify-api:5001", slackUserId);
+      // ── H6: Output Gating for Slack path ──────────────────────────────────
+      const slackGateResult = validateLlmOutput(result.answer, mapping.knowledgeBaseId, {});
+      const slackFinalAnswer = slackGateResult.safe ? slackGateResult.sanitized : "The knowledge base returned a response that could not be safely displayed. Please rephrase your question.";
+      // ────────────────────────────────────────────────────────────────────────
+      results.push({ knowledgeBaseId: mapping.knowledgeBaseId, knowledgeBaseName: kb?.name ?? mapping.knowledgeBaseId, ownerUsername: kb?.ownerUsername, answer: slackFinalAnswer });
+      await (prisma as any).channelChatKbSession.upsert({
+        where: { threadId_knowledgeBaseId: { threadId: thread.id, knowledgeBaseId: mapping.knowledgeBaseId } },
+        create: { threadId: thread.id, knowledgeBaseId: mapping.knowledgeBaseId, knowledgeBaseName: kb?.name ?? mapping.knowledgeBaseId, difyConversationId: result.conversationId },
+        update: { knowledgeBaseName: kb?.name ?? mapping.knowledgeBaseId, difyConversationId: result.conversationId }
+      });
+    } catch (error) {
+      results.push({ knowledgeBaseId: mapping.knowledgeBaseId, knowledgeBaseName: kb?.name ?? mapping.knowledgeBaseId, ownerUsername: kb?.ownerUsername, answer: "", error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  const hasAnswer = results.some((result) => result.answer.trim());
+  const answer = hasAnswer ? formatMultiKnowledgeBaseAnswer(results) : "Sorry, I couldn't reach the knowledge base right now. Please try again in a moment.";
+  await (prisma as any).channelChatMessage.create({ data: { threadId: thread.id, role: "assistant", content: answer, kbResults: results } });
+  if (!hasAnswer) {
+    const key = `slack:difyfail:${deployment.id}`;
+    const count = redis ? Number(await redis.incr(key)) : 1;
+    if (redis) await redis.expire(key, 300);
+    if (count >= 3) await (prisma as any).slackDeployment.update({ where: { id: deployment.id }, data: { status: "error", errorMessage: "Dify query failures detected in Slack bot" } });
+  }
+  await postSlackReply(deployment, slackChannelId, answer, responseUrl);
+}
+
+async function resolveSlackDeploymentForWebhook(request: any, body: any, deploymentId?: string): Promise<any | null> {
+  if (deploymentId) {
+    return (prisma as any).slackDeployment.findUnique({ where: { id: deploymentId }, include: slackDeploymentInclude() });
+  }
+  const teamId = getSlackTeamId(body);
+  return (prisma as any).slackDeployment.findFirst({
+    where: { installMode: "oauth", status: "active", slackWorkspaceId: teamId },
+    include: slackDeploymentInclude()
+  });
+}
+
+async function handleSlackWebhook(request: any, reply: any, deploymentId?: string) {
+  const rawBody = request.rawBody as Buffer | undefined;
+  const signature = safeString(request.headers["x-slack-signature"]);
+  const timestamp = safeString(request.headers["x-slack-request-timestamp"]);
+  let manualDeployment: any | null = null;
+  let signingSecret = "";
+  if (deploymentId) {
+    manualDeployment = await (prisma as any).slackDeployment.findUnique({ where: { id: deploymentId } });
+    if (!manualDeployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+    const secrets = await readVaultKv(slackDeploymentSecretPath(manualDeployment.ownerId, manualDeployment.id));
+    signingSecret = safeString(secrets.signing_secret);
+  } else {
+    signingSecret = await readSlackGlobalSecret("signing_secret");
+  }
+  if (!rawBody || !verifySlackSignature(rawBody, signingSecret, signature, timestamp)) {
+    return reply.code(403).send({ error: "INVALID_SLACK_SIGNATURE" });
+  }
+  const body = request.body ?? {};
+  if (body.type === "url_verification") return reply.type("text/plain").send(safeString(body.challenge));
+
+  const deployment = manualDeployment ? await resolveSlackDeploymentForWebhook(request, body, deploymentId) : await resolveSlackDeploymentForWebhook(request, body);
+  if (!deployment || deployment.status !== "active") return reply.code(200).send({ ignored: true });
+  const teamId = getSlackTeamId(body);
+  const channelId = getSlackChannelId(body);
+  const userId = getSlackUserId(body);
+  if (teamId !== deployment.slackWorkspaceId) return reply.code(200).send({ ignored: true });
+  if (body.event?.bot_id || body.event?.subtype) return reply.code(200).send({ ignored: true });
+
+  const responseUrl = safeString(body.response_url);
+  if (await isSlackRateLimited(deployment.id)) {
+    const text = "I'm receiving too many requests right now. Please try again in a minute.";
+    logInfo("SLACK_RATE_LIMITED", {
+      service: "workflow-service",
+      deploymentId: deployment.id,
+      workspaceId: teamId,
+      channelId
+    });
+    if (body.command) return reply.code(200).send({ response_type: "ephemeral", text });
+    reply.code(200).send({ ok: true, rateLimited: true });
+    setImmediate(() => {
+      postSlackReply(deployment, channelId, text, responseUrl).catch((error) => logInfo("SLACK_RATE_LIMIT_REPLY_FAILED", {
+        service: "workflow-service",
+        deploymentId: deployment.id,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    });
+    return;
+  }
+
+  const eventId = safeString(body.event_id);
+  const retryNum = safeString(request.headers["x-slack-retry-num"]);
+  let claimed = true;
+  if (eventId) {
+    claimed = await claimRedisKey(`slack:event:${eventId}`, 300);
+  } else if (body.command) {
+    const composite = `${teamId}:${userId}:${body.command}:${body.text}:${timestamp}`;
+    const hash = createHash("sha256").update(composite).digest("hex");
+    claimed = await claimRedisKey(`slack:command:${hash}`, 300);
+  }
+  if (!claimed) return reply.code(200).send({ duplicate: true, retryNum });
+
+  const accessDenied = deployment.accessMode === "allowlist" && !(deployment.allowedSlackUserIds ?? []).includes(userId);
+  reply.code(200).send(body.command ? { response_type: "ephemeral", text: "Working on it..." } : { ok: true });
+  setImmediate(() => {
+    (async () => {
+      if (accessDenied) {
+        await postSlackReply(deployment, channelId, "Sorry, you're not authorised to use this knowledge base bot.", responseUrl);
+        return;
+      }
+      if (body.command === "/kb") {
+        await handleSlackCommand(deployment, body);
+        return;
+      }
+      if (body.event?.type === "message" && body.event?.channel_type === "im") {
+        await handleSlackMessage(deployment, teamId, userId, channelId, safeString(body.event.text), responseUrl);
+      }
+    })().catch((error) => logInfo("SLACK_ASYNC_HANDLER_FAILED", {
+      service: "workflow-service",
+      deploymentId: deployment.id,
+      error: error instanceof Error ? error.message : String(error)
+    }));
+  });
+}
+
+app.post("/slack/events", async (request, reply) => handleSlackWebhook(request, reply));
+app.post("/slack/events/:deploymentId", async (request, reply) => handleSlackWebhook(request, reply, (request.params as { deploymentId: string }).deploymentId));
 
 // ─── KB Share Management Endpoints ───────────────────────────────────────────
 // Owner or platform admin can share a KB with specific users by their username.
@@ -5088,7 +6087,7 @@ app.post("/rag/knowledge-bases/:id/apply-template", async (request, reply) => {
     difyPromptError = error instanceof Error ? error.message : String(error);
     logInfo("dify_prompt_update_failed", { service: "workflow-service", kbId: id, userId, error: difyPromptError });
   }
-  return { applied: true, kbId: id, templateId, difyPromptUpdated, ...(difyPromptError ? { difyPromptError } : {}) };
+  return { applied: true, kbId: id, templateId, templateName: template.name, difyPromptUpdated, ...(difyPromptError ? { difyPromptError } : {}) };
 });
 
 // Auto-fail stale sync jobs that have received no progress callback for 15 minutes.

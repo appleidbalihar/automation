@@ -1,6 +1,7 @@
 "use client";
 
 import { resolveApiBase } from "./api-base";
+import { appPath } from "./web-paths";
 
 export const TOKEN_STORAGE_KEY = "ops_bearer_token";
 const REFRESH_TOKEN_STORAGE_KEY = "ops_refresh_token";
@@ -52,7 +53,7 @@ async function refreshStoredToken(): Promise<string | undefined> {
   if (typeof window === "undefined") return undefined;
   const refreshToken = window.localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) ?? "";
   if (!refreshToken.trim()) return undefined;
-  const response = await fetch("/api/auth/token", {
+  const response = await fetch(appPath("/api/auth/token"), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ refreshToken: normalizeToken(refreshToken) }),
