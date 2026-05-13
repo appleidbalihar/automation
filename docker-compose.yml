@@ -581,6 +581,7 @@ services:
       PGVECTOR_DATABASE: ${POSTGRES_DB}
       # Dify's own endpoint — used by worker to call back
       DIFY_BASE_URL: http://dify-api:5001
+      EMBEDDING_MAX_CHUNKS: "${EMBEDDING_MAX_CHUNKS:-16}"
       # CORS — allow the Dify web UI (port 3002) to call this API across origins.
       # CONSOLE_CORS_ALLOW_ORIGINS covers the /console/api/* routes (login, setup, etc.)
       # WEB_API_CORS_ALLOW_ORIGINS covers the /api/* routes used by published apps.
@@ -590,6 +591,7 @@ services:
       - tls_dify_api:/tls:ro
       - dify_storage:/app/storage
       - ./infra/dify/patches/word_extractor.py:/app/api/core/rag/extractor/word_extractor.py:ro
+      - ./infra/dify/patches/text_embedding.py:/app/api/core/model_runtime/model_providers/openai_api_compatible/text_embedding/text_embedding.py:ro
     ports:
       - "5001:5001"
     depends_on:
@@ -631,10 +633,13 @@ services:
       PGVECTOR_PASSWORD: ${POSTGRES_PASSWORD}
       PGVECTOR_DATABASE: ${POSTGRES_DB}
       DIFY_BASE_URL: http://dify-api:5001
+      EMBEDDING_MAX_CHUNKS: "${EMBEDDING_MAX_CHUNKS:-16}"
+      CELERY_WORKER_CONCURRENCY: "1"
     volumes:
       - tls_dify_api:/tls:ro
       - dify_storage:/app/storage
       - ./infra/dify/patches/word_extractor.py:/app/api/core/rag/extractor/word_extractor.py:ro
+      - ./infra/dify/patches/text_embedding.py:/app/api/core/model_runtime/model_providers/openai_api_compatible/text_embedding/text_embedding.py:ro
     depends_on:
       dify-api-vault-agent:
         condition: service_started

@@ -48,6 +48,7 @@ export function NavigationSidebar(): ReactElement {
     navItems.push({ href: "/users", label: "Users", icon: "US", section: "Admin" });
     navItems.push({ href: "/secrets", label: "Secrets", icon: "KY", section: "Admin" });
     navItems.push({ href: "/security", label: "Security", icon: "SC", section: "Admin" });
+    navItems.push({ href: "/dify-config", label: "Dify Config", icon: "DC", section: "Admin" });
   }
 
   /** Sign the user out and force a full page reload to return to the login screen */

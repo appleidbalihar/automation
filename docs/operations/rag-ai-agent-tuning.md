@@ -249,6 +249,76 @@ Response: `Conversation reset. Your next question will start a fresh context.`
 
 ---
 
+## 7. Reranking
+
+### What it does
+
+After the initial vector + BM25 hybrid search retrieves the top-K chunks, the reranker re-scores them using a cross-encoder model (`BAAI/bge-reranker-v2-m3`). Cross-encoders are more accurate than vector similarity scores because they evaluate the query and each chunk **together** rather than independently.
+
+Reranking improves precision: the final chunks passed to the AI model are ordered by actual relevance to the question, not just embedding similarity.
+
+### Current configuration
+
+| Setting | Value |
+|---------|-------|
+| Provider | Xinference |
+| Model | `BAAI/bge-reranker-v2-m3` |
+| Reranker endpoint | `http://192.168.2.253:11000/v1/rerank` |
+| Enabled | Yes (all RAG apps) |
+
+### Symptoms: reranker is down or misconfigured
+
+| Symptom | What is happening |
+|---------|-------------------|
+| `DIFY_REQUEST_FAILED:500` in the RAG assistant | Reranker service is unreachable or credentials are invalid |
+| Answers are correct but less precise than expected | Reranking disabled — results ordered by raw vector score only |
+
+### To temporarily disable reranking (debug/maintenance)
+
+```bash
+docker exec 09_automationplatform-dify-db-1 psql -U dify -d dify -c "
+UPDATE app_model_configs
+SET dataset_configs = (
+  dataset_configs::jsonb
+  || '{\"reranking_enable\": false, \"reranking_enabled\": false}'::jsonb
+)::text
+WHERE dataset_configs LIKE '%rerank%';
+"
+```
+
+### To re-enable reranking
+
+```bash
+docker exec 09_automationplatform-dify-db-1 psql -U dify -d dify -c "
+UPDATE app_model_configs
+SET dataset_configs = (
+  dataset_configs::jsonb
+  || '{\"reranking_enable\": true, \"reranking_enabled\": true}'::jsonb
+)::text
+WHERE dataset_configs LIKE '%rerank%';
+"
+```
+
+> **Important — Dify 0.6.16 bug:** You must set **both** `reranking_enable` and `reranking_enabled`. Dify stores the flag as `reranking_enable` but reads it as `reranking_enabled`. Setting only one key is silently ignored.
+
+### Verify reranker is reachable
+
+```bash
+curl -s -X POST http://192.168.2.253:11000/v1/rerank \
+  -H "Authorization: Bearer sk-central-ai-secure-key-2026" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "BAAI/bge-reranker-v2-m3",
+    "query": "backup procedure",
+    "documents": ["Run the backup script", "Install the certificate"],
+    "top_n": 2,
+    "return_documents": true
+  }' | python3 -m json.tool
+# Expected: JSON with results array containing relevance_score for each document
+```
+
+---
+
 ## Quick Diagnostic Reference
 
 Use this table when a user reports wrong or missing answers:
@@ -263,3 +333,4 @@ Use this table when a user reports wrong or missing answers:
 | "Second time I asked the same question I got the previous question's answer" | Conversation context contamination | User should send `/kb reset`; long-term: raise threshold so off-topic chunks are rejected |
 | "It doesn't find exact command strings like `ncs app backup --id`" | Hybrid search | Already enabled globally; check if KB was re-provisioned after the change |
 | "Follow-up question lost context after a break" | Thread expired (30 min inactivity) | Expected behaviour; user should re-ask with full context |
+| `DIFY_REQUEST_FAILED:500` on every query | Reranker down or misconfigured | Check reranker endpoint; disable reranking via DB patch (see Section 7) |

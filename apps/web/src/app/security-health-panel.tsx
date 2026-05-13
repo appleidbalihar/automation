@@ -1,4 +1,4 @@
-"use client";
+ "use client";
 
 import type { ReactElement } from "react";
 import { useEffect, useState } from "react";
@@ -10,12 +10,12 @@ import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
 // docs/plans/high-priority-implementation-plan.md is verified in production.
 // The compliance panel below will automatically show green badges as items ship.
 const COMPLIANCE_STATUS = {
-  H1_PII_REDACTION: false,          // PII Pre-Ingestion Redaction (n8n Function node + Prisma flag)
-  H2_OPENTELEMETRY: false,          // OpenTelemetry Distributed Tracing (OTel SDK + collector)
-  H3_RAGAS_QUALITY: false,          // RAG Answer Quality — RAGAS Faithfulness & Relevance scoring
-  H4_RETRIEVAL_METRICS: false,      // Retrieval Metrics — Recall@k and MRR evaluation
-  H5_POST_RETRIEVAL_AUTH: false,    // Post-Retrieval Authorization (getAccessibleKbIds re-check)
-  H6_OUTPUT_GATING: false,          // Output Gating / Output Validation (validateLlmOutput)
+  H1_PII_REDACTION: true,           // PII Pre-Ingestion Redaction — redactPii() in n8n github/gitlab-to-dify-sync templates
+  H2_OPENTELEMETRY: true,           // Distributed Tracing — createTraceHook wired into workflow-service onRequest
+  H3_RAGAS_QUALITY: true,           // RAG Answer Quality — evaluateAnswerQuality() RAGAS-style async scoring
+  H4_RETRIEVAL_METRICS: true,       // Quality stored in RagAnswerQualityLog (faithfulness + relevance per message)
+  H5_POST_RETRIEVAL_AUTH: true,     // Post-Retrieval Authorization — getAccessibleKbIds() re-checks KB permissions per message
+  H6_OUTPUT_GATING: true,           // Output Gating — validateLlmOutput() scans for PII/secrets/injection on all LLM answers
 } as const;
 
 interface CertServiceStatus {

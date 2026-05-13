@@ -56,6 +56,17 @@ const tlsRuntime = createTlsRuntime({
 });
 const app = Fastify({ logger: false, https: tlsRuntime.getServerOptions() } as any);
 
+// ─── H2: Distributed Tracing — wire trace hook into every request ─────────────
+// Each incoming request gets a unique traceId propagated through all logInfo calls
+// via AsyncLocalStorage in @platform/observability. The traceId is also returned
+// in the X-Trace-Id response header so callers can correlate logs with requests.
+import("@platform/observability").then(({ createTraceHook }) => {
+  app.addHook("onRequest", createTraceHook("workflow-service") as any);
+}).catch(() => {
+  // Tracing is best-effort — if the import fails, requests still work
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 function tryReadFile(path: string): Buffer | undefined {
   try {
     return readFileSync(path);
@@ -644,7 +655,10 @@ function generateDifyPassword(): string {
 }
 
 async function readDifyProvisioningConfig(sourceType: string): Promise<DifyProvisioningConfig> {
-  const configSecret = await readVaultKv("platform/global/dify/config");
+  const [configSecret, llmSecret] = await Promise.all([
+    readVaultKv("platform/global/dify/config"),
+    readVaultKv("platform/global/llm").catch(() => ({} as Record<string, unknown>))
+  ]);
   const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
   const difyAppUrl = nonEmptyString(configSecret.default_app_url) ?? defaults.difyAppUrl;
   const consoleEmail = nonEmptyString(configSecret.console_email) ?? "operations-ai@automation-platform.local";
@@ -659,9 +673,9 @@ async function readDifyProvisioningConfig(sourceType: string): Promise<DifyProvi
       console_email: consoleEmail,
       console_name: consoleName,
       console_password: consolePassword,
-      model_provider: nonEmptyString(configSecret.model_provider) ?? "openai",
-      chat_model: nonEmptyString(configSecret.chat_model) ?? "gpt-4o-mini",
-      embedding_model: nonEmptyString(configSecret.embedding_model) ?? "text-embedding-3-small"
+      model_provider: nonEmptyString(configSecret.model_provider) ?? "openai_api_compatible",
+      chat_model: nonEmptyString(llmSecret?.model as string) ?? nonEmptyString(configSecret.chat_model) ?? "gpt-4o-mini",
+      embedding_model: nonEmptyString(configSecret.embedding_model) ?? "nomic-embed-text"
     });
   }
 
@@ -673,7 +687,8 @@ async function readDifyProvisioningConfig(sourceType: string): Promise<DifyProvi
       console_name: consoleName
     },
     defaults,
-    consolePassword
+    consolePassword,
+    llmSecret
   });
 }
 
@@ -713,7 +728,7 @@ async function difyConsoleFetch(
 
 async function ensureDifyConsoleSession(sourceType: string): Promise<DifyConsoleSession> {
   const provisioningConfig = await readDifyProvisioningConfig(sourceType);
-  if (!provisioningConfig.modelApiKey) {
+  if (!provisioningConfig.chatModelApiKey && !provisioningConfig.modelApiKey) {
     throw new Error("DIFY_MODEL_PROVIDER_KEY_NOT_CONFIGURED");
   }
 
@@ -753,71 +768,57 @@ async function ensureDifyConsoleSession(sourceType: string): Promise<DifyConsole
   const token = nonEmptyString(login.payload.data);
   if (!token) throw new Error("DIFY_CONSOLE_LOGIN_TOKEN_MISSING");
 
-  const isCompatibleProvider = provisioningConfig.modelProvider === "openai_api_compatible";
-  const endpointUrl = provisioningConfig.modelApiBase
-    ? `${trimTrailingSlash(provisioningConfig.modelApiBase)}/v1`
-    : undefined;
+  // Split credentials: LLM uses chatModelApiKey/Base (api.fuelix.ai), embedding uses embeddingModelApiKey/Base (Xinference)
+  const llmEndpointUrl = provisioningConfig.chatModelApiBase
+    ? `${trimTrailingSlash(provisioningConfig.chatModelApiBase)}/v1`
+    : provisioningConfig.modelApiBase
+      ? `${trimTrailingSlash(provisioningConfig.modelApiBase)}/v1`
+      : "https://api.openai.com/v1";
 
-  // openai_api_compatible uses different credential keys and requires per-model registration
-  if (isCompatibleProvider) {
-    const baseCreds = {
-      api_key: provisioningConfig.modelApiKey,
-      endpoint_url: endpointUrl ?? "https://api.openai.com/v1"
-    };
-    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/openai_api_compatible/models`, {
-      method: "POST",
-      token,
-      body: {
-        model: provisioningConfig.chatModel,
-        model_type: "llm",
-        credentials: { ...baseCreds, mode: "chat", context_size: "128000", max_tokens_to_sample: "4096", stream_mode_delimiter: "\n\n" }
-      }
-    });
-    await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/openai_api_compatible/models`, {
-      method: "POST",
-      token,
-      body: {
-        model: provisioningConfig.embeddingModel,
-        model_type: "text-embedding",
-        credentials: { ...baseCreds, context_size: "8191" }
-      }
-    });
-  } else {
-    const modelCredentials = {
-      openai_api_key: provisioningConfig.modelApiKey,
-      ...(provisioningConfig.modelApiBase ? { openai_api_base: provisioningConfig.modelApiBase } : {})
-    };
-    try {
-      await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}`, {
-        method: "POST",
-        token,
-        body: { credentials: modelCredentials },
-        ok: [201]
-      });
-    } catch {
-      // Some OpenAI gateways only authorize selected models — fall back to per-model credentials.
-      await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/models`, {
-        method: "POST",
-        token,
-        body: { model: provisioningConfig.chatModel, model_type: "llm", credentials: modelCredentials }
-      });
-      await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/models`, {
-        method: "POST",
-        token,
-        body: { model: provisioningConfig.embeddingModel, model_type: "text-embedding", credentials: modelCredentials }
-      });
+  const embeddingEndpointUrl = provisioningConfig.embeddingModelApiBase
+    ? `${trimTrailingSlash(provisioningConfig.embeddingModelApiBase)}/v1`
+    : llmEndpointUrl;
+
+  const llmCreds = {
+    api_key: provisioningConfig.chatModelApiKey ?? provisioningConfig.modelApiKey ?? "",
+    endpoint_url: llmEndpointUrl
+  };
+  const embeddingCreds = {
+    api_key: provisioningConfig.embeddingModelApiKey ?? provisioningConfig.modelApiKey ?? "placeholder",
+    endpoint_url: embeddingEndpointUrl
+  };
+
+  // Register LLM model (api.fuelix.ai or configured chat provider)
+  await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/openai_api_compatible/models`, {
+    method: "POST",
+    token,
+    body: {
+      model: provisioningConfig.chatModel,
+      model_type: "llm",
+      credentials: { ...llmCreds, mode: "chat", context_size: "128000", max_tokens_to_sample: "4096", stream_mode_delimiter: "\n\n" }
     }
-  }
+  }).catch(() => undefined); // ignore if already registered
+
+  // Register embedding model (Xinference — separate endpoint)
+  await difyConsoleFetch(baseUrl, `/workspaces/current/model-providers/openai_api_compatible/models`, {
+    method: "POST",
+    token,
+    body: {
+      model: provisioningConfig.embeddingModel,
+      model_type: "text-embedding",
+      credentials: { ...embeddingCreds, context_size: "8191" }
+    }
+  }).catch(() => undefined); // ignore if already registered
 
   await difyConsoleFetch(
     baseUrl,
-    `/workspaces/current/model-providers/${provisioningConfig.modelProvider}/preferred-provider-type`,
+    `/workspaces/current/model-providers/openai_api_compatible/preferred-provider-type`,
     {
       method: "POST",
       token,
       body: { preferred_provider_type: "custom" }
     }
-  );
+  ).catch(() => undefined);
 
   await difyConsoleFetch(baseUrl, "/workspaces/current/default-model", {
     method: "POST",
@@ -826,12 +827,12 @@ async function ensureDifyConsoleSession(sourceType: string): Promise<DifyConsole
       model_settings: [
         {
           model_type: "llm",
-          provider: provisioningConfig.modelProvider,
+          provider: "openai_api_compatible",
           model: provisioningConfig.chatModel
         },
         {
           model_type: "text-embedding",
-          provider: provisioningConfig.modelProvider,
+          provider: "openai_api_compatible",
           model: provisioningConfig.embeddingModel
         }
       ]
@@ -856,16 +857,100 @@ async function createDifyDataset(session: DifyConsoleSession, name: string): Pro
   return datasetId;
 }
 
+// ─── Reranker: Vault config + Dify registration ──────────────────────────────
+// All reranker settings live in Vault at platform/global/reranker — no env vars.
+// Schema: { provider, model, api_base, enabled }
+// Reranking is active when the secret exists AND enabled === "true".
+// Per-KB override (rerankingEnabled) takes priority over the platform default.
+
+type RerankerVaultSecret = {
+  provider: string;
+  model: string;
+  api_base: string;
+  api_key: string | null; // optional — some gateways require Bearer auth
+  enabled: string;
+};
+
+async function fetchRerankerVaultSecret(): Promise<RerankerVaultSecret | null> {
+  try {
+    const secret = await readVaultKv("platform/global/reranker");
+    const provider = String(secret.provider ?? "").trim();
+    const model = String(secret.model ?? "").trim();
+    const api_base = String(secret.api_base ?? "").trim();
+    const api_key = String(secret.api_key ?? "").trim() || null;
+    const enabled = String(secret.enabled ?? "true").trim();
+    if (!provider || !model || !api_base) return null;
+    return { provider, model, api_base, api_key, enabled };
+  } catch {
+    return null;
+  }
+}
+
+function buildRerankingConfig(
+  reranker: RerankerVaultSecret | null,
+  perKbOverride?: boolean | null
+): Record<string, unknown> {
+  const platformEnabled = reranker !== null && reranker.enabled === "true";
+  const effective = perKbOverride !== null && perKbOverride !== undefined ? perKbOverride : platformEnabled;
+  if (!effective || !reranker) return { reranking_enable: false };
+  return {
+    reranking_enable: true,
+    reranking_enabled: true,
+    reranking_mode: "reranking_model",
+    // data_post_processor.py reads reranking_provider_name/reranking_model_name from inside this nested dict
+    reranking_model: {
+      provider: reranker.provider,
+      model: reranker.model,
+      reranking_provider_name: reranker.provider,
+      reranking_model_name: reranker.model,
+    },
+  };
+}
+
+async function registerDifyRerankModel(
+  session: DifyConsoleSession,
+  reranker: RerankerVaultSecret
+): Promise<void> {
+  try {
+    await difyConsoleFetch(session.baseUrl, `/workspaces/current/model-providers/${reranker.provider}`, {
+      method: "POST",
+      token: session.token,
+      body: {
+        credentials: {
+          api_base: reranker.api_base,
+          ...(reranker.api_key ? { api_key: reranker.api_key } : {})
+        }
+      },
+      ok: [200, 201]
+    });
+    logInfo("reranker_model_registered", {
+      service: "workflow-service",
+      provider: reranker.provider,
+      model: reranker.model
+    });
+  } catch (err) {
+    // Non-fatal: Dify may already have the provider configured — log and continue
+    logInfo("reranker_model_register_skipped", {
+      service: "workflow-service",
+      provider: reranker.provider,
+      reason: err instanceof Error ? err.message : String(err)
+    });
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function configureDifyDatasetEmbedding(
   session: DifyConsoleSession,
   datasetId: string,
-  kbConfig?: { topK?: number | null; scoreThreshold?: number | null } | null
+  kbConfig?: { topK?: number | null; scoreThreshold?: number | null; rerankingEnabled?: boolean | null } | null,
+  reranker?: RerankerVaultSecret | null
 ): Promise<void> {
   const existing = await difyConsoleFetch(session.baseUrl, `/datasets/${datasetId}`, {
     method: "GET",
     token: session.token
   });
   const dataset = existing.payload;
+  const rerankConfig = buildRerankingConfig(reranker ?? null, kbConfig?.rerankingEnabled);
 
   // Always push retrieval settings so score_threshold / top_k stay current
   await difyConsoleFetch(session.baseUrl, `/datasets/${datasetId}`, {
@@ -874,10 +959,10 @@ async function configureDifyDatasetEmbedding(
     body: {
       retrieval_model: {
         search_method: "hybrid_search",
-        reranking_enable: false,
-        top_k: kbConfig?.topK ?? 4,
+        ...rerankConfig,
+        top_k: kbConfig?.topK ?? 10,
         score_threshold_enabled: true,
-        score_threshold: kbConfig?.scoreThreshold ?? 0.4
+        score_threshold: kbConfig?.scoreThreshold ?? 0.3
       }
     }
   });
@@ -906,10 +991,10 @@ async function configureDifyDatasetEmbedding(
       embedding_model_provider: session.config.modelProvider,
       retrieval_model: {
         search_method: "hybrid_search",
-        reranking_enable: false,
-        top_k: kbConfig?.topK ?? 4,
+        ...rerankConfig,
+        top_k: kbConfig?.topK ?? 10,
         score_threshold_enabled: true,
-        score_threshold: kbConfig?.scoreThreshold ?? 0.4
+        score_threshold: kbConfig?.scoreThreshold ?? 0.3
       }
     }
   });
@@ -917,7 +1002,7 @@ async function configureDifyDatasetEmbedding(
 
 async function updateDifyDatasetRetrievalFromKbConfig(
   kbId: string,
-  kbConfig: { topK?: number | null; scoreThreshold?: number | null } | null
+  kbConfig: { topK?: number | null; scoreThreshold?: number | null; rerankingEnabled?: boolean | null } | null
 ): Promise<boolean> {
   const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId } });
   if (!kb) return false;
@@ -926,16 +1011,18 @@ async function updateDifyDatasetRetrievalFromKbConfig(
   if (!datasetId) return false;
   const sourceType = String(kb.sourceType ?? "github");
   const session = await ensureDifyConsoleSession(sourceType);
+  const reranker = await fetchRerankerVaultSecret();
+  const rerankConfig = buildRerankingConfig(reranker, kbConfig?.rerankingEnabled);
   await difyConsoleFetch(session.baseUrl, `/datasets/${datasetId}`, {
     method: "PATCH",
     token: session.token,
     body: {
       retrieval_model: {
         search_method: "hybrid_search",
-        reranking_enable: false,
-        top_k: kbConfig?.topK ?? 4,
+        ...rerankConfig,
+        top_k: kbConfig?.topK ?? 10,
         score_threshold_enabled: true,
-        score_threshold: kbConfig?.scoreThreshold ?? 0.4
+        score_threshold: kbConfig?.scoreThreshold ?? 0.3
       }
     }
   });
@@ -1092,10 +1179,13 @@ async function configureDifyApp(
     restrictionRules?: string | null;
     topK?: number | null;
     scoreThreshold?: number | null;
-  } | null = null
+    rerankingEnabled?: boolean | null;
+  } | null = null,
+  reranker: RerankerVaultSecret | null = null
 ): Promise<void> {
-  const topK = kbConfig?.topK ?? 4;
-  const scoreThreshold = kbConfig?.scoreThreshold ?? 0.4;
+  const topK = kbConfig?.topK ?? 10;
+  const scoreThreshold = kbConfig?.scoreThreshold ?? 0.3;
+  const rerankConfig = buildRerankingConfig(reranker, kbConfig?.rerankingEnabled);
   await difyConsoleFetch(session.baseUrl, `/apps/${appId}/model-config`, {
     method: "POST",
     token: session.token,
@@ -1117,8 +1207,7 @@ async function configureDifyApp(
       pre_prompt: buildFinalSystemPrompt(kbConfig),
       dataset_configs: {
         retrieval_model: "multiple",
-        reranking_enable: false,
-        reranking_model: { provider: "", model: "" },
+        ...rerankConfig,
         weights: null,
         top_k: topK,
         score_threshold_enabled: true,
@@ -1155,6 +1244,7 @@ async function updateDifyAppPromptFromKbConfig(kbId: string, kbConfig: {
   restrictionRules?: string | null;
   topK?: number | null;
   scoreThreshold?: number | null;
+  rerankingEnabled?: boolean | null;
 } | null): Promise<boolean> {
   const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: kbId } });
   if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
@@ -1166,7 +1256,8 @@ async function updateDifyAppPromptFromKbConfig(kbId: string, kbConfig: {
 
   const sourceType = String(kb.sourceType ?? "github");
   const session = await ensureDifyConsoleSession(sourceType);
-  await configureDifyApp(session, appId, datasetId, kbConfig);
+  const reranker = await fetchRerankerVaultSecret();
+  await configureDifyApp(session, appId, datasetId, kbConfig, reranker);
   return true;
 }
 
@@ -1279,6 +1370,12 @@ async function ensureDifyKnowledgeBaseProvisioned(kbId: string): Promise<void> {
   const defaults = await readGlobalDifyProvisioningDefaults(sourceType);
   const session = await ensureDifyConsoleSession(sourceType);
 
+  // Fetch reranker config once from Vault and share it across all provisioning calls
+  const reranker = await fetchRerankerVaultSecret();
+  if (reranker && reranker.enabled === "true") {
+    await registerDifyRerankModel(session, reranker);
+  }
+
   let datasetId = nonEmptyString(kb.difyDatasetId) ?? nonEmptyString(existingSecrets.dataset_id);
   if (!datasetId) {
     datasetId = await createDifyDataset(session, buildDifyResourceName(kb.name, kbId));
@@ -1287,14 +1384,14 @@ async function ensureDifyKnowledgeBaseProvisioned(kbId: string): Promise<void> {
       data: { difyDatasetId: datasetId, difyAppUrl: session.config.difyAppUrl }
     });
   }
-  await configureDifyDatasetEmbedding(session, datasetId);
+  await configureDifyDatasetEmbedding(session, datasetId, kb.config ?? null, reranker);
 
   let appId = nonEmptyString(existingSecrets.app_id);
   if (!appId) {
     appId = await createDifyApp(session, buildDifyResourceName(kb.name, kbId), kb.description);
   }
 
-  await configureDifyApp(session, appId, datasetId, kb.config ?? null);
+  await configureDifyApp(session, appId, datasetId, kb.config ?? null, reranker);
 
   const legacyApiKey = nonEmptyString(existingSecrets.api_key);
   const appApiKey =
@@ -1560,6 +1657,7 @@ async function sendToDify(
   conversationId: string;
   tokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
   timingMs: { vaultFetchMs: number; difyCallMs: number };
+  retrievedChunks: Array<{ content: string; documentName: string; score: number }> | null;
 }> {
   // Fetch the Dify API key from Vault — never from env vars
   const vaultStart = Date.now();
@@ -1670,7 +1768,19 @@ async function sendToDify(
   const conversationId = typeof payload.conversation_id === "string" ? payload.conversation_id : "";
   // Extract token usage from Dify's metadata — used for observability/cost tracking
   const tokenUsage = extractDifyTokenUsage(payload);
-  return { answer, conversationId, tokenUsage, timingMs: { vaultFetchMs, difyCallMs } };
+  // Extract retrieved chunks from Dify's retriever_resources — used by the hallucination guard
+  const retrieverResources = (payload.metadata as any)?.retriever_resources;
+  const retrievedChunks: Array<{ content: string; documentName: string; score: number }> | null =
+    Array.isArray(retrieverResources)
+      ? retrieverResources
+          .filter((r: any) => typeof r.content === "string" && r.content.trim())
+          .map((r: any) => ({
+            content: String(r.content ?? ""),
+            documentName: String(r.document_name ?? r.segment_id ?? ""),
+            score: typeof r.score === "number" ? r.score : 0
+          }))
+      : null;
+  return { answer, conversationId, tokenUsage, timingMs: { vaultFetchMs, difyCallMs }, retrievedChunks };
 }
 
 // ─── H6: Output Gating / Output Validation ───────────────────────────────────
@@ -1684,6 +1794,12 @@ const _SECRET_PATTERNS: RegExp[] = [
   /(ghp_[a-zA-Z0-9_-]{10,})/g,
   /(glpat-[a-zA-Z0-9_-]{10,})/g,
   /(xox[baprs]-[a-zA-Z0-9_-]{10,})/g,
+];
+
+// PII patterns — redacted in LLM output to prevent leaking personal data from retrieved documents
+const _OUTPUT_PII_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, label: "[EMAIL REDACTED]" },
+  { pattern: /(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, label: "[PHONE REDACTED]" },
 ];
 
 const _INJECTION_MARKERS: RegExp[] = [
@@ -1709,6 +1825,15 @@ function validateLlmOutput(answer: string, kbId: string, context: { threadId?: s
       sanitized = sanitized.replace(pattern, "[SECRET REDACTED]");
     }
     pattern.lastIndex = 0; // Reset global regex state
+  }
+
+  // Check for PII in output — redact email addresses and phone numbers from LLM responses
+  for (const { pattern, label } of _OUTPUT_PII_PATTERNS) {
+    if (pattern.test(answer)) {
+      flags.push("OUTPUT_PII_DETECTED");
+      sanitized = sanitized.replace(pattern, label);
+    }
+    pattern.lastIndex = 0;
   }
 
   // Check for prompt injection markers
@@ -1742,8 +1867,299 @@ function validateLlmOutput(answer: string, kbId: string, context: { threadId?: s
     });
   }
 
-  const safe = !flags.includes("PROMPT_INJECTION_MARKER_DETECTED");
+  const safe = !flags.includes("PROMPT_INJECTION_MARKER_DETECTED") && !flags.includes("HALLUCINATION_BLOCKED");
   return { safe, sanitized, flags };
+}
+
+// ─── Hallucination Guard (LLM-as-judge, synchronous) ─────────────────────────
+// Checks whether the LLM's answer is grounded in the retrieved chunks.
+// Controlled per-KB via hallucinationGuardEnabled + hallucinationThreshold in
+// RagKnowledgeBaseConfig — no env vars or container restarts needed.
+// Only runs when retrieved chunks are available (reranker exposes them via
+// metadata.retriever_resources in the Dify response).
+
+async function checkHallucinationGuard(
+  question: string,
+  answer: string,
+  retrievedChunks: Array<{ content: string; documentName: string; score: number }>,
+  kbId: string,
+  context: { threadId?: string },
+  kbConfig: { hallucinationGuardEnabled?: boolean; hallucinationThreshold?: number } | null
+): Promise<{ grounded: boolean; score: number | null }> {
+  const enabled = kbConfig?.hallucinationGuardEnabled !== false; // true by default
+  if (!enabled || retrievedChunks.length === 0) return { grounded: true, score: null }; // pass-through
+
+  try {
+    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+    const apiKey = String((llmSecrets as any).api_key ?? "").trim();
+    const model = String((llmSecrets as any).model ?? "").trim();
+    const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
+    if (!apiKey || apiKey === "PLACEHOLDER_UPDATE_ME" || !model) return { grounded: true, score: null }; // no LLM configured — pass-through
+
+    const contextText = retrievedChunks
+      .slice(0, 5) // cap at 5 chunks to keep prompt short
+      .map((c) => c.content)
+      .join("\n---\n")
+      .slice(0, 3000);
+
+    const prompt =
+      `You are a factual grounding evaluator. Given the retrieved context and an AI answer, ` +
+      `rate how well the answer is grounded in the context on a scale from 0.0 (fully hallucinated) ` +
+      `to 1.0 (fully grounded). Respond with ONLY valid JSON, no explanation.\n\n` +
+      `Context:\n${contextText}\n\n` +
+      `Answer: ${answer.slice(0, 800)}\n\n` +
+      `JSON: {"groundedness": 0.00}`;
+
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, max_tokens: 32, messages: [{ role: "user", content: prompt }] }),
+      signal: AbortSignal.timeout(6000) // 6s hard timeout — never stall the chat response
+    });
+
+    if (!response.ok) return { grounded: true, score: null };
+    const payload = await response.json() as Record<string, unknown>;
+    const raw = String((payload.choices as any)?.[0]?.message?.content ?? "").trim();
+    const parsed = JSON.parse(raw) as { groundedness?: number };
+    const groundedness = typeof parsed.groundedness === "number" ? Math.min(1, Math.max(0, parsed.groundedness)) : 1;
+
+    const threshold = kbConfig?.hallucinationThreshold ?? 0.3;
+    const grounded = groundedness >= threshold;
+
+    if (!grounded) {
+      void (prisma as any).platformLog.create({
+        data: {
+          severity: "WARN",
+          source: "workflow-service",
+          message: "output_gate_flag",
+          maskedPayload: {
+            kbId,
+            threadId: context.threadId ?? null,
+            flags: ["HALLUCINATION_BLOCKED"],
+            groundedness,
+            threshold,
+            answerLen: answer.length
+          }
+        }
+      }).catch(() => undefined);
+      logInfo("output_gate_flag", {
+        service: "workflow-service",
+        kbId,
+        threadId: context.threadId ?? null,
+        flags: ["HALLUCINATION_BLOCKED"],
+        groundedness,
+        threshold
+      });
+    }
+
+    return { grounded, score: groundedness };
+  } catch {
+    // Guard failure must never break the chat response — pass-through on any error
+    return { grounded: true, score: null };
+  }
+}
+
+// ─── Synthesis fallback: answer directly from chunk text via external LLM ────
+// Called when the hallucination guard blocks qwen's answer but chunks were retrieved.
+// Uses api.fuelix.ai (platform/global/llm) with a tight, chunk-only prompt.
+async function synthesizeFromChunks(
+  question: string,
+  retrievedChunks: Array<{ content: string; documentName?: string; score: number }>,
+  _kbId: string
+): Promise<string | null> {
+  try {
+    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+    const apiKey = String((llmSecrets as any).api_key ?? "").trim();
+    const model = String((llmSecrets as any).model ?? "").trim();
+    const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
+    if (!apiKey || apiKey === "PLACEHOLDER_UPDATE_ME" || !model) return null;
+
+    const excerpts = retrievedChunks
+      .slice(0, 6)
+      .map((c, i) => `[${i + 1}] ${c.content.slice(0, 1200)}`)
+      .join("\n\n");
+
+    const prompt =
+      `Answer the following question using ONLY the excerpts below. ` +
+      `If the excerpts contain step-by-step procedures, list them as numbered steps. ` +
+      `Do not add any information not present in the excerpts. Be concise and factual.\n\n` +
+      `Excerpts:\n${excerpts}\n\nQuestion: ${question}\n\nAnswer:`;
+
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, max_tokens: 800, messages: [{ role: "user", content: prompt }] }),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!response.ok) return null;
+    const payload = await response.json() as Record<string, unknown>;
+    const text = String((payload.choices as any)?.[0]?.message?.content ?? "").trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Clarification: fetch KB doc names from Dify ─────────────────────────────
+// Reads dataset_id and API key from Vault — the caller only needs kbId + difyAppUrl.
+async function fetchKbDocumentNames(
+  kbId: string,
+  difyAppUrl: string
+): Promise<string[]> {
+  if (!kbId) return [];
+  try {
+    const secrets = await readVaultKv(`platform/global/dify/${kbId}`).catch(() => ({}));
+    const apiKey = String((secrets as any).dataset_api_key ?? (secrets as any).app_api_key ?? (secrets as any).api_key ?? "").trim();
+    const datasetId = String((secrets as any).dataset_id ?? "").trim();
+    if (!apiKey || !datasetId) return [];
+    const url = `${difyAppUrl}/v1/datasets/${datasetId}/documents?page=1&limit=20`;
+    const response = await fetch(url, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(3000)
+    });
+    if (!response.ok) return [];
+    const data = await response.json() as Record<string, unknown>;
+    const docs = (data.data as any[]) ?? [];
+    return docs.map((d: any) => String(d.name ?? "")).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// ─── Clarification: generate a clarifying question via external LLM ──────────
+// Called when 0 chunks are retrieved. Instead of a dead-end "no information" message,
+// uses api.fuelix.ai to suggest what the user might have meant based on KB doc names.
+async function generateClarifyingQuestion(
+  question: string,
+  docNames: string[],
+  kbName: string
+): Promise<string | null> {
+  try {
+    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+    const apiKey = String((llmSecrets as any).api_key ?? "").trim();
+    const model = String((llmSecrets as any).model ?? "").trim();
+    const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
+    if (!apiKey || apiKey === "PLACEHOLDER_UPDATE_ME" || !model) return null;
+
+    const docList = docNames.length
+      ? docNames.slice(0, 15).map(n => `- ${n}`).join("\n")
+      : "(document list unavailable)";
+
+    const prompt =
+      `A user asked: "${question}"\n\n` +
+      `The knowledge base "${kbName}" contains these documents:\n${docList}\n\n` +
+      `If the question seems ambiguous or uses different terminology than the document names, ` +
+      `suggest 1-2 short clarifying questions to help identify what they are looking for. ` +
+      `If the KB clearly has nothing relevant to the question, respond with exactly: NO_MATCH\n\n` +
+      `Keep clarifying questions brief and conversational.`;
+
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, max_tokens: 150, messages: [{ role: "user", content: prompt }] }),
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!response.ok) return null;
+    const payload = await response.json() as Record<string, unknown>;
+    const text = String((payload.choices as any)?.[0]?.message?.content ?? "").trim();
+    if (!text || text.trim() === "NO_MATCH") return null;
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+// ─── RagChatEvent: fire-and-forget per-request quality log ───────────────────
+function writeRagChatEvent(params: {
+  knowledgeBaseId: string;
+  threadId?: string;
+  channel: "gui" | "slack";
+  questionLen: number;
+  retrievedChunks: Array<{ score: number }>;
+  hallucinationGuardScore: number | null;
+  hallucinationBlocked: boolean;
+  fallbackUsed: boolean;
+  fallbackType: string | null;
+  difyCallMs: number;
+  totalMs: number;
+  answerLen: number;
+}): void {
+  const scores = params.retrievedChunks.map(c => c.score).filter((s): s is number => typeof s === "number");
+  void (prisma as any).ragChatEvent.create({
+    data: {
+      knowledgeBaseId: params.knowledgeBaseId,
+      threadId: params.threadId ?? null,
+      channel: params.channel,
+      questionLen: params.questionLen,
+      retrievedChunkCount: params.retrievedChunks.length,
+      avgChunkScore: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null,
+      topChunkScore: scores.length ? Math.max(...scores) : null,
+      hallucinationGuardScore: params.hallucinationGuardScore,
+      hallucinationBlocked: params.hallucinationBlocked,
+      fallbackUsed: params.fallbackUsed,
+      fallbackType: params.fallbackType ?? null,
+      difyCallMs: params.difyCallMs,
+      totalMs: params.totalMs,
+      answerLen: params.answerLen
+    }
+  }).catch(() => undefined);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── H3+H4: RAG Answer Quality Metrics (RAGAS-style async scoring) ───────────
+// After each RAG response is returned to the user, this function asynchronously
+// asks the configured LLM to rate the answer on faithfulness and relevance.
+// It is always fire-and-forget — it NEVER blocks the chat response.
+// Results are stored in RagAnswerQualityLog and surfaced on the /rag/stats page.
+//
+// Faithfulness: Is the answer grounded in retrieved context or does it hallucinate?
+// Relevance:    Does the answer actually address the user's question?
+const QUALITY_EVAL_ENABLED = String(process.env.QUALITY_EVAL_ENABLED ?? "false").trim().toLowerCase() === "true";
+
+async function evaluateAnswerQuality(
+  threadId: string,
+  messageId: string,
+  kbId: string,
+  question: string,
+  answer: string
+): Promise<void> {
+  if (!QUALITY_EVAL_ENABLED || !question.trim() || !answer.trim()) return;
+  try {
+    // Read LLM credentials from Vault (same path as the prompt generator uses)
+    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+    const apiKey = String((llmSecrets as any).api_key ?? "").trim();
+    const model = String((llmSecrets as any).model ?? "").trim();
+    const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
+    if (!apiKey || apiKey === "PLACEHOLDER_UPDATE_ME" || !model) return;
+
+    const evalPrompt =
+      `You are a RAG answer quality evaluator. Score the following answer on two dimensions.\n\n` +
+      `Question: ${question.slice(0, 500)}\n\n` +
+      `Answer: ${answer.slice(0, 1000)}\n\n` +
+      `Rate each dimension from 0.0 to 1.0 (two decimal places):\n` +
+      `1. faithfulness: Is the answer fully supported by likely retrieved content, with no hallucination?\n` +
+      `2. relevance: Does the answer directly address the question?\n\n` +
+      `Respond with ONLY valid JSON, no explanation: {"faithfulness": 0.00, "relevance": 0.00}`;
+
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, max_tokens: 60, messages: [{ role: "user", content: evalPrompt }] })
+    });
+
+    if (!response.ok) return;
+    const payload = await response.json() as Record<string, unknown>;
+    const raw = String((payload.choices as any)?.[0]?.message?.content ?? "").trim();
+    const scores = JSON.parse(raw) as { faithfulness?: number; relevance?: number };
+    const faithfulness = typeof scores.faithfulness === "number" ? Math.min(1, Math.max(0, scores.faithfulness)) : null;
+    const relevance = typeof scores.relevance === "number" ? Math.min(1, Math.max(0, scores.relevance)) : null;
+
+    await (prisma as any).ragAnswerQualityLog.create({
+      data: { threadId, messageId, knowledgeBaseId: kbId, question: question.slice(0, 500), faithfulness, relevance }
+    });
+  } catch {
+    // Quality evaluation is best-effort — silently swallow all errors
+  }
 }
 
 // ─── H5: Post-Retrieval Authorization Helper ──────────────────────────────────
@@ -2443,6 +2859,16 @@ async function appendRagDiscussionMessage(
   const tokenUsageTotals = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   const timingTotals = { vaultFetchMs: 0, difyCallMs: 0 };
 
+  // Batch-fetch KB configs for the hallucination guard (1 query, not N)
+  const kbConfigMap = new Map<string, { hallucinationGuardEnabled: boolean; hallucinationThreshold: number }>();
+  {
+    const configs = await (prisma as any).ragKnowledgeBaseConfig.findMany({
+      where: { knowledgeBaseId: { in: knowledgeBases.map((kb) => kb.id) } },
+      select: { knowledgeBaseId: true, hallucinationGuardEnabled: true, hallucinationThreshold: true }
+    });
+    for (const cfg of configs) kbConfigMap.set(cfg.knowledgeBaseId, cfg);
+  }
+
   const pipelineStart = Date.now();
   for (const knowledgeBase of knowledgeBases) {
     const existingSession = sessionByKbId.get(knowledgeBase.id);
@@ -2450,6 +2876,7 @@ async function appendRagDiscussionMessage(
       existingSession?.difyConversationId ??
       (knowledgeBases.length === 1 && knowledgeBase.id === thread.knowledgeBaseId ? thread.difyConversationId : null);
 
+    const kbIterStart = Date.now();
     try {
       const result = await sendToDify(
         trimmed,
@@ -2458,10 +2885,63 @@ async function appendRagDiscussionMessage(
         knowledgeBase.difyAppUrl,
         ownerId
       );
+      const kbDifyCallMs = result.timingMs.difyCallMs;
+      const kbTotalMs = Date.now() - kbIterStart;
+
+      // ── Zero-retrieval guard — no chunks means no KB content to answer from ──
+      if (!result.retrievedChunks || result.retrievedChunks.length === 0) {
+        const docNames = await fetchKbDocumentNames(
+          knowledgeBase.id,
+          knowledgeBase.difyAppUrl
+        );
+        const clarification = await generateClarifyingQuestion(trimmed, docNames, knowledgeBase.name);
+        const answer = clarification
+          ?? "The available knowledge base does not contain verified information for this question.";
+        kbResults.push({
+          knowledgeBaseId: knowledgeBase.id,
+          knowledgeBaseName: knowledgeBase.name,
+          ownerUsername: knowledgeBase.ownerUsername ?? undefined,
+          answer
+        });
+        writeRagChatEvent({
+          knowledgeBaseId: knowledgeBase.id, threadId, channel: "gui",
+          questionLen: trimmed.length, retrievedChunks: [],
+          hallucinationGuardScore: null, hallucinationBlocked: false,
+          fallbackUsed: true, fallbackType: "zero_retrieval",
+          difyCallMs: kbDifyCallMs, totalMs: kbTotalMs, answerLen: answer.length
+        });
+        continue;
+      }
+
       // ── H6: Output Gating — scan answer before storing or returning ─────────
       const gateResult = validateLlmOutput(result.answer, knowledgeBase.id, { threadId });
-      const finalAnswer = gateResult.safe ? gateResult.sanitized : "The knowledge base returned a response that could not be safely displayed. Please rephrase your question.";
+      // ── Hallucination Guard — LLM-as-judge grounding check (synchronous) ────
+      const kbGuardConfig = kbConfigMap.get(knowledgeBase.id) ?? null;
+      const guardResult = await checkHallucinationGuard(trimmed, result.answer, result.retrievedChunks, knowledgeBase.id, { threadId }, kbGuardConfig);
+      if (!guardResult.grounded) gateResult.flags.push("HALLUCINATION_BLOCKED");
+      const safeAnswer = gateResult.safe && guardResult.grounded;
+
+      let finalAnswer: string;
+      let fallbackUsed = false;
+      if (!safeAnswer) {
+        // Synthesize from raw chunks via external LLM instead of dead-end error
+        const synthesized = await synthesizeFromChunks(trimmed, result.retrievedChunks, knowledgeBase.id);
+        finalAnswer = synthesized
+          ?? `Based on retrieved documents:\n\n${result.retrievedChunks.slice(0, 2).map(c => c.content).join("\n\n---\n\n")}`;
+        fallbackUsed = true;
+      } else {
+        finalAnswer = gateResult.sanitized;
+      }
       // ────────────────────────────────────────────────────────────────────────
+
+      writeRagChatEvent({
+        knowledgeBaseId: knowledgeBase.id, threadId, channel: "gui",
+        questionLen: trimmed.length, retrievedChunks: result.retrievedChunks,
+        hallucinationGuardScore: guardResult.score, hallucinationBlocked: !guardResult.grounded,
+        fallbackUsed, fallbackType: fallbackUsed ? "synthesis_fallback" : null,
+        difyCallMs: kbDifyCallMs, totalMs: kbTotalMs, answerLen: finalAnswer.length
+      });
+
       kbResults.push({
         knowledgeBaseId: knowledgeBase.id,
         knowledgeBaseName: knowledgeBase.name,
@@ -2474,7 +2954,7 @@ async function appendRagDiscussionMessage(
         conversationId: result.conversationId || difyConversationIdForRequest || null
       });
       timingTotals.vaultFetchMs += result.timingMs.vaultFetchMs;
-      timingTotals.difyCallMs += result.timingMs.difyCallMs;
+      timingTotals.difyCallMs += kbDifyCallMs;
       if (result.tokenUsage) {
         tokenUsageTotals.promptTokens += result.tokenUsage.promptTokens;
         tokenUsageTotals.completionTokens += result.tokenUsage.completionTokens;
@@ -2602,6 +3082,18 @@ async function appendRagDiscussionMessage(
     });
     return { userMessage, assistantMessage, updatedThread };
   });
+
+  // ── H3+H4: Async quality evaluation — fire-and-forget, never blocks response ─
+  for (const result of successfulResults) {
+    void evaluateAnswerQuality(
+      threadId,
+      persisted.assistantMessage.id,
+      result.knowledgeBaseId,
+      trimmed,
+      result.answer
+    );
+  }
+  // ────────────────────────────────────────────────────────────────────────────
 
   return {
     thread: mapRagDiscussionSummary(persisted.updatedThread, persisted.assistantMessage.content),
@@ -3337,8 +3829,21 @@ app.delete("/rag/integrations/:id", async (request, reply) => {
   });
   if (!kb) return reply.code(404).send({ error: "INTEGRATION_NOT_FOUND" });
 
+  // Best-effort Dify cleanup — if Dify is unreachable or credentials are stale
+  // (e.g. after a Vault rebuild) we still proceed to remove the DB record and secrets.
+  let difyCleanup = true;
   try {
     await deleteDifyKnowledgeBaseResources(kb);
+  } catch (difyErr) {
+    difyCleanup = false;
+    logInfo("integration_delete_dify_cleanup_skipped", {
+      service: "workflow-service",
+      kbId: id,
+      reason: difyErr instanceof Error ? difyErr.message : String(difyErr)
+    });
+  }
+
+  try {
     await (prisma as any).ragDiscussionThread.updateMany({
       where: { knowledgeBaseId: id },
       data: { difyConversationId: null }
@@ -3362,7 +3867,7 @@ app.delete("/rag/integrations/:id", async (request, reply) => {
       }
     }
 
-    return { deleted: true, id, difyCleanup: true };
+    return { deleted: true, id, difyCleanup };
   } catch (error) {
     return reply.code(500).send({
       error: "INTEGRATION_DELETE_FAILED",
@@ -3523,9 +4028,18 @@ app.patch("/rag/knowledge-bases/:id/config", async (request, reply) => {
     ...(body.toneInstructions !== undefined ? { toneInstructions: nonEmptyString(body.toneInstructions) ?? null } : {}),
     ...(body.restrictionRules !== undefined ? { restrictionRules: nonEmptyString(body.restrictionRules) ?? null } : {}),
     ...(body.topK !== undefined ? { topK: typeof body.topK === "number" ? Math.min(20, Math.max(1, body.topK)) : null } : {}),
-    ...(body.scoreThreshold !== undefined ? { scoreThreshold: typeof body.scoreThreshold === "number" ? Math.min(0.9, Math.max(0.1, body.scoreThreshold)) : null } : {})
+    ...(body.scoreThreshold !== undefined ? { scoreThreshold: typeof body.scoreThreshold === "number" ? Math.min(0.9, Math.max(0.1, body.scoreThreshold)) : null } : {}),
+    // Reranker fine-tuning: null = follow platform default from Vault; true/false = per-KB override
+    ...(body.rerankingEnabled !== undefined ? { rerankingEnabled: body.rerankingEnabled === null ? null : Boolean(body.rerankingEnabled) } : {}),
+    // Hallucination guard fine-tuning — no code change needed to adjust these per-KB
+    ...(body.hallucinationGuardEnabled !== undefined ? { hallucinationGuardEnabled: Boolean(body.hallucinationGuardEnabled) } : {}),
+    ...(body.hallucinationThreshold !== undefined ? {
+      hallucinationThreshold: typeof body.hallucinationThreshold === "number"
+        ? Math.min(0.9, Math.max(0.0, body.hallucinationThreshold))
+        : 0.3
+    } : {})
   };
-  const retrievalChanged = body.topK !== undefined || body.scoreThreshold !== undefined;
+  const retrievalChanged = body.topK !== undefined || body.scoreThreshold !== undefined || body.rerankingEnabled !== undefined;
   try {
     const updated = await (prisma as any).ragKnowledgeBaseConfig.upsert({
       where: { knowledgeBaseId: id },
@@ -3561,10 +4075,23 @@ app.delete("/rag/knowledge-bases/:id", async (request, reply) => {
   const headers = request.headers as Record<string, unknown>;
   if (!isAdminOrUserAdmin(headers)) return reply.code(403).send({ error: "FORBIDDEN" });
   const id = (request.params as { id: string }).id;
+  const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id } });
+  if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
+
+  // Best-effort Dify cleanup — don't block DB/Vault teardown if Dify is unreachable
+  let difyCleanup = true;
   try {
-    const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id } });
-    if (!kb) return reply.code(404).send({ error: "KNOWLEDGE_BASE_NOT_FOUND" });
     await deleteDifyKnowledgeBaseResources(kb);
+  } catch (difyErr) {
+    difyCleanup = false;
+    logInfo("kb_delete_dify_cleanup_skipped", {
+      service: "workflow-service",
+      kbId: id,
+      reason: difyErr instanceof Error ? difyErr.message : String(difyErr)
+    });
+  }
+
+  try {
     await (prisma as any).ragDiscussionThread.updateMany({
       where: { knowledgeBaseId: id },
       data: { difyConversationId: null }
@@ -3575,7 +4102,7 @@ app.delete("/rag/knowledge-bases/:id", async (request, reply) => {
     await (prisma as any).ragKnowledgeBase.delete({ where: { id } });
     // Remove Vault secret for this KB
     await vaultCall("DELETE", `${VAULT_KV_MOUNT}/metadata/platform/global/dify/${id}`).catch(() => undefined);
-    return { deleted: true, id, difyCleanup: true };
+    return { deleted: true, id, difyCleanup };
   } catch (error) {
     return reply.code(500).send({
       error: "KNOWLEDGE_BASE_DELETE_FAILED",
@@ -4767,17 +5294,77 @@ async function handleSlackMessage(deployment: any, slackTeamId: string, slackUse
   const isFollowUp = !isReset && lastUserQuestion ? isFollowUpQuestion(lastUserQuestion, text) : false;
 
   await (prisma as any).channelChatMessage.create({ data: { threadId: thread.id, role: "user", content: text } });
+
+  // Batch-fetch KB configs for the hallucination guard
+  const slackKbConfigMap = new Map<string, { hallucinationGuardEnabled: boolean; hallucinationThreshold: number }>();
+  {
+    const kbIds = activeMappings.map((m: any) => m.knowledgeBaseId);
+    const configs = await (prisma as any).ragKnowledgeBaseConfig.findMany({
+      where: { knowledgeBaseId: { in: kbIds } },
+      select: { knowledgeBaseId: true, hallucinationGuardEnabled: true, hallucinationThreshold: true }
+    });
+    for (const cfg of configs) slackKbConfigMap.set(cfg.knowledgeBaseId, cfg);
+  }
+
   const results: RagDiscussionKbResult[] = [];
   for (const mapping of activeMappings) {
     const kb = mapping.knowledgeBase;
     const session = (thread.kbSessions ?? []).find((item: any) => item.knowledgeBaseId === mapping.knowledgeBaseId);
     const conversationIdToUse = isFollowUp ? (session?.difyConversationId ?? null) : null;
+    const slackKbIterStart = Date.now();
+    const slackKbAppUrl = kb?.difyAppUrl ?? "http://dify-api:5001";
     try {
-      const result = await sendToDify(text, conversationIdToUse, mapping.knowledgeBaseId, kb?.difyAppUrl ?? "http://dify-api:5001", slackUserId);
+      const result = await sendToDify(text, conversationIdToUse, mapping.knowledgeBaseId, slackKbAppUrl, slackUserId);
+      const slackDifyCallMs = result.timingMs.difyCallMs;
+      const slackKbTotalMs = Date.now() - slackKbIterStart;
+
+      // ── Zero-retrieval guard — no chunks means no KB content to answer from ──
+      if (!result.retrievedChunks || result.retrievedChunks.length === 0) {
+        const slackDocNames = await fetchKbDocumentNames(
+          mapping.knowledgeBaseId,
+          slackKbAppUrl
+        );
+        const slackClarification = await generateClarifyingQuestion(text, slackDocNames, kb?.name ?? mapping.knowledgeBaseId);
+        const slackZeroAnswer = slackClarification
+          ?? "The available knowledge base does not contain verified information for this question.";
+        results.push({ knowledgeBaseId: mapping.knowledgeBaseId, knowledgeBaseName: kb?.name ?? mapping.knowledgeBaseId, ownerUsername: kb?.ownerUsername, answer: slackZeroAnswer });
+        writeRagChatEvent({
+          knowledgeBaseId: mapping.knowledgeBaseId, channel: "slack",
+          questionLen: text.length, retrievedChunks: [],
+          hallucinationGuardScore: null, hallucinationBlocked: false,
+          fallbackUsed: true, fallbackType: "zero_retrieval",
+          difyCallMs: slackDifyCallMs, totalMs: slackKbTotalMs, answerLen: slackZeroAnswer.length
+        });
+        continue;
+      }
+
       // ── H6: Output Gating for Slack path ──────────────────────────────────
       const slackGateResult = validateLlmOutput(result.answer, mapping.knowledgeBaseId, {});
-      const slackFinalAnswer = slackGateResult.safe ? slackGateResult.sanitized : "The knowledge base returned a response that could not be safely displayed. Please rephrase your question.";
+      // ── Hallucination Guard for Slack path ────────────────────────────────
+      const slackKbGuardConfig = slackKbConfigMap.get(mapping.knowledgeBaseId) ?? null;
+      const slackGuardResult = await checkHallucinationGuard(text, result.answer, result.retrievedChunks, mapping.knowledgeBaseId, {}, slackKbGuardConfig);
+      const slackSafe = slackGateResult.safe && slackGuardResult.grounded;
+
+      let slackFinalAnswer: string;
+      let slackFallbackUsed = false;
+      if (!slackSafe) {
+        const slackSynthesized = await synthesizeFromChunks(text, result.retrievedChunks, mapping.knowledgeBaseId);
+        slackFinalAnswer = slackSynthesized
+          ?? `Based on retrieved documents:\n\n${result.retrievedChunks.slice(0, 2).map(c => c.content).join("\n\n---\n\n")}`;
+        slackFallbackUsed = true;
+      } else {
+        slackFinalAnswer = slackGateResult.sanitized;
+      }
       // ────────────────────────────────────────────────────────────────────────
+
+      writeRagChatEvent({
+        knowledgeBaseId: mapping.knowledgeBaseId, channel: "slack",
+        questionLen: text.length, retrievedChunks: result.retrievedChunks,
+        hallucinationGuardScore: slackGuardResult.score, hallucinationBlocked: !slackGuardResult.grounded,
+        fallbackUsed: slackFallbackUsed, fallbackType: slackFallbackUsed ? "synthesis_fallback" : null,
+        difyCallMs: slackDifyCallMs, totalMs: slackKbTotalMs, answerLen: slackFinalAnswer.length
+      });
+
       results.push({ knowledgeBaseId: mapping.knowledgeBaseId, knowledgeBaseName: kb?.name ?? mapping.knowledgeBaseId, ownerUsername: kb?.ownerUsername, answer: slackFinalAnswer });
       await (prisma as any).channelChatKbSession.upsert({
         where: { threadId_knowledgeBaseId: { threadId: thread.id, knowledgeBaseId: mapping.knowledgeBaseId } },
@@ -5317,6 +5904,115 @@ app.post("/admin/secrets/migrate", async (request, reply) => {
   });
 });
 
+// ─── Dify configuration admin endpoints ──────────────────────────────────────
+
+app.get("/admin/dify/config", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const [difyConfig, llmConfig, rerankerConfig] = await Promise.all([
+    readVaultKv("platform/global/dify/config").catch(() => ({} as Record<string, unknown>)),
+    readVaultKv("platform/global/llm").catch(() => ({} as Record<string, unknown>)),
+    readVaultKv("platform/global/reranker").catch(() => ({} as Record<string, unknown>))
+  ]);
+  return reply.send({
+    llm: {
+      model: nonEmptyString(llmConfig.model) ?? nonEmptyString(difyConfig.chat_model) ?? "",
+      baseUrl: nonEmptyString(llmConfig.base_url as string) ?? nonEmptyString(difyConfig.model_api_base as string) ?? "",
+      apiKeySet: !!(nonEmptyString(llmConfig.api_key as string) ?? nonEmptyString(difyConfig.model_api_key as string))
+    },
+    embedding: {
+      model: nonEmptyString(difyConfig.embedding_model as string) ?? "",
+      baseUrl: nonEmptyString(difyConfig.model_api_base as string) ?? "",
+      apiKeySet: !!nonEmptyString(difyConfig.model_api_key as string),
+      maxChunks: Number(difyConfig.embedding_max_chunks ?? 16)
+    },
+    reranker: {
+      provider: nonEmptyString(rerankerConfig.provider as string) ?? "",
+      model: nonEmptyString(rerankerConfig.model as string) ?? "",
+      apiBase: nonEmptyString(rerankerConfig.api_base as string) ?? "",
+      apiKeySet: !!nonEmptyString(rerankerConfig.api_key as string),
+      enabled: String(rerankerConfig.enabled ?? "true") === "true"
+    },
+    workflows: {
+      github: nonEmptyString(difyConfig.github_workflow_id as string) ?? "rag-sync-github",
+      gitlab: nonEmptyString(difyConfig.gitlab_workflow_id as string) ?? "rag-sync-gitlab",
+      googledrive: nonEmptyString(difyConfig.googledrive_workflow_id as string) ?? "rag-sync-gdrive",
+      web: nonEmptyString(difyConfig.web_workflow_id as string) ?? "rag-sync-web"
+    },
+    console: {
+      appUrl: nonEmptyString(difyConfig.default_app_url as string) ?? "",
+      email: nonEmptyString(difyConfig.console_email as string) ?? "",
+      passwordSet: !!nonEmptyString(difyConfig.console_password as string)
+    }
+  });
+});
+
+app.patch("/admin/dify/config", async (request, reply) => {
+  const auth = requireAdmin(request.headers as Record<string, unknown>);
+  if (!auth.allowed) return reply.code(403).send(auth.error);
+  const body = request.body as {
+    llm?: { model?: string; baseUrl?: string; apiKey?: string };
+    embedding?: { model?: string; baseUrl?: string; apiKey?: string; maxChunks?: number };
+    reranker?: { provider?: string; model?: string; apiBase?: string; apiKey?: string; enabled?: boolean };
+    workflows?: { github?: string; gitlab?: string; googledrive?: string; web?: string };
+    console?: { appUrl?: string; email?: string; password?: string };
+  };
+
+  const [difyConfig, llmConfig, rerankerConfig] = await Promise.all([
+    readVaultKv("platform/global/dify/config").catch(() => ({} as Record<string, unknown>)),
+    readVaultKv("platform/global/llm").catch(() => ({} as Record<string, unknown>)),
+    readVaultKv("platform/global/reranker").catch(() => ({} as Record<string, unknown>))
+  ]);
+
+  if (body.llm) {
+    const u: Record<string, unknown> = { ...llmConfig };
+    if (body.llm.model) u.model = body.llm.model;
+    if (body.llm.baseUrl) u.base_url = body.llm.baseUrl;
+    if (body.llm.apiKey) u.api_key = body.llm.apiKey;
+    await writeVaultKv("platform/global/llm", u);
+  }
+
+  const difyUpdate: Record<string, unknown> = { ...difyConfig };
+  if (body.embedding) {
+    if (body.embedding.model) difyUpdate.embedding_model = body.embedding.model;
+    if (body.embedding.baseUrl) difyUpdate.model_api_base = body.embedding.baseUrl;
+    if (body.embedding.apiKey) difyUpdate.model_api_key = body.embedding.apiKey;
+    if (body.embedding.maxChunks != null) difyUpdate.embedding_max_chunks = body.embedding.maxChunks;
+  }
+  if (body.workflows) {
+    if (body.workflows.github) difyUpdate.github_workflow_id = body.workflows.github;
+    if (body.workflows.gitlab) difyUpdate.gitlab_workflow_id = body.workflows.gitlab;
+    if (body.workflows.googledrive) difyUpdate.googledrive_workflow_id = body.workflows.googledrive;
+    if (body.workflows.web) difyUpdate.web_workflow_id = body.workflows.web;
+  }
+  if (body.console) {
+    if (body.console.appUrl) difyUpdate.default_app_url = body.console.appUrl;
+    if (body.console.email) difyUpdate.console_email = body.console.email;
+    if (body.console.password) difyUpdate.console_password = body.console.password;
+  }
+  if (body.embedding || body.workflows || body.console) {
+    await writeVaultKv("platform/global/dify/config", difyUpdate);
+  }
+
+  if (body.reranker) {
+    const u: Record<string, unknown> = { ...rerankerConfig };
+    if (body.reranker.provider !== undefined) u.provider = body.reranker.provider;
+    if (body.reranker.model !== undefined) u.model = body.reranker.model;
+    if (body.reranker.apiBase !== undefined) u.api_base = body.reranker.apiBase;
+    if (body.reranker.apiKey) u.api_key = body.reranker.apiKey;
+    if (body.reranker.enabled !== undefined) u.enabled = String(body.reranker.enabled);
+    await writeVaultKv("platform/global/reranker", u);
+  }
+
+  if (body.llm || body.embedding || body.console) {
+    await ensureDifyConsoleSession("github").catch((err: Error) => {
+      logInfo("DIFY_CONFIG_VAULT_SAVED_PUSH_FAILED", { service: "workflow-service", error: err.message });
+    });
+  }
+
+  return reply.send({ ok: true });
+});
+
 // ─── Internal OAuth token endpoints (called by api-gateway only) ─────────────
 
 const INTERNAL_OAUTH_SECRET = String(process.env.PLATFORM_OAUTH_SECRET ?? "").trim();
@@ -5648,6 +6344,73 @@ app.get("/rag/stats", async (request, reply) => {
         createdAt: e.createdAt
       }));
 
+    // ── Quality metrics from RagChatEvent ──────────────────────────────────────
+    const chatEvents = await (prisma as any).ragChatEvent.findMany({
+      where: {
+        createdAt: { gte: since },
+        ...(query.kbId ? { knowledgeBaseId: query.kbId } : {})
+      },
+      select: {
+        knowledgeBaseId: true, channel: true, retrievedChunkCount: true,
+        avgChunkScore: true, hallucinationGuardScore: true,
+        hallucinationBlocked: true, fallbackUsed: true, fallbackType: true,
+        totalMs: true
+      },
+      orderBy: { createdAt: "desc" },
+      take: 2000
+    }) as Array<{
+      knowledgeBaseId: string; channel: string; retrievedChunkCount: number;
+      avgChunkScore: number | null; hallucinationGuardScore: number | null;
+      hallucinationBlocked: boolean; fallbackUsed: boolean; fallbackType: string | null;
+      totalMs: number;
+    }>;
+
+    const qTotal = chatEvents.length;
+    const qHits = chatEvents.filter(e => e.retrievedChunkCount > 0).length;
+    const qBlocked = chatEvents.filter(e => e.hallucinationBlocked).length;
+    const qFallback = chatEvents.filter(e => e.fallbackUsed).length;
+    const qScores = chatEvents.map(e => e.avgChunkScore).filter((s): s is number => s !== null);
+    const avgQScore = qScores.length ? qScores.reduce((a, b) => a + b, 0) / qScores.length : null;
+
+    // Per-KB quality aggregation
+    const qByKb = new Map<string, typeof chatEvents>();
+    for (const ev of chatEvents) {
+      if (!qByKb.has(ev.knowledgeBaseId)) qByKb.set(ev.knowledgeBaseId, []);
+      qByKb.get(ev.knowledgeBaseId)!.push(ev);
+    }
+    const qualityByKb = Array.from(qByKb.entries()).map(([kbId, evs]) => {
+      const total = evs.length;
+      const hits = evs.filter(e => e.retrievedChunkCount > 0).length;
+      const blocked = evs.filter(e => e.hallucinationBlocked).length;
+      const fallbacks = evs.filter(e => e.fallbackUsed).length;
+      const scores = evs.map(e => e.avgChunkScore).filter((s): s is number => s !== null);
+      const blockRate = total ? blocked / total : 0;
+      return {
+        knowledgeBaseId: kbId,
+        requests: total,
+        retrievalHitRate: total ? hits / total : 0,
+        blockRate,
+        fallbackRate: total ? fallbacks / total : 0,
+        avgChunkScore: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null,
+        avgTotalMs: total ? Math.round(evs.reduce((a, e) => a + e.totalMs, 0) / total) : 0,
+        alertLevel: blockRate > 0.5 ? "critical" : blockRate > 0.25 ? "warn" : "ok"
+      };
+    }).sort((a, b) => b.requests - a.requests);
+
+    const quality = qTotal > 0 ? {
+      totalEvents: qTotal,
+      retrievalHitRate: qTotal ? qHits / qTotal : 0,
+      hallucinationBlockRate: qTotal ? qBlocked / qTotal : 0,
+      fallbackRate: qTotal ? qFallback / qTotal : 0,
+      avgChunkScore: avgQScore,
+      byChannel: {
+        gui: chatEvents.filter(e => e.channel === "gui").length,
+        slack: chatEvents.filter(e => e.channel === "slack").length
+      },
+      byKnowledgeBase: qualityByKb
+    } : null;
+    // ────────────────────────────────────────────────────────────────────────────
+
     return {
       periodDays: days,
       totalRequests: entries.length,
@@ -5664,7 +6427,8 @@ app.get("/rag/stats", async (request, reply) => {
         p99: { vaultFetchMs: percentile(vaultTimes, 99), difyCallMs: percentile(difyTimes, 99), totalMs: percentile(totalTimes, 99) }
       },
       slowestQueries: slowest,
-      byKnowledgeBase: kbBreakdown
+      byKnowledgeBase: kbBreakdown,
+      quality
     };
   } catch (error) {
     return reply.code(500).send({

@@ -1087,6 +1087,14 @@ app.delete("/admin/secrets/by-path", { preHandler: requireAnyRole(["admin"]) }, 
   await proxy(request, reply, "DELETE", config.workflowServiceUrl, "/admin/secrets/by-path");
 });
 
+app.get("/admin/dify/config", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/admin/dify/config");
+});
+
+app.patch("/admin/dify/config", { preHandler: requireAnyRole(["admin"]) }, async (request, reply) => {
+  await proxy(request, reply, "PATCH", config.workflowServiceUrl, "/admin/dify/config");
+});
+
 // ─── Knowledge Base Routes ────────────────────────────────────────────────────
 // All authenticated users can list and view KBs.
 // Create/delete/set-default require admin or useradmin role.

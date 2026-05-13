@@ -368,6 +368,115 @@ curl -s -X POST http://localhost:5001/console/api/login \
 
 Knowledge bases are created automatically by the platform when a user creates a Knowledge Source in the UI. **Do not create them manually in Dify** — the workflow-service provisions them via the Dify API using credentials stored in Vault.
 
+### 9.4 — Configure the Reranker (Xinference)
+
+The RAG assistant uses a reranker to improve retrieval quality. Dify 0.6.16 supports reranking only through specific providers — `openai_api_compatible` does **not** support reranking. Use the **Xinference** provider type, which accepts a custom base URL and works with any `/v1/rerank`-compatible endpoint (Xinference, LiteLLM proxy, etc.).
+
+**Step 1 — Add Xinference as a model provider in Dify UI:**
+
+1. Open Dify → Settings → Model Provider → Add Model
+2. Select **Xorbits Inference (Xinference)**
+3. Fill in the model credentials:
+
+| Field | Value |
+|-------|-------|
+| Model Type | Rerank |
+| Model Name | `BAAI/bge-reranker-v2-m3` |
+| Server URL | `http://<reranker-host>:<port>` (**no** `/v1` suffix) |
+| Model UID | `BAAI/bge-reranker-v2-m3` |
+| API Key | *(your reranker API key)* |
+
+> The Xinference client calls `{server_url}/v1/rerank` internally — do not include `/v1` in the server URL.
+
+**Step 2 — Patch existing app configs in Dify DB:**
+
+Adding the provider in the UI does not update existing Dify app configurations. Run these SQL patches against the Dify PostgreSQL DB:
+
+```bash
+docker exec <dify-db-container> psql -U dify -d dify -c "
+-- Fix reranking_model key names (Dify 0.6.16 expects reranking_provider_name/reranking_model_name)
+UPDATE app_model_configs
+SET dataset_configs = (
+  jsonb_set(
+    dataset_configs::jsonb,
+    '{reranking_model}',
+    jsonb_build_object(
+      'reranking_provider_name', 'xinference',
+      'reranking_model_name',    'BAAI/bge-reranker-v2-m3'
+    )
+  )
+)::text
+WHERE dataset_configs LIKE '%rerank%';
+
+-- Enable reranking using BOTH key variants (Dify 0.6.16 bug: stores reranking_enable but reads reranking_enabled)
+UPDATE app_model_configs
+SET dataset_configs = (
+  dataset_configs::jsonb
+  || '{\"reranking_enable\": true, \"reranking_enabled\": true}'::jsonb
+)::text
+WHERE dataset_configs LIKE '%rerank%';
+"
+```
+
+**Step 3 — Insert Xinference model credentials into Dify DB:**
+
+Dify encrypts provider credentials using per-field RSA encryption keyed to the tenant. Run this inside the `dify-api` container to insert them correctly:
+
+```bash
+docker exec <dify-api-container> python3 -c "
+import sys, json, base64, psycopg2
+sys.path.insert(0, '/app/api')
+from libs import rsa as dify_rsa
+
+DB_PASS = '<dify-db-password>'   # from Vault: platform/global/dify/* or DB_PASSWORD env var
+TENANT_ID = '<tenant-uuid>'      # SELECT id FROM tenants LIMIT 1
+RERANKER_URL = 'http://<reranker-host>:<port>'
+RERANKER_KEY = '<api-key>'
+
+conn = psycopg2.connect(host='dify-db', dbname='dify', user='dify', password=DB_PASS)
+cur = conn.cursor()
+cur.execute(\"SELECT encrypt_public_key FROM tenants WHERE id=%s\", (TENANT_ID,))
+pub_key = cur.fetchone()[0]
+
+def enc(val):
+    return base64.b64encode(dify_rsa.encrypt(val, pub_key)).decode()
+
+import uuid
+from datetime import datetime
+encrypted_config = json.dumps({
+    'server_url': enc(RERANKER_URL),   # server_url is secret-input in xinference.yaml
+    'model_uid':  'BAAI/bge-reranker-v2-m3',
+    'api_key':    enc(RERANKER_KEY)
+})
+cur.execute('''
+    INSERT INTO provider_models (id, tenant_id, provider_name, model_name, model_type, encrypted_config, is_valid, created_at, updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, true, %s, %s)
+    ON CONFLICT (tenant_id, provider_name, model_name, model_type)
+    DO UPDATE SET encrypted_config = EXCLUDED.encrypted_config, is_valid = true, updated_at = EXCLUDED.updated_at
+''', (str(uuid.uuid4()), TENANT_ID, 'xinference', 'BAAI/bge-reranker-v2-m3', 'rerank', encrypted_config, datetime.utcnow(), datetime.utcnow()))
+conn.commit()
+conn.close()
+print('Done')
+"
+```
+
+> **Why not just use the Dify UI?** Dify 0.6.16 stores `encrypted_config` as a JSON where only `secret-input` fields are individually RSA-encrypted. If you insert a fully-encrypted blob instead of per-field encryption, Dify will fail with `ProviderTokenNotInitError` at runtime. The script above handles this correctly.
+
+**Verify reranking is working:**
+
+Send a test query through the RAG assistant. If reranking is active, Dify logs will show retrieval without errors. To temporarily disable reranking (e.g. for debugging):
+
+```bash
+docker exec <dify-db-container> psql -U dify -d dify -c "
+UPDATE app_model_configs
+SET dataset_configs = (
+  dataset_configs::jsonb
+  || '{\"reranking_enable\": false, \"reranking_enabled\": false}'::jsonb
+)::text
+WHERE dataset_configs LIKE '%rerank%';
+"
+```
+
 Each time a Knowledge Source is synced for the first time, the platform:
 1. Creates a Dify dataset via API
 2. Stores the resulting dataset ID and API key in Vault at `secret/platform/global/dify/{kbId}`
@@ -585,6 +694,29 @@ ENVIRONMENT=prod bash scripts/rotate-secret.sh all
 ---
 
 ## Known Issues (Fixed in Current Codebase)
+
+### Dify 0.6.16: Reranker 500 errors after fresh install
+
+**Symptom:** RAG assistant returns `DIFY_REQUEST_FAILED:500: internal_server_error`. Dify logs show one of:
+- `KeyError: 'reranking_provider_name'`
+- `Invalid model type ModelType.RERANK for provider openai_api_compatible`
+- `ProviderTokenNotInitError: Model BAAI/bge-reranker-v2-m3 credentials is not initialized`
+
+**Root causes (all three must be fixed):**
+
+1. **Wrong key names** — Dify 0.6.16 `data_post_processor.py` expects `reranking_provider_name` / `reranking_model_name` inside the `reranking_model` JSON, but the DB may contain `provider` / `model` from older configs or UI saves.
+
+2. **Wrong provider type** — `openai_api_compatible` has no RERANK model type implementation. Must use `xinference` (which supports custom base URL + reranking).
+
+3. **`reranking_enable` vs `reranking_enabled` key name bug** — Dify stores the flag as `reranking_enable` (no `d`) but `dataset/manager.py` reads `reranking_enabled` (with `d`). Setting only `reranking_enable: false` is silently ignored; Dify defaults to `True` and still tries to invoke the reranker. Always set **both** keys.
+
+**Fix:** Follow Step 9.4 above. The SQL patches and credential insertion script handle all three issues.
+
+### Dify 0.6.16: `openai_api_compatible` provider does not support reranking
+
+**Status: By design in Dify 0.6.16 — use Xinference provider instead**
+
+Dify's `openai_api_compatible` provider only implements LLM and text-embedding model types. Attempting to configure a reranker under this provider (regardless of what model or URL you point it at) will always fail with `Invalid model type ModelType.RERANK for provider openai_api_compatible`. The correct provider for any self-hosted `/v1/rerank` endpoint (Xinference, LiteLLM proxy, etc.) is the **Xinference** provider type in Dify, which supports a configurable `server_url`.
 
 ### MinIO fails to start: `'sh' is not a minio sub-command`
 

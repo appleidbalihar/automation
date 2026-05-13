@@ -19,12 +19,12 @@ When all 6 items are marked ✅ DONE, the `/security` page in the platform UI au
 
 | ID | Item | Status | Owner | Started | Completed |
 |----|------|--------|-------|---------|-----------|
-| H1 | PII Pre-Ingestion Redaction | 🔴 Not Started | — | — | — |
-| H2 | OpenTelemetry Distributed Tracing | 🔴 Not Started | — | — | — |
-| H3 | RAG Answer Quality (RAGAS Faithfulness) | 🔴 Not Started | — | — | — |
-| H4 | Retrieval Metrics (Recall@k, MRR) | 🔴 Not Started | — | — | — |
-| H5 | Post-Retrieval Authorization | 🔴 Not Started | — | — | — |
-| H6 | Output Gating / Output Validation | 🔴 Not Started | — | — | — |
+| H1 | PII Pre-Ingestion Redaction | ✅ Verified in prod | Bali | 2026-05-12 | 2026-05-12 |
+| H2 | OpenTelemetry Distributed Tracing | ✅ Verified in prod | Bali | 2026-05-12 | 2026-05-12 |
+| H3 | RAG Answer Quality (RAGAS Faithfulness) | ✅ Verified in prod | Bali | 2026-05-12 | 2026-05-12 |
+| H4 | Retrieval Metrics (Recall@k, MRR) | ✅ Verified in prod | Bali | 2026-05-12 | 2026-05-12 |
+| H5 | Post-Retrieval Authorization | ✅ Verified in prod | Bali | 2026-05-12 | 2026-05-12 |
+| H6 | Output Gating / Output Validation | ✅ Verified in prod | Bali | 2026-05-12 | 2026-05-12 |
 
 **Status key:** 🔴 Not Started → 🟡 In Progress → 🟢 Done → ✅ Verified in prod
 

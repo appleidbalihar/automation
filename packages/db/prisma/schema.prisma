@@ -113,6 +113,13 @@ model RagKnowledgeBaseConfig {
   restrictionRules String? // "Only answer questions about topic X"
   welcomeMessage   String? // Custom greeting shown at chat start
 
+  // Reranker fine-tuning — null means follow platform/global/reranker Vault default
+  rerankingEnabled Boolean? // explicit true/false overrides per-KB; null = platform default
+
+  // Hallucination guard fine-tuning — adjustable per-KB without code changes
+  hallucinationGuardEnabled Boolean @default(true)  // on by default; LLM-as-judge blocks hallucinated answers
+  hallucinationThreshold    Float   @default(0.3)   // block if groundedness score < this value
+
   updatedAt DateTime @updatedAt
 
   @@index([knowledgeBaseId])
@@ -377,6 +384,25 @@ model ChannelChatMessage {
   @@index([threadId, createdAt])
 }
 
+// ─── H3+H4: RAG Answer Quality Metrics ──────────────────────────────────────
+// Stores async RAGAS-style quality scores (faithfulness + relevance) per RAG
+// response. Scores are computed asynchronously after the answer is returned to
+// the user — they never block the response. Used by /rag/stats to surface
+// answer quality trends over time.
+model RagAnswerQualityLog {
+  id              String   @id @default(cuid())
+  threadId        String
+  messageId       String
+  knowledgeBaseId String
+  question        String   // The user's question (for context, not displayed to others)
+  faithfulness    Float?   // 0.0–1.0: is the answer grounded in retrieved chunks?
+  relevance       Float?   // 0.0–1.0: does the answer address the question?
+  evaluatedAt     DateTime @default(now())
+
+  @@index([knowledgeBaseId, evaluatedAt])
+  @@index([threadId])
+}
+
 model ChannelChatKbSession {
   id                 String            @id @default(cuid())
   threadId           String
@@ -387,4 +413,29 @@ model ChannelChatKbSession {
 
   @@unique([threadId, knowledgeBaseId])
   @@index([threadId])
+}
+
+// ─── RAG Chat Event Log ────────────────────────────────────────────────────────
+// One row per RAG request. Captures retrieval quality and answer outcome signals
+// that drive the /rag/stats quality dashboard. Fire-and-forget; never blocks response.
+model RagChatEvent {
+  id                      String   @id @default(cuid())
+  knowledgeBaseId         String
+  threadId                String?
+  channel                 String   // 'gui' | 'slack'
+  questionLen             Int
+  retrievedChunkCount     Int      // 0 = retrieval miss
+  avgChunkScore           Float?   // null when 0 chunks
+  topChunkScore           Float?   // null when 0 chunks
+  hallucinationGuardScore Float?   // null when guard skipped
+  hallucinationBlocked    Boolean  @default(false)
+  fallbackUsed            Boolean  @default(false)
+  fallbackType            String?  // 'zero_retrieval' | 'synthesis_fallback'
+  difyCallMs              Int
+  totalMs                 Int
+  answerLen               Int
+  createdAt               DateTime @default(now())
+
+  @@index([knowledgeBaseId, createdAt])
+  @@index([createdAt])
 }
