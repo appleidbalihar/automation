@@ -319,6 +319,74 @@ curl -s -X POST http://192.168.2.253:11000/v1/rerank \
 
 ---
 
+## 8. Output Gating Configuration
+
+### What it does
+
+Output gating is a deterministic code-level security layer that runs on **both** the user's incoming question (before the AI is called) and the AI's response (before it reaches the user). It cannot be bypassed by retrieved document content or LLM reasoning — it is purely a text-scanning step.
+
+### Three tiers
+
+| Tier | On/Off | Examples |
+|------|--------|---------|
+| **Always-on** | Cannot be disabled | Passwords of any format, API keys, credit card numbers, SSN, IBAN, JWT tokens, PEM private keys, passport numbers, medical IDs, bank routing numbers, security question answers |
+| **Optional** | Per-KB toggle (default: off) | Email addresses, phone numbers |
+| **Custom** | Per-KB — add your own | Any regex pattern with a label |
+
+### How always-on password detection works
+
+The platform catches credentials in all of these output formats automatically:
+
+| LLM response format | Caught? |
+|---------------------|---------|
+| `password: Goldy@12` | ✓ |
+| `the default password is: Goldy@12` | ✓ |
+| `the default password is **Goldy@12**` | ✓ |
+| `the default password is \`Goldy@12\`` | ✓ |
+| `password was set to Goldy@12` | ✓ |
+| `password has been reset to Goldy@12` | ✓ |
+| `password is now Goldy@12` | ✓ |
+| `credentials: admin / Goldy@12` | ✓ |
+| Multi-line: `password:\n\nGoldy@12` | ✓ |
+
+**Not caught** (acceptable trade-off, system prompt handles these): purely alphabetic passwords with no digits or special characters (e.g. `password is correct`).
+
+**Not impacted** (no false positives on): "what's the procedure to change the password", "password strength: high", "password reset link is valid for 24 hours".
+
+### When to enable email gating
+
+| Use case | Recommended setting |
+|----------|-------------------|
+| Support/sales bot — users ask "what's the support email?" | **Off** (default) — allow emails through |
+| HR or internal KB — personal emails in documents should not be shared | **On** — block all emails |
+| DevOps runbook bot | **Off** — emails are rarely sensitive in runbooks |
+
+### When to enable phone gating
+
+Same logic as email gating: leave off for bots that legitimately need to provide phone numbers; enable for KBs where phone numbers in documents should remain private.
+
+### Custom patterns — examples
+
+| Label | Regex | Use case |
+|-------|-------|---------|
+| `Employee ID` | `EMP-\d{5}` | Blocks internal employee IDs like `EMP-00123` |
+| `Internal Ticket` | `TICKET-[A-Z]{2}\d{6}` | Blocks internal ticket references |
+| `Account Number` | `ACC\d{8}` | Blocks internal account codes |
+| `IP Address` | `\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b` | Blocks IP addresses from being revealed |
+
+Tip: test your regex at [regex101.com](https://regex101.com) before adding it to production. Invalid regex is rejected with an inline error in the UI and never silently stored.
+
+### Where to configure
+
+Knowledge Connector → open a KB → Fine-tune options → **Output Gating** section.
+
+- The always-on list shows as a locked info panel (click "View" to see all 6 categories).
+- Optional checkboxes: Email addresses, Phone numbers.
+- Custom patterns: enter a label and regex, click Add.
+- Save applies immediately — next chat message uses the new rules.
+
+---
+
 ## Quick Diagnostic Reference
 
 Use this table when a user reports wrong or missing answers:
@@ -334,3 +402,5 @@ Use this table when a user reports wrong or missing answers:
 | "It doesn't find exact command strings like `ncs app backup --id`" | Hybrid search | Already enabled globally; check if KB was re-provisioned after the change |
 | "Follow-up question lost context after a break" | Thread expired (30 min inactivity) | Expected behaviour; user should re-ask with full context |
 | `DIFY_REQUEST_FAILED:500` on every query | Reranker down or misconfigured | Check reranker endpoint; disable reranking via DB patch (see Section 7) |
+| "The bot revealed a password / credential" | Output gating pattern gap or fallback synthesis not gated | Check `workflow-service` logs for `output_gate_flag`; verify code version has fallback gating (both primary AND synthesis answers are run through `validateLlmOutput`) |
+| "The bot revealed an email / phone number" | Optional gating not enabled | Open KB → Fine-tune → Output Gating → enable Email or Phone checkbox |

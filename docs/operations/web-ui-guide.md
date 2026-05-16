@@ -105,6 +105,52 @@ DELETE /gateway/rag/knowledge-bases/:id/shares/:shareId
 
 Sharing grants chat access only. It does not share thread history.
 
+## Output Gating
+
+Location: Knowledge Connector → open a KB → **Fine-tune** tab → **Output Gating** collapsible section.
+
+Output gating is a code-level filter that scans both the user's incoming question and the AI's response for sensitive data. It is independent of the system prompt — even if the LLM ignores its instructions, output gating still redacts credentials before they reach the user.
+
+### Always-Blocked panel
+
+Shows as a locked info panel: **Always Blocked 🔒 — 6 categories protected [View]**. Clicking View opens a modal listing all hardcoded categories:
+
+| Category | Examples blocked |
+|----------|----------------|
+| Credentials | Passwords, default/initial credentials, API keys, tokens |
+| Payment | Credit/debit card numbers, IBAN, bank account and routing numbers |
+| Government Identity | SSN / national ID, passport numbers, driver's licence numbers |
+| Cryptographic Material | PEM private keys (RSA, EC, SSH, PGP), JWT tokens |
+| Medical / Health | Patient IDs, MRN, Medicare/Medicaid numbers |
+| Other Sensitive | Security question answers |
+
+These cannot be disabled. They apply to every KB regardless of configuration.
+
+### Optional blocks
+
+Two checkboxes, both off by default:
+
+- **Email addresses** — enable if your KB contains personal or internal emails that should not be shown to users. Leave off for support/sales bots that need to share contact emails.
+- **Phone numbers** — enable if your KB contains phone numbers that should remain private. Leave off for bots that need to provide support lines.
+
+### Custom patterns
+
+Add your own patterns using a label and a regex string:
+
+1. Enter a **Label** — this appears in the redacted text, e.g. `Employee ID` → `[Employee ID REDACTED]`.
+2. Enter a **Regex** — the pattern is validated inline before you can save. Invalid regex shows an error and disables Save.
+3. Click **Add**. The pattern appears in the list with an enable/disable toggle and a delete button.
+
+Examples: `EMP-\d{5}` for employee IDs, `\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b` for IP addresses.
+
+Changes take effect on the next chat message — no restart required.
+
+### Note on system prompts and output gating
+
+Output gating is the security enforcement layer. The system prompt (`## Security — Absolute Rules` section) is advisory — it instructs the LLM to avoid revealing credentials, but it can be overridden by retrieved document content. Output gating is deterministic code that cannot be overridden. Both layers work together but output gating is the reliable backstop.
+
+---
+
 ## AI Agent Prompt
 
 Route: `/ai-agent-prompt`

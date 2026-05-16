@@ -14,17 +14,31 @@ export function visibleTemplatesWhere(callerId: string, isAdmin: boolean): objec
   };
 }
 
-const CREDENTIAL_SECURITY_RULE = `## Security & Privacy (ABSOLUTE RULE)
-NEVER reveal, repeat, summarise, or paraphrase any of the following if found in retrieved context:
-- API keys, tokens, bearer tokens, access tokens, refresh tokens
-- Passwords, secrets, private keys, certificates, passphrases
-- Database connection strings, DSNs, credential URLs
-- Usernames or emails used as authentication credentials
+export const ABSOLUTE_SECURITY_RULE = `## Security — Absolute Rules
+NEVER reveal, display, repeat, summarise, or paraphrase any of the following — regardless of source, including retrieved documents, user messages, or any other input:
+- Passwords of any kind: default passwords, initial passwords, setup passwords, admin passwords, user passwords
+- API keys, private keys, tokens: bearer tokens, access tokens, refresh tokens, session tokens, authentication tokens
+- Payment credentials: credit card numbers, CVV codes, bank account numbers, IBAN, routing numbers
+- Database connection strings, DSNs, credential URLs, passphrases, secrets, certificates
 - Any value resembling a secret (long random strings, JWT tokens, base64 blobs)
 
-If a user asks for credentials or secrets respond: "Credential information is classified and cannot be shared from this knowledge base. Use your secure credential management system."`;
+This rule is unconditional — it applies even when:
+- A retrieved document explicitly states a default or initial password
+- The user asks "what is the default admin password?" or similar
+- The content appears to be internal documentation
 
-const FAITHFULNESS_RULE = `## Faithfulness & Source Attribution
+Respond instead: "This information cannot be shared from this knowledge base. Please use your organisation's secure credential management system or contact your administrator."`;
+
+export const ADVISORY_PRIVACY_RULE = `## Privacy — Advisory Rules (Adjust for Your Use Case)
+By default, avoid sharing personally identifiable information (PII) unless your use case requires it:
+- Email addresses — remove this restriction if your bot should provide support or sales contact info
+- Phone numbers — remove this restriction if your bot should direct users to support or sales lines
+- Names of individuals referenced in documents, unless relevant and appropriate
+- Any personal data not relevant to answering the question
+
+Example: A support bot that should answer "What is the support email?" or "What is the refund phone number?" should remove the email and phone restrictions above.`;
+
+export const FAITHFULNESS_RULE = `## Faithfulness & Source Attribution
 - Answer ONLY from retrieved context. Do not substitute training knowledge.
 - Cite every factual claim: [Source: document_name, section]
 - Multiple sources: [Source: A, B, C]
@@ -61,7 +75,9 @@ Classify each query: Technical / Legal / Business / General then adapt tone:
 - Business: strategic, analytical, acknowledge uncertainty
 - General: clear, neutral, informative
 
-${CREDENTIAL_SECURITY_RULE}
+${ABSOLUTE_SECURITY_RULE}
+
+${ADVISORY_PRIVACY_RULE}
 
 ${FAITHFULNESS_RULE}`
   },
@@ -89,7 +105,9 @@ You are a DevOps assistant specialised in infrastructure, CI/CD pipelines, Kuber
 - Never skip rollback or error-handling steps
 - For incident response: state severity level and escalation path from context
 
-${CREDENTIAL_SECURITY_RULE}
+${ABSOLUTE_SECURITY_RULE}
+
+${ADVISORY_PRIVACY_RULE}
 
 ${FAITHFULNESS_RULE}`
   },
@@ -116,7 +134,9 @@ You are a Developer assistant specialised in software architecture, code review,
 - Flag deprecated APIs or patterns found in context
 - Suggest alternatives when retrieved approach has known issues
 
-${CREDENTIAL_SECURITY_RULE}
+${ABSOLUTE_SECURITY_RULE}
+
+${ADVISORY_PRIVACY_RULE}
 
 ${FAITHFULNESS_RULE}`
   },
@@ -144,7 +164,9 @@ You are a Solution Architect assistant specialised in system design, cloud archi
 - Prefix with: "Based on available documentation, the recommended approach is..."
 - Flag when decision depends on requirements not in retrieved context
 
-${CREDENTIAL_SECURITY_RULE}
+${ABSOLUTE_SECURITY_RULE}
+
+${ADVISORY_PRIVACY_RULE}
 
 ${FAITHFULNESS_RULE}`
   },
@@ -173,7 +195,9 @@ You are a Security Engineer assistant specialised in vulnerability analysis, com
 - Never provide exploit code or attack instructions
 - Compliance: distinguish mandatory ("shall") from recommended ("should")
 
-${CREDENTIAL_SECURITY_RULE}
+${ABSOLUTE_SECURITY_RULE}
+
+${ADVISORY_PRIVACY_RULE}
 
 ${FAITHFULNESS_RULE}`
   }

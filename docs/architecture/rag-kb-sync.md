@@ -1,5 +1,78 @@
 # RAG Knowledge Base — Document Management Guide
 
+## Security Architecture
+
+### Answer Pipeline with Output Gating
+
+Every user question passes through a deterministic security pipeline before and after the LLM:
+
+```
+USER QUESTION
+      │
+      ▼
+┌─────────────────────────────────────────────┐
+│  INPUT GUARD (validateUserInput)            │
+│  Runs same always-on + optional + custom    │
+│  patterns against the question itself.      │
+│  If question contains a credential value    │
+│  (pasted JWT, SSN, etc.) → BLOCKED          │
+│  "Your question contains sensitive data..." │
+└──────────────────┬──────────────────────────┘
+                   │ (clean question only)
+                   ▼
+         DIFY / LLM RAG CALL
+                   │
+                   ▼
+┌─────────────────────────────────────────────┐
+│  OUTPUT GATE (validateLlmOutput)            │
+│  Always-on: structural secrets + contextual │
+│  passwords → redacted                       │
+│  Optional: email, phone (per-KB flag)       │
+│  Custom: user-defined regex (per-KB)        │
+└──────────────────┬──────────────────────────┘
+                   │
+           ┌───────┴──────────┐
+           │ safe=true AND    │ safe=false OR
+           │ grounded=true    │ not grounded
+           ▼                  ▼
+   USE sanitized      synthesizeFromChunks()
+   Dify answer              │
+                            ▼
+                  ┌─────────────────────┐
+                  │ OUTPUT GATE AGAIN   │ ← critical: fallback
+                  │ validateLlmOutput   │   also gated
+                  └──────────┬──────────┘
+                             ▼
+                    RESPONSE TO USER
+```
+
+### Why the Fallback Must Also Be Gated
+
+When the primary Dify answer is rejected (output gating flagged it OR the hallucination guard says it's ungrounded), the platform calls `synthesizeFromChunks()` — a second LLM call using the raw KB chunks as context. Those raw chunks may themselves contain plaintext credentials. Without gating the fallback, a credential blocked in the primary answer would leak through the synthesis path.
+
+**Both** the primary answer and the fallback synthesis answer are run through `validateLlmOutput` before being returned to the user.
+
+### System Prompt Architecture
+
+The platform no longer force-appends a hidden security layer to every KB system prompt:
+
+| Before | After |
+|--------|-------|
+| Customer prompt → Layer 3 (hidden, hardcoded credential rules) always appended | Customer prompt sent to Dify exactly as saved |
+| Customer cannot see or remove the forced rules | Generated prompts include `## Security — Absolute Rules` and `## Privacy — Advisory Rules` as visible, editable sections |
+| LLM instruction was the primary security layer | Code-level output gating is the primary layer; prompt rules are advisory |
+
+### Output Gating Tiers
+
+| Tier | Who controls it | Examples | Bypass possible? |
+|------|----------------|---------|-----------------|
+| Always-on structural | Hardcoded | API keys (sk-…, ghp-…, glpat-…), credit card numbers, SSN, IBAN, JWT, PEM private keys | No |
+| Always-on contextual | Hardcoded | Passwords in any format ("password is X", "set to X", "credentials: a/b"), passport, medical IDs, routing numbers | No |
+| Optional | Per-KB checkbox (default off) | Email addresses, phone numbers | Yes — operator enables/disables |
+| Custom | Per-KB user-defined | Any label + regex pattern | Yes — operator enables/disables |
+
+---
+
 ## The Core Problem: Why RAG Gives Wrong Answers
 
 RAG (Retrieval-Augmented Generation) works by:

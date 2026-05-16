@@ -215,7 +215,7 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
             ) : null}
             {steps.map((step) => {
               const variant = stepBadgeVariant(step.status);
-              const isErr = variant === "failed" || Boolean(step.errorMessage);
+              const isErr = variant === "failed";
               const canRetryIndexing = isErr && isFailedDifyIndexingStep(step) && effectiveJob?.status === "failed" && Boolean(kbId);
 
               // Detect smart-sync / cleanup operation type for visual differentiation
@@ -236,7 +236,21 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
                         {isProjectNameStep ? <span className="ops-step-op-badge ops-step-op-meta">🏷 Metadata</span> : null}
                         <span>{step.task}</span>
                       </div>
-                      {step.errorMessage ? <small className="ops-sync-inline-err">{step.errorMessage}</small> : null}
+                      {step.errorMessage && variant !== "running" ? <small className="ops-sync-inline-err">{step.errorMessage}</small> : null}
+                      {step.difyStats && (step.logStepName === "dify_indexing" || step.logStepName === "retry_failed_indexing") ? (
+                        <div className="ops-dify-stats-row">
+                          <span className="ops-dify-stat ops-dify-stat-total">📄 {step.difyStats.total} total</span>
+                          <span className="ops-dify-stat ops-dify-stat-inprogress">🔄 {step.difyStats.inProgress} in-progress</span>
+                          <span className="ops-dify-stat ops-dify-stat-completed">✅ {step.difyStats.completed} completed</span>
+                          <span className="ops-dify-stat ops-dify-stat-queuing">⏳ {step.difyStats.queuing} queuing</span>
+                          <span className="ops-dify-stat ops-dify-stat-error">❌ {step.difyStats.error} errors</span>
+                          {step.difyStats.retryAttempt ? (
+                            <span className="ops-dify-stat ops-dify-stat-retry">
+                              Retry {step.difyStats.retryAttempt}/{step.difyStats.maxRetries ?? 5}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : null}
                       {step.failedDocuments.length > 0 ? (
                         <div className="ops-failed-doc-list">
                           {step.failedDocuments.map((doc, index) => (

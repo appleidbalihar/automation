@@ -95,8 +95,11 @@ A: The schedule field is available in the UI, but automatic cron execution is no
 **Q: What happens if a sync fails?**  
 A: The sync job is marked as failed and each step reports its error. You can see the failure reason in the sync job detail view. Common causes: expired token, network timeout, or Dify indexing error. After fixing the root cause, click **Retry** to restart from the failed step.
 
+**Q: Are knowledge bases isolated from each other? Could a query on one KB accidentally return results from another KB?**  
+A: Yes, each knowledge base is completely isolated. Every knowledge base is backed by its own separate dataset with its own independent vector index and keyword index. There is no shared index between knowledge bases — retrieval is strictly scoped so a query on KB A can only return content from KB A, never from KB B. This also means keyword relevance weights (used in hybrid search) are calibrated independently per knowledge base, so domain-specific terminology ranks correctly within its own context without being diluted by content from other KBs.
+
 **Q: Can I delete a knowledge base?**  
-A: Yes. Deleting a KB removes it from the platform and removes all associated documents from the Dify vector index. This action is not reversible without re-syncing.
+A: Yes. Deleting a KB removes it from the platform and removes all associated documents from the vector index. This action is not reversible without re-syncing.
 
 ---
 

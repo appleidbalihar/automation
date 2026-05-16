@@ -24,7 +24,10 @@ import {
   canModifyTemplate,
   mapTemplateRow,
   seedBuiltInTemplates,
-  visibleTemplatesWhere
+  visibleTemplatesWhere,
+  ABSOLUTE_SECURITY_RULE,
+  ADVISORY_PRIVACY_RULE,
+  FAITHFULNESS_RULE
 } from "./prompt-templates.js";
 import {
   buildRagThreadExpiry,
@@ -1120,16 +1123,23 @@ For every response follow this default structure (unless a specific domain forma
 3. **Sources** (inline or at end, if available).
 4. **Follow-up suggestion** (optional, only if helpful and domain-appropriate).
 
-## 5. Credential Security (ABSOLUTE RULE)
+## 5. Credential Security (ABSOLUTE RULE — NO EXCEPTIONS)
 
-NEVER reveal, repeat, summarise, or paraphrase any of the following if found in retrieved context:
-- API keys, tokens, bearer tokens, access tokens, refresh tokens
-- Passwords, secrets, private keys, certificates, passphrases
+NEVER reveal, display, repeat, summarise, or paraphrase any of the following — regardless of source, including retrieved knowledge base documents:
+- Passwords of any kind: default passwords, initial passwords, setup passwords, admin passwords, user passwords
+- Login credentials, authentication tokens, session tokens, bearer tokens, access tokens, refresh tokens
+- API keys, private keys, certificates, passphrases, secrets
+- Payment details, credit card numbers, CVV codes, bank account details
 - Database connection strings, DSNs, credential URLs
-- Usernames or emails used as authentication credentials
+- Usernames or emails paired with passwords or used as authentication credentials
 - Any value resembling a secret (long random strings, JWT tokens, base64 blobs)
 
-If a user asks for credentials or secrets respond: "Credential information is classified and cannot be shared from this knowledge base. Use your secure credential management system."
+This rule is unconditional — it applies even when:
+- A retrieved document explicitly states "default password: X" — do NOT reveal X
+- The user asks "what is the default admin password?" — do NOT answer with the password value
+- The content is internal documentation — credentials in it are still classified
+
+Respond instead: "Credential information cannot be shared from this knowledge base. Contact your administrator or use your organisation's credential management system."
 
 ## 6. Ethical & Safety Guardrails
 
@@ -1151,7 +1161,8 @@ function buildFinalSystemPrompt(kbConfig: {
 } | null): string {
   const parts: string[] = [];
 
-  // Layer 1: KB-specific instructions set by useradmin/admin
+  // Layer 1: KB-specific instructions set by useradmin/admin (placed first so platform
+  // grounding rules below cannot be overridden by KB-level content)
   const kbPrompt = kbConfig?.systemPromptBase?.trim();
   if (kbPrompt) {
     parts.push(`## Knowledge Base Context\n${kbPrompt}`);
@@ -1171,6 +1182,11 @@ function buildFinalSystemPrompt(kbConfig: {
   if (styleLines.length > 0) {
     parts.push(`## Response Style\n${styleLines.join(" ")}`);
   }
+
+  // No forced Layer 3: customer's configured prompt is sent to Dify exactly as saved.
+  // Security is enforced by output gating (validateLlmOutput / validateUserInput),
+  // not by hidden system prompt additions. Generated prompts already include
+  // ABSOLUTE_SECURITY_RULE and ADVISORY_PRIVACY_RULE as visible editable sections.
 
   return parts.join("\n\n").trim();
 }
@@ -1797,16 +1813,106 @@ async function sendToDify(
 const OUTPUT_GATING_ENABLED = String(process.env.OUTPUT_GATING_ENABLED ?? "true").trim().toLowerCase() !== "false";
 
 const _SECRET_PATTERNS: RegExp[] = [
+  // API token formats
   /(sk-[a-zA-Z0-9_-]{10,})/g,
   /(ghp_[a-zA-Z0-9_-]{10,})/g,
   /(glpat-[a-zA-Z0-9_-]{10,})/g,
   /(xox[baprs]-[a-zA-Z0-9_-]{10,})/g,
+  // Credit/debit card numbers (16-digit groups)
+  /\b(?:\d{4}[-\s]?){3}\d{4}\b/g,
+  // US SSN (000-00-0000)
+  /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g,
+  // IBAN (e.g. GB29NWBK60161331926819)
+  /\b[A-Z]{2}\d{2}[A-Z0-9]{4,28}\b/g,
+  // JWT (3-part base64url)
+  /eyJ[A-Za-z0-9+/=_-]{10,}\.[A-Za-z0-9+/=_-]{10,}\.[A-Za-z0-9+/=_-]{10,}/g,
+  // PEM private key headers
+  /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g,
+  /-----BEGIN PGP PRIVATE KEY BLOCK-----/g,
 ];
 
-// PII patterns — redacted in LLM output to prevent leaking personal data from retrieved documents
-const _OUTPUT_PII_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
-  { pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, label: "[EMAIL REDACTED]" },
-  { pattern: /(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, label: "[PHONE REDACTED]" },
+// PII patterns moved to per-KB configurable optional gates (_OPTIONAL_GATE_PATTERNS below)
+const _OUTPUT_PII_PATTERNS: Array<{ pattern: RegExp; label: string }> = [];
+
+// Optional gates — per-KB configurable, off by default
+const _OPTIONAL_GATE_PATTERNS: Record<string, { pattern: RegExp; label: string }> = {
+  emailGating: {
+    pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
+    label: "[EMAIL REDACTED]"
+  },
+  phoneGating: {
+    pattern: /(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g,
+    label: "[PHONE REDACTED]"
+  },
+};
+
+// Contextual credential patterns — catch plain-text passwords surfaced in LLM answers.
+// Each pattern keeps the context prefix and redacts only the credential value.
+// Credential value lookahead requires an uppercase letter, digit, or special char to avoid
+// false-positives on phrases like "password strength: high" or "password reset: available".
+const _CONTEXTUAL_CREDENTIAL_PATTERNS: Array<{
+  pattern: RegExp;
+  replacer: (...args: string[]) => string;
+}> = [
+  {
+    // "credentials: username / password" slash-separated format
+    pattern: /((?:credentials?)\s*[:=]\s+)([^\s/\n]+\s*\/\s*[^\s\n]+)/gi,
+    replacer: (_, prefix: string) => `${prefix}[CREDENTIALS REDACTED]`,
+  },
+  {
+    // Dify multiline format: "password ... :\n\n**Goldy@12**"
+    pattern: /((?:password|passwd|passcode|passphrase|credentials?)\b[^\n]{0,80}?[:]\s*\n+)\*\*([^*\s][^*]*)\*\*/gi,
+    replacer: (_, prefix: string) => `${prefix}**[CREDENTIAL REDACTED]**`,
+  },
+  {
+    // Same line bold: "password is **Goldy@12**" or "password: **Goldy@12**"
+    pattern: /((?:password|passwd|passcode|passphrase|credentials?)\b[^.\n]{0,60}?(?:\b(?:is|are)\b|[:=])\s*)\*\*([^*\s][^*]*)\*\*/gi,
+    replacer: (_, prefix: string) => `${prefix}**[CREDENTIAL REDACTED]**`,
+  },
+  {
+    // Direct adjacent: "password: X" or "password = X" (no extra words between keyword and separator)
+    pattern: /((?:password|passwd|passcode|passphrase|credentials?)\s*[:=]\s+)(?!https?:\/\/)(?!\[)(?=[^\s]*[@!#$%^&*\d])([^\s\[*][^\s*]*)/gi,
+    replacer: (_, prefix: string) => `${prefix}[CREDENTIAL REDACTED]`,
+  },
+  {
+    // "password is/are/was/becomes X" — compound connectors first; lookahead requires word to contain digit or special char (unaffected by i-flag), preventing false positives on plain words like "valid"
+    pattern: /((?:password|passwd|passcode|passphrase|credentials?)\b[^.\n]{0,60}?\b(?:is\s+now|was\s+set\s+to|has\s+been\s+(?:set|reset|changed)\s+to|set\s+to|reset\s+to|changed\s+to|configured\s+as|is|are|was|becomes?|now)\b[\s:]*\s*)(?!https?:\/\/)(?!\[)(?=[^\s]*[@!#$%^&*\d])([^\s\[*][^\s*]*)/gi,
+    replacer: (_, prefix: string) => `${prefix}[CREDENTIAL REDACTED]`,
+  },
+  {
+    // Multiline plain: "password ... :\n\nGoldy@12" (not bold)
+    pattern: /((?:password|passwd|passcode|passphrase|credentials?)\b[^\n]{0,80}?[:]\s*\n+)(?!https?:\/\/)(?!\[)(?=[A-Z@!#$%^&*\d]|[a-z][a-zA-Z\d@!#$%^&*]{2,})([^\s\[*\n][^\s\n]*)/gi,
+    replacer: (_, prefix: string) => `${prefix}[CREDENTIAL REDACTED]`,
+  },
+  // Identity / medical contextual patterns
+  {
+    pattern: /((?:social\s+security\s+(?:number|#|no)|SSN|S\.S\.N\.?)\s*[:=\-]?\s*)(\d{3}[-\s]?\d{2}[-\s]?\d{4})/gi,
+    replacer: (_, prefix: string) => `${prefix}[SSN REDACTED]`,
+  },
+  {
+    pattern: /((?:passport\s+(?:number|no|#|id))\s*[:=]?\s*)([A-Z0-9]{6,9})/gi,
+    replacer: (_, prefix: string) => `${prefix}[PASSPORT REDACTED]`,
+  },
+  {
+    pattern: /((?:driver['']?s?\s+licen[sc]e|driving\s+licen[sc]e|DL\s+(?:number|no|#))\s*[:=]?\s*)([A-Z0-9]{4,15})/gi,
+    replacer: (_, prefix: string) => `${prefix}[LICENCE REDACTED]`,
+  },
+  {
+    pattern: /((?:(?:patient|medical|health)\s+(?:record|ID|number|no)|MRN|Medicare|Medicaid)\s*[:=\-]?\s*)([A-Z0-9]{4,15})/gi,
+    replacer: (_, prefix: string) => `${prefix}[MEDICAL ID REDACTED]`,
+  },
+  {
+    pattern: /((?:routing\s+(?:number|no|#)|ABA\s+(?:number|code)|SWIFT|BIC)\s*[:=]?\s*)([A-Z0-9]{6,11})/gi,
+    replacer: (_, prefix: string) => `${prefix}[ROUTING/SWIFT REDACTED]`,
+  },
+  {
+    pattern: /((?:account\s+(?:number|no|#)|bank\s+(?:account|acct))\s*[:=]?\s*)(\d{6,17})/gi,
+    replacer: (_, prefix: string) => `${prefix}[ACCOUNT NUMBER REDACTED]`,
+  },
+  {
+    pattern: /((?:security\s+(?:question|answer)|secret\s+(?:question|answer))\s*[:=]?\s*)(.{3,60})/gi,
+    replacer: (_, prefix: string) => `${prefix}[SECURITY ANSWER REDACTED]`,
+  },
 ];
 
 const _INJECTION_MARKERS: RegExp[] = [
@@ -1816,7 +1922,18 @@ const _INJECTION_MARKERS: RegExp[] = [
   /act as (a|an) (different|new|unrestricted|evil|uncensored)/i,
 ];
 
-function validateLlmOutput(answer: string, kbId: string, context: { threadId?: string }): {
+type OutputGatingCfg = {
+  emailGating?: boolean;
+  phoneGating?: boolean;
+  customPatterns?: Array<{ id: string; label: string; pattern: string; enabled: boolean }>;
+};
+
+function validateLlmOutput(
+  answer: string,
+  kbId: string,
+  context: { threadId?: string },
+  gatingConfig?: OutputGatingCfg | null
+): {
   safe: boolean;
   sanitized: string;
   flags: string[];
@@ -1825,16 +1942,16 @@ function validateLlmOutput(answer: string, kbId: string, context: { threadId?: s
   const flags: string[] = [];
   let sanitized = answer;
 
-  // Check for secret patterns — redact if found
+  // Always-on: structural secret patterns
   for (const pattern of _SECRET_PATTERNS) {
     if (pattern.test(answer)) {
       flags.push("SECRET_PATTERN_DETECTED");
       sanitized = sanitized.replace(pattern, "[SECRET REDACTED]");
     }
-    pattern.lastIndex = 0; // Reset global regex state
+    pattern.lastIndex = 0;
   }
 
-  // Check for PII in output — redact email addresses and phone numbers from LLM responses
+  // Always-on: static PII patterns (empty by default — kept for future use)
   for (const { pattern, label } of _OUTPUT_PII_PATTERNS) {
     if (pattern.test(answer)) {
       flags.push("OUTPUT_PII_DETECTED");
@@ -1843,11 +1960,47 @@ function validateLlmOutput(answer: string, kbId: string, context: { threadId?: s
     pattern.lastIndex = 0;
   }
 
+  // Always-on: contextual credential/identity patterns
+  for (const { pattern, replacer } of _CONTEXTUAL_CREDENTIAL_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      flags.push("CREDENTIAL_IN_OUTPUT_DETECTED");
+      pattern.lastIndex = 0;
+      sanitized = sanitized.replace(pattern, replacer as any);
+    }
+    pattern.lastIndex = 0;
+  }
+
+  // Optional gates (per-KB configuration)
+  for (const [key, gate] of Object.entries(_OPTIONAL_GATE_PATTERNS)) {
+    if (gatingConfig?.[key as keyof OutputGatingCfg] !== true) continue;
+    const p = new RegExp(gate.pattern.source, gate.pattern.flags);
+    if (p.test(sanitized)) {
+      flags.push("OPTIONAL_GATE_TRIGGERED");
+      sanitized = sanitized.replace(p, gate.label);
+    }
+  }
+
+  // Customer custom patterns (per-KB)
+  for (const custom of gatingConfig?.customPatterns ?? []) {
+    if (!custom.enabled || !custom.pattern) continue;
+    try {
+      const p = new RegExp(custom.pattern, "gi");
+      if (p.test(sanitized)) {
+        flags.push("CUSTOM_GATE_TRIGGERED");
+        sanitized = sanitized.replace(new RegExp(custom.pattern, "gi"), `[${custom.label || "REDACTED"}]`);
+      }
+    } catch {
+      void (prisma as any).platformLog.create({
+        data: { severity: "WARN", source: "workflow-service", message: "custom_gate_invalid_regex", maskedPayload: { kbId, label: custom.label } }
+      }).catch(() => undefined);
+    }
+  }
+
   // Check for prompt injection markers
   for (const marker of _INJECTION_MARKERS) {
     if (marker.test(answer)) {
       flags.push("PROMPT_INJECTION_MARKER_DETECTED");
-      break; // One flag is enough for injection detection
+      break;
     }
   }
 
@@ -1876,6 +2029,54 @@ function validateLlmOutput(answer: string, kbId: string, context: { threadId?: s
 
   const safe = !flags.includes("PROMPT_INJECTION_MARKER_DETECTED") && !flags.includes("HALLUCINATION_BLOCKED");
   return { safe, sanitized, flags };
+}
+
+// Runs the same always-on + optional + custom patterns against the user's incoming question
+// BEFORE calling Dify. If the question itself contains a sensitive value, block immediately.
+function validateUserInput(
+  query: string,
+  kbId: string,
+  gatingConfig?: OutputGatingCfg | null
+): { blocked: boolean; flags: string[] } {
+  if (!OUTPUT_GATING_ENABLED) return { blocked: false, flags: [] };
+  const flags: string[] = [];
+
+  for (const pattern of _SECRET_PATTERNS) {
+    if (pattern.test(query)) flags.push("INPUT_SECRET_DETECTED");
+    pattern.lastIndex = 0;
+  }
+
+  for (const { pattern } of _CONTEXTUAL_CREDENTIAL_PATTERNS) {
+    if (pattern.test(query)) flags.push("INPUT_CREDENTIAL_DETECTED");
+    pattern.lastIndex = 0;
+  }
+
+  for (const [key, gate] of Object.entries(_OPTIONAL_GATE_PATTERNS)) {
+    if (gatingConfig?.[key as keyof OutputGatingCfg] !== true) continue;
+    const p = new RegExp(gate.pattern.source, gate.pattern.flags);
+    if (p.test(query)) flags.push("INPUT_OPTIONAL_GATE_TRIGGERED");
+  }
+
+  for (const custom of gatingConfig?.customPatterns ?? []) {
+    if (!custom.enabled || !custom.pattern) continue;
+    try {
+      if (new RegExp(custom.pattern, "gi").test(query)) flags.push("INPUT_CUSTOM_GATE_TRIGGERED");
+    } catch { /* invalid regex — skip */ }
+  }
+
+  const blocked = flags.length > 0;
+  if (blocked) {
+    void (prisma as any).platformLog.create({
+      data: {
+        severity: "WARN",
+        source: "workflow-service",
+        message: "input_gate_blocked",
+        maskedPayload: { kbId, flags, queryLen: query.length }
+      }
+    }).catch(() => undefined);
+    logInfo("input_gate_blocked", { service: "workflow-service", kbId, flags });
+  }
+  return { blocked, flags };
 }
 
 // ─── Hallucination Guard (LLM-as-judge, synchronous) ─────────────────────────
@@ -2254,6 +2455,57 @@ function isDifyIndexingActive(status: string): boolean {
   return ["waiting", "parsing", "cleaning", "splitting", "indexing"].includes(status);
 }
 
+async function getDifyIndexingStats(
+  difyAppUrl: string,
+  datasetId: string,
+  apiKey: string
+): Promise<{ total: number; completed: number; inProgress: number; queuing: number; error: number; docs: DifyDatasetDocument[] }> {
+  const docs = await listDifyDatasetDocuments(difyAppUrl, datasetId, apiKey);
+  const nonArchived = docs.filter((d) => !d.archived);
+  return {
+    total: nonArchived.length,
+    completed: nonArchived.filter((d) => String(d.indexing_status ?? "") === "completed").length,
+    inProgress: nonArchived.filter((d) => ["parsing", "cleaning", "splitting", "indexing"].includes(String(d.indexing_status ?? ""))).length,
+    queuing: nonArchived.filter((d) => String(d.indexing_status ?? "") === "waiting").length,
+    error: nonArchived.filter((d) => String(d.indexing_status ?? "") === "error").length,
+    docs: nonArchived
+  };
+}
+
+async function waitForDifyQueueToClear(input: {
+  syncJobId: string;
+  difyAppUrl: string;
+  datasetId: string;
+  datasetApiKey: string;
+  retryAttempt?: number;
+  maxRetries?: number;
+  maxWaitMs?: number;
+}): Promise<{ total: number; completed: number; inProgress: number; queuing: number; error: number; docs: DifyDatasetDocument[] }> {
+  const intervalMs = 10_000;
+  const deadline = Date.now() + (input.maxWaitMs ?? 10 * 60_000);
+  const retryAttempt = input.retryAttempt ?? 0;
+  const maxRetries = input.maxRetries ?? 5;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    const stats = await getDifyIndexingStats(input.difyAppUrl, input.datasetId, input.datasetApiKey);
+    const { docs: _docs, ...statsWithoutDocs } = stats;
+    await updateSyncJobStep(input.syncJobId, {
+      task: "AI Indexing",
+      stepName: "dify_indexing",
+      status: "running",
+      message: `Indexing: ${stats.completed} completed, ${stats.inProgress} in-progress, ${stats.queuing} queuing, ${stats.error} errors`,
+      difyStats: { ...statsWithoutDocs, retryAttempt, maxRetries }
+    }).catch(() => undefined);
+
+    if (stats.inProgress === 0 && stats.queuing === 0) return stats;
+
+    const job = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId }, select: { status: true } }).catch(() => null);
+    if (String(job?.status ?? "") === "cancelled") return stats;
+  }
+  return getDifyIndexingStats(input.difyAppUrl, input.datasetId, input.datasetApiKey);
+}
+
 function isRetryableDifyIndexingError(error: string | undefined): boolean {
   const normalized = String(error ?? "").toLowerCase();
   if (!normalized) return false;
@@ -2535,17 +2787,8 @@ async function autoRetryFailedDifyIndexingForJob(input: {
   knowledgeBaseId: string;
   failedDocuments: FailedDifyIndexingDocument[];
 }): Promise<void> {
-  const retryDelaysMs = [60_000, 120_000];
-  const nonRetryableFailures = input.failedDocuments.filter((doc) =>
-    !doc.difyDocId ||
-    doc.retryable === false ||
-    !isRetryableDifyIndexingError(doc.error)
-  );
-  let remaining = input.failedDocuments.filter((doc) =>
-    doc.difyDocId &&
-    doc.retryable !== false &&
-    isRetryableDifyIndexingError(doc.error)
-  );
+  const maxRounds = 5;
+  const errorCountHistory: number[] = [];
 
   const kb = await (prisma as any).ragKnowledgeBase.findUnique({ where: { id: input.knowledgeBaseId } });
   if (!kb) throw new Error("KNOWLEDGE_BASE_NOT_FOUND");
@@ -2554,96 +2797,112 @@ async function autoRetryFailedDifyIndexingForJob(input: {
   const datasetApiKey = nonEmptyString(difySecrets.dataset_api_key);
   if (!difyDatasetId) throw new Error("DIFY_DATASET_NOT_CONFIGURED");
   if (!datasetApiKey) throw new Error("DIFY_DATASET_API_KEY_NOT_CONFIGURED");
-
-  for (let round = 0; round < retryDelaysMs.length && remaining.length > 0; round++) {
-    const delayMs = retryDelaysMs[round];
-    await (prisma as any).ragKbSyncJob.update({
-      where: { id: input.syncJobId },
-      data: {
-        status: "running",
-        completedAt: null,
-        errorMessage: `${remaining.length} files failed indexing. Waiting before retry...`
-      }
-    });
-    await updateSyncJobStep(input.syncJobId, {
-      task: "AI Indexing",
-      stepName: "dify_indexing",
-      status: "running",
-      message: `${remaining.length} files failed indexing. Waiting before retry...`,
-      failedDocuments: [...nonRetryableFailures, ...remaining]
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-    const latestJob = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId } });
-    if (String(latestJob?.status ?? "") === "cancelled") return;
-
-    const session = await ensureDifyConsoleSession(String(kb.sourceType ?? "github"));
-    await updateSyncJobStep(input.syncJobId, {
-      task: "AI Indexing",
-      stepName: "dify_indexing",
-      status: "running",
-      message: `Retrying ${remaining.length} failed files`,
-      failedDocuments: [...nonRetryableFailures, ...remaining]
-    });
-    await difyConsoleFetch(session.baseUrl, `/datasets/${difyDatasetId}/retry`, {
-      method: "POST",
-      token: session.token,
-      body: { document_ids: remaining.map((doc) => doc.difyDocId).filter(Boolean) },
-      ok: [204]
-    });
-
-    const result = await pollFailedDifyDocumentsAfterRetry({
-      difyAppUrl: String(kb.difyAppUrl ?? ""),
-      datasetId: difyDatasetId,
-      datasetApiKey,
-      failedDocuments: remaining
-    });
-    remaining = result.failed;
-
-    const job = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId } });
-    const total = Number(job?.filesTotal ?? 0);
-    const processed = total > 0 ? Math.max(0, total - remaining.length) : result.completed;
-    await (prisma as any).ragKbSyncJob.update({
-      where: { id: input.syncJobId },
-      data: {
-        filesProcessed: processed,
-        chunksProcessed: processed,
-        errorMessage: nonRetryableFailures.length + remaining.length
-          ? `${nonRetryableFailures.length + remaining.length} files failed indexing${remaining.length && round + 1 < retryDelaysMs.length ? ". Waiting before retry..." : ""}`
-          : null
-      }
-    });
-  }
-
-  const finalJob = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId } });
-  const total = Number(finalJob?.filesTotal ?? 0);
-  const finalFailures = [...nonRetryableFailures, ...remaining];
-  const finalStatus = finalFailures.length ? "failed" : "completed";
-  const first = finalFailures[0];
-  const errorMessage = finalFailures.length
-    ? `${finalFailures.length} files failed indexing: ${first?.filePath ?? first?.difyDocId ?? "unknown document"}${first?.error ? `: ${first.error}` : ""}`
-    : null;
-  const processed = total > 0 ? Math.max(0, total - finalFailures.length) : Number(finalJob?.filesProcessed ?? 0);
+  const difyAppUrl = String(kb.difyAppUrl ?? "");
 
   await (prisma as any).ragKbSyncJob.update({
     where: { id: input.syncJobId },
-    data: {
-      status: finalStatus,
-      filesProcessed: processed,
-      chunksProcessed: processed,
-      errorMessage,
-      completedAt: new Date()
+    data: { status: "running", completedAt: null, errorMessage: "Monitoring Dify indexing..." }
+  });
+
+  let round = 0;
+  let finalStats: Awaited<ReturnType<typeof getDifyIndexingStats>> | null = null;
+
+  while (round < maxRounds) {
+    // Wait for all queuing/in-progress docs to finish before checking errors
+    const stats = await waitForDifyQueueToClear({
+      syncJobId: input.syncJobId,
+      difyAppUrl,
+      datasetId: difyDatasetId,
+      datasetApiKey,
+      retryAttempt: round,
+      maxRetries: maxRounds
+    });
+    finalStats = stats;
+
+    const latestJob = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId }, select: { status: true } }).catch(() => null);
+    if (String(latestJob?.status ?? "") === "cancelled") return;
+
+    // Get fresh error docs from Dify now that queue is clear
+    const errorDocs = stats.docs.filter((d) => String(d.indexing_status ?? "") === "error");
+    const errorCount = errorDocs.length;
+    errorCountHistory.push(errorCount);
+
+    if (errorCount === 0) break; // All done
+
+    // Stuck detection: last 3 error counts all identical
+    const last3 = errorCountHistory.slice(-3);
+    const isStuck = last3.length === 3 && last3.every((c) => c === last3[0]);
+    if (isStuck || round >= maxRounds - 1) break;
+
+    // Trigger Dify retry for all current error docs
+    const errorDocIds = errorDocs.map((d) => d.id).filter(Boolean) as string[];
+    const failedDocsForStep = errorDocs.map(failedDifyDocumentFromDatasetDocument);
+    const { docs: _docs, ...statsWithoutDocs } = stats;
+
+    await updateSyncJobStep(input.syncJobId, {
+      task: "AI Indexing",
+      stepName: "dify_indexing",
+      status: "running",
+      message: `Retry ${round + 1}: retrying ${errorCount} failed documents`,
+      failedDocuments: failedDocsForStep,
+      difyStats: { ...statsWithoutDocs, retryAttempt: round + 1, maxRetries: maxRounds }
+    }).catch(() => undefined);
+
+    try {
+      const session = await ensureDifyConsoleSession(String(kb.sourceType ?? "github"));
+      await difyConsoleFetch(session.baseUrl, `/datasets/${difyDatasetId}/retry`, {
+        method: "POST",
+        token: session.token,
+        body: { document_ids: errorDocIds },
+        ok: [204]
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logInfo("Dify retry API call failed", { service: "workflow-service", syncJobId: input.syncJobId, round, msg });
     }
+
+    round++;
+  }
+
+  // Build final state from last stats snapshot
+  const lastStats = finalStats ?? await getDifyIndexingStats(difyAppUrl, difyDatasetId, datasetApiKey);
+  const { docs: _finalDocs, ...lastStatsWithoutDocs } = lastStats;
+  const finalErrorDocs = lastStats.docs.filter((d) => String(d.indexing_status ?? "") === "error");
+  const finalFailures = finalErrorDocs.map(failedDifyDocumentFromDatasetDocument);
+  const finalStatus = finalFailures.length ? "failed" : "completed";
+  const jobRecord = await (prisma as any).ragKbSyncJob.findUnique({ where: { id: input.syncJobId } });
+  const filesTotal = Number(jobRecord?.filesTotal ?? 0);
+  const filesProcessed = filesTotal > 0
+    ? Math.max(0, filesTotal - finalFailures.length)
+    : lastStats.completed;
+  const first = finalFailures[0];
+
+  const isStuckFinal = (() => {
+    const last3 = errorCountHistory.slice(-3);
+    return last3.length === 3 && last3.every((c) => c === last3[0]);
+  })();
+  const errorMessage = finalFailures.length
+    ? isStuckFinal
+      ? `${finalFailures.length} documents are stuck and could not be indexed after ${errorCountHistory.length} attempts: ${first?.filePath ?? first?.difyDocId ?? "unknown"}`
+      : `${finalFailures.length} documents failed indexing: ${first?.filePath ?? first?.difyDocId ?? "unknown"}${first?.error ? `: ${first.error}` : ""}`
+    : null;
+
+  await (prisma as any).ragKbSyncJob.update({
+    where: { id: input.syncJobId },
+    data: { status: finalStatus, filesProcessed, chunksProcessed: filesProcessed, errorMessage, completedAt: new Date() }
   });
   await updateSyncJobStep(input.syncJobId, {
     task: "AI Indexing",
     stepName: "dify_indexing",
     status: finalStatus,
     completedAt: new Date().toISOString(),
-    message: finalFailures.length ? `${processed} / ${total || processed + finalFailures.length} indexed` : `${total || processed} / ${total || processed} indexed`,
+    message: finalFailures.length
+      ? `${filesProcessed} / ${filesTotal || filesProcessed + finalFailures.length} indexed`
+      : `${filesTotal || filesProcessed} / ${filesTotal || filesProcessed} indexed`,
     errorMessage: errorMessage ?? undefined,
-    failedDocuments: finalFailures
-  });
+    failedDocuments: finalFailures,
+    difyStats: { ...lastStatsWithoutDocs, retryAttempt: round, maxRetries: maxRounds }
+  }).catch(() => undefined);
 }
 
 async function retryFailedDifyIndexing(
@@ -2866,12 +3125,12 @@ async function appendRagDiscussionMessage(
   const tokenUsageTotals = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   const timingTotals = { vaultFetchMs: 0, difyCallMs: 0 };
 
-  // Batch-fetch KB configs for the hallucination guard (1 query, not N)
-  const kbConfigMap = new Map<string, { hallucinationGuardEnabled: boolean; hallucinationThreshold: number }>();
+  // Batch-fetch KB configs for hallucination guard + output gating (1 query, not N)
+  const kbConfigMap = new Map<string, { hallucinationGuardEnabled: boolean; hallucinationThreshold: number; outputGatingConfig: OutputGatingCfg | null }>();
   {
     const configs = await (prisma as any).ragKnowledgeBaseConfig.findMany({
       where: { knowledgeBaseId: { in: knowledgeBases.map((kb) => kb.id) } },
-      select: { knowledgeBaseId: true, hallucinationGuardEnabled: true, hallucinationThreshold: true }
+      select: { knowledgeBaseId: true, hallucinationGuardEnabled: true, hallucinationThreshold: true, outputGatingConfig: true }
     });
     for (const cfg of configs) kbConfigMap.set(cfg.knowledgeBaseId, cfg);
   }
@@ -2884,6 +3143,19 @@ async function appendRagDiscussionMessage(
       (knowledgeBases.length === 1 && knowledgeBase.id === thread.knowledgeBaseId ? thread.difyConversationId : null);
 
     const kbIterStart = Date.now();
+    const kbGatingConfig = kbConfigMap.get(knowledgeBase.id)?.outputGatingConfig ?? null;
+    // ── Input Guard — block before calling Dify if question contains sensitive data ──
+    const inputCheck = validateUserInput(trimmed, knowledgeBase.id, kbGatingConfig);
+    if (inputCheck.blocked) {
+      const blockedAnswer = "Your question contains information that cannot be processed by this assistant. Please rephrase without including sensitive data.";
+      kbResults.push({
+        knowledgeBaseId: knowledgeBase.id,
+        knowledgeBaseName: knowledgeBase.name,
+        ownerUsername: knowledgeBase.ownerUsername ?? undefined,
+        answer: blockedAnswer
+      });
+      continue;
+    }
     try {
       const result = await sendToDify(
         trimmed,
@@ -2921,7 +3193,7 @@ async function appendRagDiscussionMessage(
       }
 
       // ── H6: Output Gating — scan answer before storing or returning ─────────
-      const gateResult = validateLlmOutput(result.answer, knowledgeBase.id, { threadId });
+      const gateResult = validateLlmOutput(result.answer, knowledgeBase.id, { threadId }, kbGatingConfig);
       // ── Hallucination Guard — LLM-as-judge grounding check (synchronous) ────
       const kbGuardConfig = kbConfigMap.get(knowledgeBase.id) ?? null;
       const guardResult = await checkHallucinationGuard(trimmed, result.answer, result.retrievedChunks, knowledgeBase.id, { threadId }, kbGuardConfig);
@@ -2933,8 +3205,11 @@ async function appendRagDiscussionMessage(
       if (!safeAnswer) {
         // Synthesize from raw chunks via external LLM instead of dead-end error
         const synthesized = await synthesizeFromChunks(trimmed, result.retrievedChunks, knowledgeBase.id);
-        finalAnswer = synthesized
+        const rawFallback = synthesized
           ?? `Based on retrieved documents:\n\n${result.retrievedChunks.slice(0, 2).map(c => c.content).join("\n\n---\n\n")}`;
+        // Gate the fallback answer too — synthesizeFromChunks can also reveal credentials from raw chunks
+        const fallbackGate = validateLlmOutput(rawFallback, knowledgeBase.id, { threadId }, kbGatingConfig);
+        finalAnswer = fallbackGate.sanitized;
         fallbackUsed = true;
       } else {
         finalAnswer = gateResult.sanitized;
@@ -4052,7 +4327,9 @@ app.patch("/rag/knowledge-bases/:id/config", async (request, reply) => {
       hallucinationThreshold: typeof body.hallucinationThreshold === "number"
         ? Math.min(0.9, Math.max(0.0, body.hallucinationThreshold))
         : 0.3
-    } : {})
+    } : {}),
+    // Per-KB output gating configuration (emailGating, phoneGating, customPatterns)
+    ...(body.outputGatingConfig !== undefined ? { outputGatingConfig: body.outputGatingConfig ?? null } : {})
   };
   const retrievalChanged = body.topK !== undefined || body.scoreThreshold !== undefined || body.rerankingEnabled !== undefined;
   try {
@@ -4661,15 +4938,11 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
         });
       }
     }
-    const autoRetryableDocuments = failedDocuments.filter((doc) =>
-      doc.difyDocId &&
-      doc.retryable !== false &&
-      isRetryableDifyIndexingError(doc.error)
-    );
+    const hasFailedDocs = failedDocuments.some((doc) => doc.difyDocId);
     if (
       body.status === "failed" &&
       body.step?.stepName === "dify_indexing" &&
-      autoRetryableDocuments.length > 0
+      hasFailedDocs
     ) {
       await (prisma as any).ragKbSyncJob.update({
         where: { id: body.syncJobId },
@@ -4678,14 +4951,14 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
           filesProcessed: body.filesProcessed ?? undefined,
           filesTotal: body.filesTotal ?? undefined,
           chunksProcessed: body.chunksProcessed ?? undefined,
-          errorMessage: `${autoRetryableDocuments.length} files failed indexing. Waiting before retry...`,
+          errorMessage: "Monitoring Dify indexing...",
           completedAt: null
         }
       });
       await updateSyncJobStep(body.syncJobId, {
         ...body.step,
         status: "running",
-        message: `${autoRetryableDocuments.length} files failed indexing. Waiting before retry...`,
+        message: "Monitoring Dify indexing...",
         failedDocuments
       });
       void autoRetryFailedDifyIndexingForJob({
@@ -5310,13 +5583,13 @@ async function handleSlackMessage(deployment: any, slackTeamId: string, slackUse
 
   await (prisma as any).channelChatMessage.create({ data: { threadId: thread.id, role: "user", content: text } });
 
-  // Batch-fetch KB configs for the hallucination guard
-  const slackKbConfigMap = new Map<string, { hallucinationGuardEnabled: boolean; hallucinationThreshold: number }>();
+  // Batch-fetch KB configs for hallucination guard + output gating
+  const slackKbConfigMap = new Map<string, { hallucinationGuardEnabled: boolean; hallucinationThreshold: number; outputGatingConfig: OutputGatingCfg | null }>();
   {
     const kbIds = activeMappings.map((m: any) => m.knowledgeBaseId);
     const configs = await (prisma as any).ragKnowledgeBaseConfig.findMany({
       where: { knowledgeBaseId: { in: kbIds } },
-      select: { knowledgeBaseId: true, hallucinationGuardEnabled: true, hallucinationThreshold: true }
+      select: { knowledgeBaseId: true, hallucinationGuardEnabled: true, hallucinationThreshold: true, outputGatingConfig: true }
     });
     for (const cfg of configs) slackKbConfigMap.set(cfg.knowledgeBaseId, cfg);
   }
@@ -5328,6 +5601,18 @@ async function handleSlackMessage(deployment: any, slackTeamId: string, slackUse
     const conversationIdToUse = isFollowUp ? (session?.difyConversationId ?? null) : null;
     const slackKbIterStart = Date.now();
     const slackKbAppUrl = kb?.difyAppUrl ?? "http://dify-api:5001";
+    const slackKbGatingConfig = slackKbConfigMap.get(mapping.knowledgeBaseId)?.outputGatingConfig ?? null;
+    // ── Input Guard — block before calling Dify if question contains sensitive data ──
+    const slackInputCheck = validateUserInput(text, mapping.knowledgeBaseId, slackKbGatingConfig);
+    if (slackInputCheck.blocked) {
+      results.push({
+        knowledgeBaseId: mapping.knowledgeBaseId,
+        knowledgeBaseName: kb?.name ?? mapping.knowledgeBaseId,
+        ownerUsername: kb?.ownerUsername,
+        answer: "Your question contains information that cannot be processed by this assistant. Please rephrase without including sensitive data."
+      });
+      continue;
+    }
     try {
       const result = await sendToDify(text, conversationIdToUse, mapping.knowledgeBaseId, slackKbAppUrl, slackUserId);
       const slackDifyCallMs = result.timingMs.difyCallMs;
@@ -5354,7 +5639,7 @@ async function handleSlackMessage(deployment: any, slackTeamId: string, slackUse
       }
 
       // ── H6: Output Gating for Slack path ──────────────────────────────────
-      const slackGateResult = validateLlmOutput(result.answer, mapping.knowledgeBaseId, {});
+      const slackGateResult = validateLlmOutput(result.answer, mapping.knowledgeBaseId, {}, slackKbGatingConfig);
       // ── Hallucination Guard for Slack path ────────────────────────────────
       const slackKbGuardConfig = slackKbConfigMap.get(mapping.knowledgeBaseId) ?? null;
       const slackGuardResult = await checkHallucinationGuard(text, result.answer, result.retrievedChunks, mapping.knowledgeBaseId, {}, slackKbGuardConfig);
@@ -5364,8 +5649,11 @@ async function handleSlackMessage(deployment: any, slackTeamId: string, slackUse
       let slackFallbackUsed = false;
       if (!slackSafe) {
         const slackSynthesized = await synthesizeFromChunks(text, result.retrievedChunks, mapping.knowledgeBaseId);
-        slackFinalAnswer = slackSynthesized
+        const slackRaw = slackSynthesized
           ?? `Based on retrieved documents:\n\n${result.retrievedChunks.slice(0, 2).map(c => c.content).join("\n\n---\n\n")}`;
+        // Gate the fallback answer too — synthesizeFromChunks can also reveal credentials from raw chunks
+        const slackFallbackGate = validateLlmOutput(slackRaw, mapping.knowledgeBaseId, {}, slackKbGatingConfig);
+        slackFinalAnswer = slackFallbackGate.sanitized;
         slackFallbackUsed = true;
       } else {
         slackFinalAnswer = slackGateResult.sanitized;
@@ -6463,8 +6751,10 @@ app.get("/rag/knowledge-bases/default-prompt", async (request, reply) => {
   return {
     defaultPrompt: PLATFORM_DEFAULT_SYSTEM_PROMPT,
     description:
-      "This prompt is always applied to every knowledge base chat session. " +
-      "You can add KB-specific instructions — they will be placed before these platform grounding rules."
+      "Reference copy of the platform grounding rules. " +
+      "This text is no longer force-appended to every KB — instead, these rules are embedded verbatim " +
+      "in generated system prompts as visible, editable sections. " +
+      "Security enforcement is handled by output gating (code-level), not system prompt injection."
   };
 });
 
@@ -6488,6 +6778,9 @@ app.post("/rag/prompt-templates/generate", async (request, reply) => {
   if (!apiKey || apiKey === "PLACEHOLDER_UPDATE_ME") return reply.code(503).send({ error: "LLM_NOT_CONFIGURED", details: "Add API credentials at Vault path platform/global/llm (fields: api_key, model, base_url)" });
   const model = String((llmSecrets as any).model ?? "claude-sonnet-4-6").trim();
   const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
+  // max_output_tokens: read from Vault so operators can adjust without a deploy.
+  // 2000 is safe for all currently supported models (GPT-4o-mini: 16k, Claude Sonnet: 8k).
+  const maxOutputTokens = Number((llmSecrets as any).max_output_tokens ?? 2000);
 
   // Category descriptions for the 5 built-in roles; for custom/unknown categories use
   // the template name + description as the domain context so the LLM can tailor the prompt.
@@ -6511,11 +6804,16 @@ app.post("/rag/prompt-templates/generate", async (request, reply) => {
       `Requirements:\n` +
       `- Start with a ## Role section describing the assistant's expertise and domain\n` +
       `- Include a ## Response Format section with numbered steps appropriate for the role\n` +
-      `- Include a ## Domain Rules section with 4-6 role-specific rules\n` +
+      `- Include a ## Domain Rules section with 4-6 role-specific rules relevant to the domain\n` +
       `- Be concise, professional, and domain-appropriate\n` +
-      `- Do NOT include generic platform rules (source citations, credential security, faithfulness) — those are appended automatically\n` +
       `- Use markdown headings (##) and bullet points\n` +
-      `- Aim for 150-250 words\n\n` +
+      `- Include a ## Security — Absolute Rules section using EXACTLY this text (do not rephrase or abbreviate):\n\n` +
+      `${ABSOLUTE_SECURITY_RULE}\n\n` +
+      `- Include a ## Privacy — Advisory Rules section using EXACTLY this text (do not rephrase or abbreviate):\n\n` +
+      `${ADVISORY_PRIVACY_RULE}\n\n` +
+      `- Include a ## Faithfulness & Source Attribution section using EXACTLY this text (do not rephrase or abbreviate):\n\n` +
+      `${FAITHFULNESS_RULE}\n\n` +
+      `- Aim for 350-500 words total\n\n` +
       `Output ONLY the system prompt text with no preamble, explanation, or surrounding quotes.`;
   } else {
     metaPrompt =
@@ -6527,8 +6825,13 @@ app.post("/rag/prompt-templates/generate", async (request, reply) => {
       `- Add a ## Response Format section with numbered steps if missing\n` +
       `- Add a ## Domain Rules section with role-specific rules if missing\n` +
       `- Use markdown headings (##) and bullet points\n` +
-      `- Be concise and professional (aim for 150-300 words)\n` +
-      `- Do NOT include generic platform rules (source citations, credential security, faithfulness) — those are appended automatically\n\n` +
+      `- Be concise and professional (aim for 350-500 words total)\n` +
+      `- REPLACE any existing credential or security rules with EXACTLY the following ## Security — Absolute Rules section (do not rephrase or abbreviate):\n\n` +
+      `${ABSOLUTE_SECURITY_RULE}\n\n` +
+      `- REPLACE any existing PII or privacy rules with EXACTLY the following ## Privacy — Advisory Rules section (do not rephrase or abbreviate):\n\n` +
+      `${ADVISORY_PRIVACY_RULE}\n\n` +
+      `- If a faithfulness / source citation section is missing, add EXACTLY the following (do not rephrase or abbreviate):\n\n` +
+      `${FAITHFULNESS_RULE}\n\n` +
       `Output ONLY the rewritten system prompt text with no preamble, explanation, or surrounding quotes.`;
   }
 
@@ -6542,7 +6845,7 @@ app.post("/rag/prompt-templates/generate", async (request, reply) => {
       },
       body: JSON.stringify({
         model,
-        max_tokens: 1500,
+        max_tokens: maxOutputTokens,
         messages: [{ role: "user", content: metaPrompt }]
       })
     });

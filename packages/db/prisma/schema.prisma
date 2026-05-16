@@ -120,6 +120,21 @@ model RagKnowledgeBaseConfig {
   hallucinationGuardEnabled Boolean @default(true)  // on by default; LLM-as-judge blocks hallucinated answers
   hallucinationThreshold    Float   @default(0.3)   // block if groundedness score < this value
 
+  // Per-KB output gating configuration
+  // JSON shape: {
+  //   emailGating?: boolean         -- default: false (emails are legitimate contact info for many bots)
+  //   phoneGating?: boolean         -- default: false
+  //   customPatterns?: Array<{
+  //     id: string                  -- uuid for UI keying
+  //     label: string               -- shown in redacted output e.g. "[SSN REDACTED]"
+  //     pattern: string             -- regex string (validated before save)
+  //     enabled: boolean
+  //   }>
+  // }
+  // Always-on patterns (passwords, API keys, credit cards, SSN, IBAN, JWT, PEM keys,
+  // medical IDs, passport, routing numbers) are hardcoded and cannot be disabled.
+  outputGatingConfig Json?
+
   updatedAt DateTime @updatedAt
 
   @@index([knowledgeBaseId])

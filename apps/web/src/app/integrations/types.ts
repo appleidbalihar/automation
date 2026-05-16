@@ -21,6 +21,19 @@ export type FailedDifyDocument = {
   retryable?: boolean;
 };
 
+export type OutputGatingCustomPattern = {
+  id: string;
+  label: string;
+  pattern: string;
+  enabled: boolean;
+};
+
+export type OutputGatingConfig = {
+  emailGating?: boolean;
+  phoneGating?: boolean;
+  customPatterns?: OutputGatingCustomPattern[];
+};
+
 export type KbConfig = {
   systemPromptBase?: string | null;
   responseStyle?: string | null;
@@ -28,6 +41,7 @@ export type KbConfig = {
   restrictionRules?: string | null;
   topK?: number | null;
   scoreThreshold?: number | null;
+  outputGatingConfig?: OutputGatingConfig | null;
 };
 
 export type Integration = {
@@ -98,6 +112,16 @@ export const EMPTY_FORM: IntegrationForm = {
   templateId: ""
 };
 
+export type DifyIndexingStats = {
+  total: number;
+  completed: number;
+  inProgress: number;
+  queuing: number;
+  error: number;
+  retryAttempt?: number;
+  maxRetries?: number;
+};
+
 export type NormalizedSyncStep = {
   key: string;
   task: string;
@@ -108,6 +132,7 @@ export type NormalizedSyncStep = {
   durationLabel: string;
   errorMessage: string | null;
   failedDocuments: FailedDifyDocument[];
+  difyStats: DifyIndexingStats | null;
 };
 
 export function formatDate(value?: string | null): string {
@@ -243,6 +268,18 @@ export function normalizeSyncSteps(stepsJson: unknown): NormalizedSyncStep[] {
           ? o.error
           : null;
     const id = typeof o.id === "string" ? o.id : `${i}-${task}`;
+    const ds = o.difyStats && typeof o.difyStats === "object" ? (o.difyStats as Record<string, unknown>) : null;
+    const difyStats: DifyIndexingStats | null = ds
+      ? {
+          total: Number(ds.total ?? 0),
+          completed: Number(ds.completed ?? 0),
+          inProgress: Number(ds.inProgress ?? 0),
+          queuing: Number(ds.queuing ?? 0),
+          error: Number(ds.error ?? 0),
+          retryAttempt: ds.retryAttempt != null ? Number(ds.retryAttempt) : undefined,
+          maxRetries: ds.maxRetries != null ? Number(ds.maxRetries) : undefined
+        }
+      : null;
     return {
       key: id,
       task,
@@ -251,7 +288,8 @@ export function normalizeSyncSteps(stepsJson: unknown): NormalizedSyncStep[] {
       startedAt,
       durationLabel: formatDuration(pickDurationMs(o)),
       errorMessage: err,
-      failedDocuments: normalizeFailedDifyDocuments(o.failedDocuments)
+      failedDocuments: normalizeFailedDifyDocuments(o.failedDocuments),
+      difyStats
     };
   });
 }
@@ -264,6 +302,7 @@ export function hasFailedDifyIndexing(job: SyncJob | null | undefined): boolean 
 export function isFailedDifyIndexingStep(step: NormalizedSyncStep): boolean {
   return (
     (step.logStepName === "dify_indexing" || step.logStepName === "retry_failed_indexing") &&
+    step.status !== "running" &&
     (step.status === "failed" || step.errorMessage != null || step.failedDocuments.length > 0)
   );
 }

@@ -3,7 +3,7 @@
 import type { ReactElement } from "react";
 import { useEffect, useState } from "react";
 import { requestJson } from "./api";
-import type { Integration, KbConfig } from "./types";
+import type { Integration, KbConfig, OutputGatingConfig } from "./types";
 import type { PromptTemplate } from "../prompt-templates/types";
 import { CATEGORY_ICONS } from "../prompt-templates/types";
 import { applyTemplateToKb, listTemplates } from "../prompt-templates/api";
@@ -64,6 +64,18 @@ export function SystemPromptPanel({ kbId, initialConfig, templateId: initialTemp
   const [topK, setTopK] = useState<number>(initialConfig?.topK ?? 4);
   const [scoreThreshold, setScoreThreshold] = useState<number>(initialConfig?.scoreThreshold ?? 0.4);
 
+  const [outputGatingOpen, setOutputGatingOpen] = useState(false);
+  const [showAlwaysOnModal, setShowAlwaysOnModal] = useState(false);
+  const [outputGatingConfig, setOutputGatingConfig] = useState<OutputGatingConfig>({
+    emailGating: initialConfig?.outputGatingConfig?.emailGating ?? false,
+    phoneGating: initialConfig?.outputGatingConfig?.phoneGating ?? false,
+    customPatterns: initialConfig?.outputGatingConfig?.customPatterns ?? []
+  });
+  const [newPatternLabel, setNewPatternLabel] = useState("");
+  const [newPatternRegex, setNewPatternRegex] = useState("");
+  const [newPatternError, setNewPatternError] = useState<string | null>(null);
+  const [customPatternErrors, setCustomPatternErrors] = useState<Record<string, string>>({});
+
   const [generating, setGenerating] = useState(false);
   const [suggestion, setSuggestion] = useState<string | null>(null);
   const [generateError, setGenerateError] = useState<string | null>(null);
@@ -90,6 +102,11 @@ export function SystemPromptPanel({ kbId, initialConfig, templateId: initialTemp
     setRestrictionRules(initialConfig?.restrictionRules ?? "");
     setTopK(initialConfig?.topK ?? 4);
     setScoreThreshold(initialConfig?.scoreThreshold ?? 0.4);
+    setOutputGatingConfig({
+      emailGating: initialConfig?.outputGatingConfig?.emailGating ?? false,
+      phoneGating: initialConfig?.outputGatingConfig?.phoneGating ?? false,
+      customPatterns: initialConfig?.outputGatingConfig?.customPatterns ?? []
+    });
   }, [initialConfig]);
 
   useEffect(() => {
@@ -164,7 +181,8 @@ export function SystemPromptPanel({ kbId, initialConfig, templateId: initialTemp
         toneInstructions: toneInstructions.trim() || null,
         restrictionRules: restrictionRules.trim() || null,
         topK,
-        scoreThreshold
+        scoreThreshold,
+        outputGatingConfig
       };
       const updated = await requestJson<ConfigSaveResponse>(`/rag/knowledge-bases/${kbId}/config`, "PATCH", patch);
       onSaved?.({
@@ -173,7 +191,8 @@ export function SystemPromptPanel({ kbId, initialConfig, templateId: initialTemp
         toneInstructions: updated.toneInstructions ?? null,
         restrictionRules: updated.restrictionRules ?? null,
         topK: updated.topK ?? null,
-        scoreThreshold: updated.scoreThreshold ?? null
+        scoreThreshold: updated.scoreThreshold ?? null,
+        outputGatingConfig: (updated as any).outputGatingConfig ?? null
       });
       if (updated.difyPromptError) {
         setSaveStatus("Fine-tune saved. AI Agent update needs attention.");
@@ -352,6 +371,176 @@ export function SystemPromptPanel({ kbId, initialConfig, templateId: initialTemp
             </button>
             {saveStatus && <span className="ops-system-prompt-save-ok">{saveStatus}</span>}
             {saveError && <span className="ops-system-prompt-save-error">{saveError}</span>}
+          </div>
+        </div>
+      )}
+
+      {/* ── Output Gating (collapsible) ── */}
+      <button
+        type="button"
+        className="tpl-finetune-toggle"
+        style={{ marginTop: 12 }}
+        onClick={() => setOutputGatingOpen((v) => !v)}
+      >
+        {outputGatingOpen ? "▾" : "▸"} Output Gating <span style={{ color: "#888", fontWeight: 400, fontSize: "0.85em" }}>(applies to questions AND responses)</span>
+      </button>
+
+      {outputGatingOpen && (
+        <div className="tpl-finetune-panel">
+          <p className="tpl-hint" style={{ marginBottom: 10 }}>
+            These rules apply to both incoming questions and outgoing responses. If a question or answer contains a blocked pattern, it is stopped before any further processing.
+          </p>
+
+          {/* Always-on section */}
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontWeight: 600, fontSize: "0.9em" }}>🔒 Always Blocked</span>
+              <span style={{ color: "#888", fontSize: "0.85em" }}>12 categories protected</span>
+              <button
+                type="button"
+                className="ops-btn ops-btn-ghost ops-btn-sm"
+                onClick={() => setShowAlwaysOnModal(true)}
+                style={{ fontSize: "0.8em" }}
+              >
+                ⓘ View
+              </button>
+            </div>
+          </div>
+
+          {/* Optional gates */}
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontWeight: 600, fontSize: "0.9em", marginBottom: 6 }}>Optional Blocks <span style={{ color: "#888", fontWeight: 400 }}>(off by default)</span></div>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={outputGatingConfig.emailGating ?? false}
+                onChange={(e) => setOutputGatingConfig((c) => ({ ...c, emailGating: e.target.checked }))}
+              />
+              <span>Email addresses</span>
+              <span className="ops-form-label-hint">— disable if your bot should share support or sales contact emails</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={outputGatingConfig.phoneGating ?? false}
+                onChange={(e) => setOutputGatingConfig((c) => ({ ...c, phoneGating: e.target.checked }))}
+              />
+              <span>Phone numbers</span>
+              <span className="ops-form-label-hint">— disable if your bot should share support or sales contact numbers</span>
+            </label>
+          </div>
+
+          {/* Custom patterns */}
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontWeight: 600, fontSize: "0.9em", marginBottom: 6 }}>Custom Patterns</div>
+
+            {(outputGatingConfig.customPatterns ?? []).map((cp) => (
+              <div key={cp.id} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={cp.enabled}
+                  onChange={(e) => {
+                    setOutputGatingConfig((c) => ({
+                      ...c,
+                      customPatterns: (c.customPatterns ?? []).map((p) => p.id === cp.id ? { ...p, enabled: e.target.checked } : p)
+                    }));
+                  }}
+                  title="Enable/disable this pattern"
+                />
+                <span style={{ minWidth: 90, fontSize: "0.85em", fontWeight: 500 }}>{cp.label || "(unlabelled)"}</span>
+                <code style={{ fontSize: "0.8em", background: "#f0f0f0", padding: "2px 6px", borderRadius: 3, flex: 1 }}>{cp.pattern}</code>
+                {customPatternErrors[cp.id] && <span style={{ color: "red", fontSize: "0.8em" }}>{customPatternErrors[cp.id]}</span>}
+                <button
+                  type="button"
+                  className="ops-btn ops-btn-ghost ops-btn-sm"
+                  style={{ color: "#c00" }}
+                  onClick={() => setOutputGatingConfig((c) => ({ ...c, customPatterns: (c.customPatterns ?? []).filter((p) => p.id !== cp.id) }))}
+                  title="Remove"
+                >
+                  🗑
+                </button>
+              </div>
+            ))}
+
+            <div style={{ display: "flex", alignItems: "flex-start", gap: 8, marginTop: 8 }}>
+              <input
+                type="text"
+                className="ops-input"
+                placeholder="Label (e.g. Employee ID)"
+                value={newPatternLabel}
+                onChange={(e) => setNewPatternLabel(e.target.value)}
+                style={{ width: 150 }}
+              />
+              <input
+                type="text"
+                className="ops-input"
+                placeholder="Regex pattern"
+                value={newPatternRegex}
+                onChange={(e) => { setNewPatternRegex(e.target.value); setNewPatternError(null); }}
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                className="ops-btn ops-btn-secondary ops-btn-sm"
+                onClick={() => {
+                  if (!newPatternRegex.trim()) { setNewPatternError("Pattern required"); return; }
+                  try {
+                    new RegExp(newPatternRegex.trim());
+                  } catch {
+                    setNewPatternError("Invalid regex"); return;
+                  }
+                  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+                  setOutputGatingConfig((c) => ({
+                    ...c,
+                    customPatterns: [...(c.customPatterns ?? []), { id, label: newPatternLabel.trim() || "Custom", pattern: newPatternRegex.trim(), enabled: true }]
+                  }));
+                  setNewPatternLabel("");
+                  setNewPatternRegex("");
+                  setNewPatternError(null);
+                }}
+              >
+                + Add
+              </button>
+            </div>
+            {newPatternError && <p style={{ color: "red", fontSize: "0.8em", marginTop: 4 }}>{newPatternError}</p>}
+          </div>
+
+          <div className="ops-system-prompt-save-row" style={{ marginTop: 12 }}>
+            <button type="button" className="ops-btn ops-btn-primary" onClick={() => void handleSaveFineTune()} disabled={saving}>
+              {saving ? "Saving…" : "Save Gating Config"}
+            </button>
+            {saveStatus && <span className="ops-system-prompt-save-ok">{saveStatus}</span>}
+            {saveError && <span className="ops-system-prompt-save-error">{saveError}</span>}
+          </div>
+        </div>
+      )}
+
+      {/* ── Always-On Modal ── */}
+      {showAlwaysOnModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }}
+          onClick={() => setShowAlwaysOnModal(false)}>
+          <div style={{ background: "#fff", borderRadius: 8, padding: 24, maxWidth: 480, width: "90%", boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
+            onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <strong>Always-Blocked Categories</strong>
+              <button type="button" className="ops-btn ops-btn-ghost ops-btn-sm" onClick={() => setShowAlwaysOnModal(false)}>✕</button>
+            </div>
+            <p style={{ fontSize: "0.85em", color: "#666", marginBottom: 14 }}>These cannot be disabled for any knowledge base.</p>
+            {[
+              { icon: "🔒", title: "Credentials", items: ["Passwords, default/initial credentials", "API keys and tokens (sk-..., ghp_..., glpat-..., xox...)"] },
+              { icon: "🔒", title: "Payment", items: ["Credit/debit card numbers", "Bank account & routing numbers, IBAN/SWIFT"] },
+              { icon: "🔒", title: "Government Identity", items: ["SSN / national ID numbers", "Passport numbers", "Driver's licence numbers"] },
+              { icon: "🔒", title: "Cryptographic Material", items: ["PEM private keys (RSA, EC, SSH, PGP)", "JWT tokens, OAuth refresh tokens"] },
+              { icon: "🔒", title: "Medical / Health", items: ["Patient IDs, MRN, Medicare/Medicaid numbers"] },
+              { icon: "🔒", title: "Other Sensitive", items: ["Security question answers", "Biometric identifiers"] }
+            ].map((section) => (
+              <div key={section.title} style={{ marginBottom: 12 }}>
+                <div style={{ fontWeight: 600, fontSize: "0.875em" }}>{section.icon} {section.title}</div>
+                {section.items.map((item) => (
+                  <div key={item} style={{ fontSize: "0.8em", color: "#555", paddingLeft: 20, marginTop: 2 }}>• {item}</div>
+                ))}
+              </div>
+            ))}
           </div>
         </div>
       )}
