@@ -1,7 +1,8 @@
 export const DEFAULT_WORKFLOW_IDS: Record<string, string> = {
-  github: "rag-sync-github",
-  gitlab: "rag-sync-gitlab",
-  googledrive: "rag-sync-gdrive",
+  source: "rag-sync-source",
+  github: "rag-sync-source",
+  gitlab: "rag-sync-source",
+  googledrive: "rag-sync-source",
   web: "rag-sync-web",
   upload: ""
 };
@@ -47,6 +48,15 @@ export function resolveDifyWorkflowId(
   workflowIds: Record<string, string> = DEFAULT_WORKFLOW_IDS
 ): string {
   const normalizedType = normalizedDifySourceType(sourceType);
+  if (["github", "gitlab", "googledrive"].includes(normalizedType)) {
+    return (
+      nonEmptyString(configSecret.source_workflow_id) ??
+      nonEmptyString(configSecret[`${normalizedType}_workflow_id`]) ??
+      workflowIds[normalizedType] ??
+      workflowIds.source ??
+      ""
+    );
+  }
   return nonEmptyString(configSecret[`${normalizedType}_workflow_id`]) ?? workflowIds[normalizedType] ?? "";
 }
 

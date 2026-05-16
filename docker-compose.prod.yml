@@ -125,6 +125,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec
     mem_limit: 512m
     cpus: 0.5
 
@@ -162,6 +165,8 @@ services:
     mem_limit: 512m
     cpus: 0.5
     # Port NOT published in prod — accessed via nginx web-ingress at /n8n/
+    # entrypoint, volumes (templates + init-workflows.sh) are inherited from
+    # docker-compose.yml — no manual workflow import step needed on deploy.
 
   # ── cert-rotation-controller ───────────────────────────────────────────────
   cert-rotation-controller:

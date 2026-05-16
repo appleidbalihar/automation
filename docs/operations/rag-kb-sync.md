@@ -229,24 +229,33 @@ ORDER BY "updatedAt" DESC;
 
 ## n8n Workflow Maintenance
 
-Template files:
+All three source types (GitHub, GitLab, Google Drive) use a single unified workflow:
 
 ```text
-infra/n8n/templates/github-to-dify-sync.json
-infra/n8n/templates/gitlab-to-dify-sync.json
+infra/n8n/templates/source-to-dify-sync.json   ← active, handles all sources
+infra/n8n/templates/github-to-dify-sync.json   ← legacy, inactive
+infra/n8n/templates/gitlab-to-dify-sync.json   ← legacy, inactive
 ```
 
-Editing the JSON file alone does not update the active n8n workflow. Publish a new `workflow_history` version and update `workflow_entity.activeVersionId`, then recreate n8n if needed:
+The init script (`infra/n8n/init-workflows.sh`) imports and activates
+`source-to-dify-sync.json` automatically on every container start. No manual
+import is needed.
+
+**To apply an updated template**, just restart n8n:
 
 ```bash
-docker compose stop n8n
-docker compose rm -f n8n
-docker compose up -d n8n
+scripts/platform-containers.sh prod restart n8n
 ```
 
-Known workflow IDs:
+Active webhook:
+
+| Workflow | Webhook path | ID |
+|----------|--------------|----|
+| Generic Source to Dify Sync | `POST /webhook/rag-sync-source` | `rag-sync-source-template` |
+
+Legacy workflows (inactive — kept for reference only):
 
 | Workflow | ID |
 |----------|----|
-| GitHub to Dify Sync | `4f8dbb73-d6c5-4a55-8178-8c4f51c76d01` |
-| GitLab to Dify Sync | `22d3d7b8-d94b-4300-a3a3-b55835e6c902` |
+| GitHub → Dify KB Sync | `c81ad5e4-7f92-4e07-a2d3-741534a0c16c` |
+| GitLab → Dify KB Sync | `22d3d7b8-d94b-4300-a3a3-b55835e6c902` |

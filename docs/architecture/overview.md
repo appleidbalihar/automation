@@ -129,7 +129,7 @@ When an operator triggers a knowledge base sync:
 1. Operator clicks "Sync" in Knowledge Connector UI
 2. POST /gateway/rag/knowledge-bases/:id/sync → api-gateway → workflow-service
 3. workflow-service creates a RagKbSyncJob record
-4. workflow-service triggers n8n webhook (rag-sync-github / rag-sync-gitlab / etc.)
+4. workflow-service triggers n8n webhook (rag-sync-source — unified for GitHub, GitLab, Google Drive)
 5. n8n fetches source files from GitHub/GitLab/Google Drive
 6. n8n calls sync-diff endpoint to find changed files
 7. Changed/new files are uploaded and indexed in Dify

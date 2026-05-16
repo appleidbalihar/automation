@@ -8,7 +8,7 @@
 | Sync orchestration | `apps/workflow-service/src/main.ts` |
 | UI source management | `apps/web/src/app/integrations-page.tsx` and `apps/web/src/app/integrations/*` |
 | Prisma models | `packages/db/prisma/schema.prisma` |
-| n8n templates | `infra/n8n/templates/github-to-dify-sync.json`, `infra/n8n/templates/gitlab-to-dify-sync.json` |
+| n8n templates | `infra/n8n/templates/source-to-dify-sync.json` (unified), legacy: `github-to-dify-sync.json`, `gitlab-to-dify-sync.json` |
 
 ## Important Routes
 
@@ -209,29 +209,32 @@ Request body may include a `syncJobId` and/or `documentIds`. The workflow-servic
 
 ## n8n Template Updates
 
-The template files are source-controlled, but n8n runtime data lives in the n8n database. After editing a template, publish the new nodes/connections into `workflow_history` and update `workflow_entity.activeVersionId`.
-
-Current template paths:
+All source types (GitHub, GitLab, Google Drive) route through one unified workflow:
 
 ```text
-infra/n8n/templates/github-to-dify-sync.json
-infra/n8n/templates/gitlab-to-dify-sync.json
+infra/n8n/templates/source-to-dify-sync.json   ← the only active template
 ```
 
-Known workflow IDs used by existing docs/scripts:
+`infra/n8n/init-workflows.sh` imports and activates this file automatically on
+every container start (mounted via `docker-compose.yml`). To apply a template
+change, edit the JSON and restart n8n:
+
+```bash
+scripts/platform-containers.sh dev restart n8n
+```
+
+Active workflow:
+
+| Workflow | Webhook path | ID |
+|----------|--------------|----|
+| Generic Source to Dify Sync | `POST /webhook/rag-sync-source` | `rag-sync-source-template` |
+
+Legacy workflows (inactive):
 
 | Workflow | ID |
 |----------|----|
-| GitHub to Dify Sync | `4f8dbb73-d6c5-4a55-8178-8c4f51c76d01` |
-| GitLab to Dify Sync | `22d3d7b8-d94b-4300-a3a3-b55835e6c902` |
-
-After publishing, recreate n8n if restart does not pick up the active version:
-
-```bash
-docker compose stop n8n
-docker compose rm -f n8n
-docker compose up -d n8n
-```
+| GitHub → Dify KB Sync | `c81ad5e4-7f92-4e07-a2d3-741534a0c16c` |
+| GitLab → Dify KB Sync | `22d3d7b8-d94b-4300-a3a3-b55835e6c902` |
 
 ## Development Checks
 

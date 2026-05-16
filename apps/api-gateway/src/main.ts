@@ -1431,12 +1431,12 @@ app.get("/oauth/connect/:provider", { preHandler: requireAnyRole(["admin", "user
 
   const redirectUri = `${OAUTH_CALLBACK_BASE_URL}/oauth/callback/${provider}`;
   const authorizeUrl = new URL(provCfg.authUrl);
+  authorizeUrl.searchParams.set("response_type", "code");
   authorizeUrl.searchParams.set("client_id", clientId);
   authorizeUrl.searchParams.set("redirect_uri", redirectUri);
   authorizeUrl.searchParams.set("scope", provCfg.scope);
   authorizeUrl.searchParams.set("state", state);
   if (provider === "google") {
-    authorizeUrl.searchParams.set("response_type", "code");
     authorizeUrl.searchParams.set("access_type", "offline");
     authorizeUrl.searchParams.set("prompt", "consent");
   }

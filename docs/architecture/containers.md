@@ -37,10 +37,13 @@ The platform runs the following Docker containers:
 
 ### `web`
 
-- Image: built with `infra/docker/Dockerfile.web`
+- Image: built with `infra/docker/Dockerfile.web` (~240 MB)
+- Base: `node:22-alpine`; runtime stage uses Next.js **standalone output** — no pnpm or full node_modules at runtime.
 - Port: `3000` internal
-- Framework: Next.js
+- Framework: Next.js 15 (`output: 'standalone'`)
+- Entrypoint: `node apps/web/server.js`
 - Purpose: RapidRAG landing page and authenticated platform UI.
+- Production: `read_only: true` with `/tmp` tmpfs (standalone server requires no writable FS).
 - Important env: `NEXT_PUBLIC_API_BASE_URL`, `NEXT_PUBLIC_PLATFORM_URL`, `NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL`, `WEB_INTERNAL_API_BASE_URL`, Keycloak env, `NODE_EXTRA_CA_CERTS`.
 - API proxy: `/gateway/*` forwards server-side to `WEB_INTERNAL_API_BASE_URL`, default `https://api-gateway:4000`.
 
@@ -54,7 +57,7 @@ The platform runs the following Docker containers:
 
 ### `api-gateway`
 
-- Image: shared service image built from `infra/docker/Dockerfile.service`
+- Image: shared service image built from `infra/docker/Dockerfile.service` (~1.1 GB); base `node:22-alpine`
 - Port: `4000`
 - Framework: Fastify
 - Purpose: browser-facing API boundary.
@@ -69,7 +72,7 @@ The platform runs the following Docker containers:
 
 ### `workflow-service`
 
-- Image: shared service image built from `infra/docker/Dockerfile.service`
+- Image: shared service image built from `infra/docker/Dockerfile.service` (~1.1 GB); base `node:22-alpine`
 - Port: `4001`
 - Framework: Fastify
 - Purpose: RAG orchestration service.
@@ -87,7 +90,7 @@ The platform runs the following Docker containers:
 
 ### `logging-service`
 
-- Image: shared service image built from `infra/docker/Dockerfile.service`
+- Image: shared service image built from `infra/docker/Dockerfile.service` (~1.1 GB); base `node:22-alpine`
 - Port: `4005`
 - Framework: Fastify
 - Purpose: platform log ingest and query service.
@@ -245,8 +248,9 @@ Start and restart through the platform wrapper so Vault-rendered runtime env fil
 
 ### `db-migrate`
 
-- Image: built with `infra/docker/Dockerfile.migrate`
+- Image: built with `infra/docker/Dockerfile.migrate` (~315 MB); base `node:22-alpine`, 2-stage build targeting `packages/db` only.
 - Purpose: Prisma migration job before app services start.
+- If it exits 1 with `relation "X" already exists`, the migration was applied manually but never recorded. Fix: `prisma migrate resolve --applied <name>` — see `PRODUCTION_MIGRATION.md` § Known Issues.
 
 ### Vault Agent sidecars
 

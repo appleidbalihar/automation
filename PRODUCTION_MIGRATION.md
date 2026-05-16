@@ -182,6 +182,24 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml \
 
 > Pulling third-party images (Keycloak, Dify, n8n, OpenSearch) happens automatically on first `up`. No separate `pull` step needed.
 
+**Build notes (post-2026-05-15 optimisation):**
+
+All custom images now use `node:22-alpine` as the base (replacing `node:22-bookworm-slim`). Approximate sizes after build:
+
+| Image | Size |
+|-------|------|
+| `web` | ~240 MB |
+| `service-base` (api-gateway / workflow-service / logging-service) | ~1.1 GB |
+| `db-migrate` | ~315 MB |
+
+The build uses `--frozen-lockfile` — `pnpm-lock.yaml` **must be committed and up to date** in the repo before building. If the lockfile is out of sync, the build fails with `ERR_PNPM_OUTDATED_LOCKFILE`. Fix locally with `pnpm install` and commit the updated lockfile before deploying.
+
+After the build, prune dangling images and build cache to reclaim disk space:
+
+```bash
+docker image prune -a -f && docker builder prune -a -f
+```
+
 ---
 
 ## Step 6 — Start the Full Stack
@@ -224,9 +242,12 @@ Keycloak users live in the persistent `keycloak_data` Docker volume. `infra/keyc
 
 ---
 
-## Step 8 — Post-Start: n8n Owner Setup and Workflow Import
+## Step 8 — Post-Start: n8n Owner Setup
 
-> n8n 2.x requires: **create owner → import workflows via CLI → publish via CLI → activate via REST API → restart**. The browser wizard and UI import work but are unreliable for webhooks — always use the CLI approach below.
+> **Workflow import is automatic.** `infra/n8n/init-workflows.sh` runs on every
+> container start (via the custom entrypoint in `docker-compose.yml`). It imports
+> `source-to-dify-sync.json`, activates it, and deactivates the legacy
+> GitHub/GitLab-only workflows. No manual import steps are needed.
 
 ### 8.1 — Create owner account (one-time)
 
@@ -243,82 +264,32 @@ curl -s -X POST "http://localhost:5679/rest/owner/setup" \
 # Expected: HTTP 200 with owner user JSON
 ```
 
-Save the owner `id` from the response — needed for workflow import.
-
-### 8.2 — Import workflows via CLI
+### 8.2 — Verify webhook is live
 
 ```bash
-# Sign in and get session cookie
-curl -s -c /tmp/n8n_cookies.txt -X POST "http://localhost:5679/rest/login" \
-  -H "Content-Type: application/json" \
-  -d '{"emailOrLdapLoginId":"admin@platform.local","password":"YOUR_PASSWORD"}'
-
-# Get owner user ID
-OWNER_ID=$(curl -s -b /tmp/n8n_cookies.txt http://localhost:5679/rest/users \
-  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-echo "Owner ID: $OWNER_ID"
-
-# Copy workflow templates into the container
-docker cp infra/n8n/templates/github-to-dify-sync.json \
-  $(docker ps -qf name=n8n-1):/tmp/github-workflow.json
-docker cp infra/n8n/templates/gitlab-to-dify-sync.json \
-  $(docker ps -qf name=n8n-1):/tmp/gitlab-workflow.json
-
-# Import via CLI (ignore the "Deactivating" warning — that's expected)
-docker exec $(docker ps -qf name=n8n-1) \
-  n8n import:workflow --input=/tmp/github-workflow.json --userId="$OWNER_ID"
-docker exec $(docker ps -qf name=n8n-1) \
-  n8n import:workflow --input=/tmp/gitlab-workflow.json --userId="$OWNER_ID"
-```
-
-### 8.3 — Publish workflows via CLI
-
-```bash
-# Get the IDs of the imported workflows
-GH_ID=$(curl -s -b /tmp/n8n_cookies.txt http://localhost:5679/rest/workflows \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); \
-    print(next(w['id'] for w in d['data'] if 'GitHub' in w['name']))")
-GL_ID=$(curl -s -b /tmp/n8n_cookies.txt http://localhost:5679/rest/workflows \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); \
-    print(next(w['id'] for w in d['data'] if 'GitLab' in w['name']))")
-
-docker exec $(docker ps -qf name=n8n-1) n8n publish:workflow --id="$GH_ID"
-docker exec $(docker ps -qf name=n8n-1) n8n publish:workflow --id="$GL_ID"
-```
-
-### 8.4 — Activate workflows via REST API
-
-```bash
-for id in $GH_ID $GL_ID; do
-  curl -s -b /tmp/n8n_cookies.txt -X PATCH "http://localhost:5679/rest/workflows/$id" \
-    -H "Content-Type: application/json" -d '{"active":true}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); \
-      print(d['data']['name'], '→ active:', d['data']['active'])"
-done
-```
-
-### 8.5 — Restart n8n to register webhooks
-
-```bash
-/home/bali/09_automationplatform/scripts/platform-containers.sh prod restart n8n
-
-# Wait for startup and verify webhook registration
+# Wait for n8n to finish starting
 until docker logs $(docker ps -qf name=n8n-1) 2>&1 | grep -q "Editor is now accessible"; do
   sleep 3
 done
-docker logs $(docker ps -qf name=n8n-1) 2>&1 | grep -E "Activated|published"
-# Expected: "Activated workflow 'GitHub → Dify KB Sync'"
-#           "Activated workflow 'GitLab → Dify KB Sync'"
 
-# Test webhooks are live
-curl -s -X POST http://localhost:5679/webhook/rag-sync-github \
-  -H "Content-Type: application/json" -d '{}' | grep -o '"message":"[^"]*"'
-# Expected: {"message":"Workflow was started"}
+# Confirm the unified workflow is active
+docker logs $(docker ps -qf name=n8n-1) 2>&1 | grep "Activated"
+# Expected: Activated workflow "Generic Source to Dify Sync" (ID: rag-sync-source-template)
+
+# Test the webhook endpoint
+curl -s -o /dev/null -w "%{http_code}" \
+  -X POST http://localhost:5679/webhook/rag-sync-source \
+  -H "Content-Type: application/json" -d '{}'
+# Expected: 200
 ```
 
+### 8.3 — Updating the workflow template
+
+If you edit `infra/n8n/templates/source-to-dify-sync.json`, the change takes
+effect on the next container restart — the init script re-imports automatically:
+
 ```bash
-# Clean up temp files
-rm -f /tmp/n8n_cookies.txt
+scripts/platform-containers.sh prod restart n8n
 ```
 
 ---
@@ -690,6 +661,44 @@ ENVIRONMENT=prod bash scripts/rotate-secret.sh infra/postgres
 # Rotate everything
 ENVIRONMENT=prod bash scripts/rotate-secret.sh all
 ```
+
+---
+
+## Known Issues
+
+### `db-migrate` exits 1: `relation "X" already exists` (Prisma migration conflict)
+
+**Symptom:** `db-migrate` exits with code 1 and logs:
+
+```
+Error: P3018
+A migration failed to apply. New migrations cannot be applied before the error is recovered from.
+Database error code: 42P07
+Database error: ERROR: relation "X" already exists
+```
+
+**Root cause:** The table was created manually (or by a previous migration that ran against the DB but was never recorded in `_prisma_migrations`). Prisma sees the migration as unapplied and tries to re-create the table.
+
+**Fix — mark it as applied without running it:**
+
+```bash
+# Step 1: generate a short-lived runtime env from Vault
+RUNTIME_ENV="/run/platform-secrets/.env.prod.runtime"
+mkdir -p "$(dirname "$RUNTIME_ENV")"
+ENVIRONMENT=prod OUTPUT_FILE="$RUNTIME_ENV" bash scripts/generate-runtime-env.sh
+
+# Step 2: resolve the stuck migration (replace migration name with the one in the error)
+docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+  --env-file .env.production --env-file "$RUNTIME_ENV" \
+  run --rm --no-deps db-migrate \
+  pnpm --filter @platform/db exec prisma migrate resolve --applied <migration_name>
+
+# Step 3: clean up secrets and restart
+shred -u "$RUNTIME_ENV" 2>/dev/null || rm -f "$RUNTIME_ENV"
+scripts/platform-containers.sh prod start
+```
+
+After this, subsequent starts will apply all remaining migrations cleanly.
 
 ---
 

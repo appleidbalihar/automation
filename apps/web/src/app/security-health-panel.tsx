@@ -10,7 +10,7 @@ import { authHeaderFromStoredToken, fetchIdentity } from "./auth-client";
 // docs/plans/high-priority-implementation-plan.md is verified in production.
 // The compliance panel below will automatically show green badges as items ship.
 const COMPLIANCE_STATUS = {
-  H1_PII_REDACTION: true,           // PII Pre-Ingestion Redaction — redactPii() in n8n github/gitlab-to-dify-sync templates
+  H1_PII_REDACTION: true,           // PII Pre-Ingestion Redaction — redactPii() in n8n source/github/gitlab sync templates
   H2_OPENTELEMETRY: true,           // Distributed Tracing — createTraceHook wired into workflow-service onRequest
   H3_RAGAS_QUALITY: true,           // RAG Answer Quality — evaluateAnswerQuality() RAGAS-style async scoring
   H4_RETRIEVAL_METRICS: true,       // Quality stored in RagAnswerQualityLog (faithfulness + relevance per message)

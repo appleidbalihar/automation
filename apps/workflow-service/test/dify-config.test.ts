@@ -10,7 +10,12 @@ test("resolveDifyWorkflowId uses configured source workflow before defaults", ()
     resolveDifyWorkflowId("github", { github_workflow_id: "custom-github-sync" }),
     "custom-github-sync"
   );
-  assert.equal(resolveDifyWorkflowId("gdrive", {}), "rag-sync-gdrive");
+  assert.equal(
+    resolveDifyWorkflowId("gitlab", { source_workflow_id: "custom-source-sync", gitlab_workflow_id: "custom-gitlab-sync" }),
+    "custom-source-sync"
+  );
+  assert.equal(resolveDifyWorkflowId("gdrive", {}), "rag-sync-source");
+  assert.equal(resolveDifyWorkflowId("web", {}), "rag-sync-web");
 });
 
 test("buildDifyProvisioningConfig preserves OpenAI-compatible Vault settings", () => {
@@ -58,10 +63,10 @@ test("buildDifyProvisioningConfig supplies Dify model defaults", () => {
   assert.equal(config.difyAppUrl, "http://dify-api:5001");
   assert.equal(config.consoleEmail, "operations-ai@automation-platform.local");
   assert.equal(config.consoleName, "Automation Platform");
-  assert.equal(config.modelProvider, "openai");
+  assert.equal(config.modelProvider, "openai_api_compatible");
   assert.equal(config.modelApiKey, undefined);
   assert.equal(config.modelApiBase, undefined);
   assert.equal(config.chatModel, "gpt-4o-mini");
-  assert.equal(config.embeddingModel, "text-embedding-3-small");
+  assert.equal(config.embeddingModel, "nomic-embed-text");
   assert.equal(config.workflowId, "rag-sync-github");
 });

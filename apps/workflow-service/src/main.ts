@@ -33,12 +33,6 @@ import {
   mapRagDiscussionSummary,
   mapRagDiscussionThread
 } from "./rag-chat.js";
-import {
-  canModifyTemplate,
-  mapTemplateRow,
-  seedBuiltInTemplates,
-  visibleTemplatesWhere
-} from "./prompt-templates.js";
 
 const config = loadConfig("workflow-service", 4001);
 const tlsRuntime = createTlsRuntime({
@@ -396,12 +390,15 @@ function normalizeSourceType(sourceType: string, sourceUrl?: string): string {
   return requested;
 }
 
-function supportedDocumentPath(path: string): boolean {
+function supportedDocumentPath(path: string, options?: { includeDriveExports?: boolean }): boolean {
   const ext = path.split(".").pop()?.toLowerCase();
   // Text path (create_by_text): md, markdown, txt, html, htm, xml, csv, rst, mdx
   // Binary path (create_by_file, Dify standard ETL): pdf, docx, xlsx, xls
-  // pptx, ppt, eml, msg, epub require Dify Unstructured ETL (ETL_TYPE=Unstructured) — excluded
-  return Boolean(ext && ["md", "markdown", "txt", "html", "htm", "xml", "csv", "pdf", "docx", "xlsx", "xls", "rst", "mdx"].includes(ext));
+  // pptx is allowed only for Google Drive Slides exports in the generic sync workflow.
+  // ppt, eml, msg, epub require Dify Unstructured ETL (ETL_TYPE=Unstructured) — excluded
+  const supported = ["md", "markdown", "txt", "html", "htm", "xml", "csv", "pdf", "docx", "xlsx", "xls", "rst", "mdx"];
+  if (options?.includeDriveExports) supported.push("pptx");
+  return Boolean(ext && supported.includes(ext));
 }
 
 function normalizeSourcePath(value: unknown): string | null {
@@ -454,7 +451,10 @@ async function preflightGitHubSource(input: {
   if (!response.ok) {
     throw new Error(sourceAccessError("GitHub", response.status, await response.text().catch(() => "")));
   }
-  const payload = (await response.json()) as { tree?: Array<{ path?: string; type?: string }> };
+  const payload = (await response.json()) as { tree?: Array<{ path?: string; type?: string }>; truncated?: boolean };
+  if (payload.truncated) {
+    throw new Error("GitHub repository tree exceeds 100,000 files and was truncated. Use a more specific source path to limit the scope.");
+  }
   return (payload.tree ?? []).filter((item) => {
     const path = String(item.path ?? "");
     return item.type === "blob" && supportedDocumentPath(path) && matchesSourcePaths(path, input.sourcePath, input.sourcePaths ?? []);
@@ -472,36 +472,43 @@ async function preflightGitLabSource(input: {
   if (!match) throw new Error("Invalid GitLab repository URL");
   const projectPath = match[1].replace(/\.git$/i, "").replace(/\/+$/g, "");
   const encodedProjectPath = encodeURIComponent(projectPath);
-  let page = 1;
+
+  const authHeaders = {
+    "user-agent": "platform-rag-sync/1.0",
+    ...(input.token ? { "Authorization": `Bearer ${input.token}` } : {})
+  };
+
+  // Query each configured path separately so large repos don't push target files past the page limit
+  const normalizedPaths = normalizeSourcePaths(input.sourcePaths ?? [], input.sourcePath);
+  const pathsToQuery: Array<string | null> = normalizedPaths.length > 0 ? normalizedPaths : [null];
   let total = 0;
 
-  while (page <= 10) {
-    const url = new URL(`https://gitlab.com/api/v4/projects/${encodedProjectPath}/repository/tree`);
-    url.searchParams.set("ref", input.sourceBranch);
-    url.searchParams.set("recursive", "true");
-    url.searchParams.set("per_page", "100");
-    url.searchParams.set("page", String(page));
+  for (const filterPath of pathsToQuery) {
+    let page = 1;
+    while (page <= 50) {
+      const url = new URL(`https://gitlab.com/api/v4/projects/${encodedProjectPath}/repository/tree`);
+      url.searchParams.set("ref", input.sourceBranch);
+      url.searchParams.set("recursive", "true");
+      url.searchParams.set("per_page", "100");
+      url.searchParams.set("page", String(page));
+      if (filterPath) url.searchParams.set("path", filterPath);
 
-    const response = await fetch(url, {
-      headers: {
-        "user-agent": "platform-rag-sync/1.0",
-        ...(input.token ? { "PRIVATE-TOKEN": input.token } : {})
+      const response = await fetch(url, { headers: authHeaders });
+      if (!response.ok) {
+        throw new Error(sourceAccessError("GitLab", response.status, await response.text().catch(() => "")));
       }
-    });
-    if (!response.ok) {
-      throw new Error(sourceAccessError("GitLab", response.status, await response.text().catch(() => "")));
+
+      const files = (await response.json()) as Array<{ path?: string; type?: string }>;
+      total += files.filter((item) => {
+        const path = String(item.path ?? "");
+        return item.type === "blob" && supportedDocumentPath(path);
+      }).length;
+
+      const nextPage = response.headers.get("x-next-page");
+      if (!nextPage) break;
+      page = Number(nextPage);
+      if (!Number.isFinite(page) || page <= 0) break;
     }
-
-    const files = (await response.json()) as Array<{ path?: string; type?: string }>;
-    total += files.filter((item) => {
-      const path = String(item.path ?? "");
-      return item.type === "blob" && supportedDocumentPath(path) && matchesSourcePaths(path, input.sourcePath, input.sourcePaths ?? []);
-    }).length;
-
-    const nextPage = response.headers.get("x-next-page");
-    if (!nextPage) break;
-    page = Number(nextPage);
-    if (!Number.isFinite(page) || page <= 0) break;
   }
 
   return total;
@@ -3331,6 +3338,68 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
     return syncJob.id;
   }
 
+  // Refresh OAuth token before preflight so the preflight uses a valid token
+  const effectiveSourceSecrets = { ...sourceSecrets };
+  if (String(sourceSecrets.auth_method ?? "") === "oauth") {
+    const expiry = nonEmptyString(sourceSecrets.token_expiry);
+    if (expiry) {
+      const expiresAt = new Date(expiry).getTime();
+      const nowPlusFive = Date.now() + 5 * 60 * 1000;
+      if (expiresAt < nowPlusFive) {
+        const refreshToken = nonEmptyString(sourceSecrets.gitlab_refresh) ?? nonEmptyString(sourceSecrets.gdrive_refresh);
+        const sourceTypeStr = String(kb.sourceType ?? "");
+        const refreshUrl = sourceTypeStr === "gitlab" ? "https://gitlab.com/oauth/token" : "https://oauth2.googleapis.com/token";
+        const clientIdKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_ID" : "GOOGLE_CLIENT_ID";
+        const clientSecretKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_SECRET" : "GOOGLE_CLIENT_SECRET";
+        const clientId = String(process.env[clientIdKey] ?? sourceSecrets.oauth_client_id ?? "").trim();
+        const clientSecret = String(process.env[clientSecretKey] ?? sourceSecrets.oauth_client_secret ?? "").trim();
+        if (refreshToken && clientId && clientSecret) {
+          try {
+            const refreshRes = await fetch(refreshUrl, {
+              method: "POST",
+              headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+              body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId, client_secret: clientSecret }).toString()
+            });
+            const refreshPayload = (await refreshRes.json()) as Record<string, unknown>;
+            const newToken = String(refreshPayload.access_token ?? "").trim();
+            const newExpiry = Number(refreshPayload.expires_in ?? 0);
+            if (newToken) {
+              const newTokenExpiry = newExpiry > 0 ? new Date(Date.now() + newExpiry * 1000).toISOString() : undefined;
+              const ownerId = String(kb.ownerId ?? triggeredById).trim() || triggeredById;
+              const updatedSecrets: Record<string, string> = {
+                ...Object.fromEntries(Object.entries(sourceSecrets).map(([k, v]) => [k, String(v)])),
+                ...(sourceTypeStr === "gitlab" ? { gitlab_token: newToken } : { gdrive_token: newToken }),
+                ...(newTokenExpiry ? { token_expiry: newTokenExpiry } : {})
+              };
+              await writeVaultKv(userSourceSecretPath(ownerId, kbId), updatedSecrets).catch((e) =>
+                logInfo("OAuth token refresh Vault write failed", { service: "workflow-service", kbId, error: e instanceof Error ? e.message : String(e) })
+              );
+              if (sourceTypeStr === "gitlab") effectiveSourceSecrets.gitlab_token = newToken;
+              else effectiveSourceSecrets.gdrive_token = newToken;
+            }
+          } catch (err) {
+            logInfo("OAuth token refresh failed — using existing token", { service: "workflow-service", kbId, error: err instanceof Error ? err.message : String(err) });
+          }
+        } else if (!refreshToken) {
+          // No refresh token and token is expired — fail immediately before preflight
+          const syncJob = await prisma.ragKbSyncJob.create({
+            data: {
+              knowledgeBaseId: kbId,
+              trigger,
+              triggeredById,
+              status: "failed",
+              startedAt: new Date(),
+              completedAt: new Date(),
+              n8nWebhookUrl: n8nWorkflowId ? `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}` : null,
+              errorMessage: "OAuth access token expired. Please reconnect the integration."
+            }
+          });
+          return syncJob.id;
+        }
+      }
+    }
+  }
+
   let filesTotal: number | null = null;
   try {
     filesTotal = await preflightSourceDocumentCount(
@@ -3341,7 +3410,7 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
         sourcePath: kb.sourcePath,
         sourcePaths: (kb as any).sourcePaths ?? []
       },
-      sourceSecrets
+      effectiveSourceSecrets
     );
   } catch (error) {
     const syncJob = await prisma.ragKbSyncJob.create({
@@ -3391,60 +3460,6 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
         : null
     }
   });
-
-  // Refresh OAuth token if it is close to expiry (within 5 minutes)
-  const effectiveSourceSecrets = { ...sourceSecrets };
-  if (String(sourceSecrets.auth_method ?? "") === "oauth") {
-    const expiry = nonEmptyString(sourceSecrets.token_expiry);
-    if (expiry) {
-      const expiresAt = new Date(expiry).getTime();
-      const nowPlusFive = Date.now() + 5 * 60 * 1000;
-      if (expiresAt < nowPlusFive) {
-        const refreshToken = nonEmptyString(sourceSecrets.gitlab_refresh) ?? nonEmptyString(sourceSecrets.gdrive_refresh);
-        const sourceTypeStr = String(kb.sourceType ?? "");
-        const refreshUrl = sourceTypeStr === "gitlab" ? "https://gitlab.com/oauth/token" : "https://oauth2.googleapis.com/token";
-        const clientIdKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_ID" : "GOOGLE_CLIENT_ID";
-        const clientSecretKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_SECRET" : "GOOGLE_CLIENT_SECRET";
-        const clientId = String(process.env[clientIdKey] ?? "").trim();
-        const clientSecret = String(process.env[clientSecretKey] ?? "").trim();
-        if (refreshToken && clientId && clientSecret) {
-          try {
-            const refreshRes = await fetch(refreshUrl, {
-              method: "POST",
-              headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-              body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId, client_secret: clientSecret }).toString()
-            });
-            const refreshPayload = (await refreshRes.json()) as Record<string, unknown>;
-            const newToken = String(refreshPayload.access_token ?? "").trim();
-            const newExpiry = Number(refreshPayload.expires_in ?? 0);
-            if (newToken) {
-              const newTokenExpiry = newExpiry > 0 ? new Date(Date.now() + newExpiry * 1000).toISOString() : undefined;
-              const ownerId = String(kb.ownerId ?? triggeredById).trim() || triggeredById;
-              const updatedSecrets: Record<string, string> = {
-                ...Object.fromEntries(Object.entries(sourceSecrets).map(([k, v]) => [k, String(v)])),
-                ...(sourceTypeStr === "gitlab" ? { gitlab_token: newToken } : { gdrive_token: newToken }),
-                ...(newTokenExpiry ? { token_expiry: newTokenExpiry } : {})
-              };
-              await writeVaultKv(userSourceSecretPath(ownerId, kbId), updatedSecrets).catch((e) =>
-                logInfo("OAuth token refresh Vault write failed", { service: "workflow-service", kbId, error: e instanceof Error ? e.message : String(e) })
-              );
-              if (sourceTypeStr === "gitlab") effectiveSourceSecrets.gitlab_token = newToken;
-              else effectiveSourceSecrets.gdrive_token = newToken;
-            }
-          } catch (err) {
-            logInfo("OAuth token refresh failed — using existing token", { service: "workflow-service", kbId, error: err instanceof Error ? err.message : String(err) });
-          }
-        } else if (!refreshToken) {
-          // No refresh token and token is expired — fail the sync with a clear message
-          await prisma.ragKbSyncJob.update({
-            where: { id: syncJob.id },
-            data: { status: "failed", completedAt: new Date(), errorMessage: "OAuth access token expired. Please reconnect the integration." }
-          });
-          return syncJob.id;
-        }
-      }
-    }
-  }
 
   // If n8n workflow is configured, trigger it via webhook and capture execution ID
   if (n8nWorkflowId) {
@@ -4287,7 +4302,7 @@ app.post("/rag/knowledge-bases/:id/sync-diff", async (request, reply) => {
       if (item.type !== "blob" || !matchesSourcePaths(path, basePathStr, sourcePathsArr)) {
         continue;
       }
-      if (!supportedDocumentPath(path)) {
+      if (!supportedDocumentPath(path, { includeDriveExports: String(kb.sourceType ?? "") === "googledrive" })) {
         skippedUnsupported.push({ path, ext: path.split(".").pop()?.toLowerCase() ?? "" });
         continue;
       }
@@ -5934,9 +5949,10 @@ app.get("/admin/dify/config", async (request, reply) => {
       enabled: String(rerankerConfig.enabled ?? "true") === "true"
     },
     workflows: {
-      github: nonEmptyString(difyConfig.github_workflow_id as string) ?? "rag-sync-github",
-      gitlab: nonEmptyString(difyConfig.gitlab_workflow_id as string) ?? "rag-sync-gitlab",
-      googledrive: nonEmptyString(difyConfig.googledrive_workflow_id as string) ?? "rag-sync-gdrive",
+      source: nonEmptyString(difyConfig.source_workflow_id as string) ?? "rag-sync-source",
+      github: nonEmptyString(difyConfig.github_workflow_id as string) ?? "rag-sync-source",
+      gitlab: nonEmptyString(difyConfig.gitlab_workflow_id as string) ?? "rag-sync-source",
+      googledrive: nonEmptyString(difyConfig.googledrive_workflow_id as string) ?? "rag-sync-source",
       web: nonEmptyString(difyConfig.web_workflow_id as string) ?? "rag-sync-web"
     },
     console: {
@@ -5954,7 +5970,7 @@ app.patch("/admin/dify/config", async (request, reply) => {
     llm?: { model?: string; baseUrl?: string; apiKey?: string };
     embedding?: { model?: string; baseUrl?: string; apiKey?: string; maxChunks?: number };
     reranker?: { provider?: string; model?: string; apiBase?: string; apiKey?: string; enabled?: boolean };
-    workflows?: { github?: string; gitlab?: string; googledrive?: string; web?: string };
+    workflows?: { source?: string; github?: string; gitlab?: string; googledrive?: string; web?: string };
     console?: { appUrl?: string; email?: string; password?: string };
   };
 
@@ -5980,6 +5996,7 @@ app.patch("/admin/dify/config", async (request, reply) => {
     if (body.embedding.maxChunks != null) difyUpdate.embedding_max_chunks = body.embedding.maxChunks;
   }
   if (body.workflows) {
+    if (body.workflows.source) difyUpdate.source_workflow_id = body.workflows.source;
     if (body.workflows.github) difyUpdate.github_workflow_id = body.workflows.github;
     if (body.workflows.gitlab) difyUpdate.gitlab_workflow_id = body.workflows.gitlab;
     if (body.workflows.googledrive) difyUpdate.googledrive_workflow_id = body.workflows.googledrive;
@@ -6449,67 +6466,6 @@ app.get("/rag/knowledge-bases/default-prompt", async (request, reply) => {
       "This prompt is always applied to every knowledge base chat session. " +
       "You can add KB-specific instructions — they will be placed before these platform grounding rules."
   };
-  const categoryDesc = builtInCategoryDescriptions[category]
-    ?? (templateName
-      ? `${templateName}${description && mode === "recommend" ? ` — ${description.slice(0, 150)}` : ""}`
-      : "specialised knowledge base");
-
-  let metaPrompt: string;
-  if (mode === "recommend") {
-    metaPrompt =
-      `Generate a professional, complete system prompt for a RAG (Retrieval-Augmented Generation) chat assistant.\n\n` +
-      `Role: ${templateName || `${category} assistant`} — ${categoryDesc}\n\n` +
-      `Requirements:\n` +
-      `- Start with a ## Role section describing the assistant's expertise and domain\n` +
-      `- Include a ## Response Format section with numbered steps appropriate for the role\n` +
-      `- Include a ## Domain Rules section with 4-6 role-specific rules\n` +
-      `- Be concise, professional, and domain-appropriate\n` +
-      `- Do NOT include generic platform rules (source citations, credential security, faithfulness) — those are appended automatically\n` +
-      `- Use markdown headings (##) and bullet points\n` +
-      `- Aim for 150-250 words\n\n` +
-      `Output ONLY the system prompt text with no preamble, explanation, or surrounding quotes.`;
-  } else {
-    metaPrompt =
-      `Rewrite the following draft system prompt into a professional, RAG-optimised template for a ${categoryDesc} assistant.\n\n` +
-      `Draft:\n"${description}"\n\n` +
-      `Requirements:\n` +
-      `- Preserve the user's intent and domain focus\n` +
-      `- Add a ## Role section if missing\n` +
-      `- Add a ## Response Format section with numbered steps if missing\n` +
-      `- Add a ## Domain Rules section with role-specific rules if missing\n` +
-      `- Use markdown headings (##) and bullet points\n` +
-      `- Be concise and professional (aim for 150-300 words)\n` +
-      `- Do NOT include generic platform rules (source citations, credential security, faithfulness) — those are appended automatically\n\n` +
-      `Output ONLY the rewritten system prompt text with no preamble, explanation, or surrounding quotes.`;
-  }
-
-  try {
-    const userId = requesterUserId(headers);
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 1500,
-        messages: [{ role: "user", content: metaPrompt }]
-      })
-    });
-    if (!response.ok) {
-      const errText = await response.text().catch(() => "");
-      return reply.code(502).send({ error: "LLM_CALL_FAILED", details: errText.slice(0, 300) });
-    }
-    const payload = await response.json() as Record<string, unknown>;
-    const suggestion = ((payload.choices as any)?.[0]?.message?.content ?? "").trim();
-    if (!suggestion) return reply.code(502).send({ error: "LLM_EMPTY_RESPONSE" });
-    logInfo("template_generated", { service: "workflow-service", category, mode, userId, outputLen: suggestion.length });
-    return { suggestion, mode, category };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    return reply.code(502).send({ error: "TEMPLATE_GENERATION_FAILED", details: msg });
-  }
 });
 
 // ─── Prompt Template Generator (smart mode) ──────────────────────────────────

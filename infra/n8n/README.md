@@ -50,21 +50,11 @@ docker compose up -d n8n-db n8n-vault-agent n8n
 
 Open **http://localhost:5679** in your browser.
 
-### 4. Import workflow templates
+> **Workflow import is automatic.** `infra/n8n/init-workflows.sh` runs on every
+> container start and imports + activates `source-to-dify-sync.json` so the
+> `rag-sync-source` webhook is always present. No manual import needed.
 
-In the n8n UI → **Workflows** → **Import from file**, import each template:
-
-```
-infra/n8n/templates/github-to-dify-sync.json
-infra/n8n/templates/gitlab-to-dify-sync.json
-infra/n8n/templates/gdrive-to-dify-sync.json
-infra/n8n/templates/web-to-dify-sync.json
-infra/n8n/templates/slack-dify-bot.json
-infra/n8n/templates/discord-dify-bot.json
-infra/n8n/templates/telegram-dify-bot.json
-```
-
-### 5. Configure n8n credentials for each source type
+### 4. Configure n8n credentials for each source type
 
 In n8n UI → **Credentials** → **Add credential**:
 
@@ -124,6 +114,45 @@ Users can configure a sync schedule per knowledge base (stored in `RagKnowledgeB
 - `"0 2 * * 0"` = weekly on Sunday at 2am
 
 The schedule is stored in Dify KB settings and the n8n workflow cron trigger.
+
+## Generic Source Sync Workflow
+
+`infra/n8n/templates/source-to-dify-sync.json` is the preferred workflow for
+GitHub, GitLab, and Google Drive. It exposes one webhook:
+
+```text
+POST /webhook/rag-sync-source
+```
+
+The workflow keeps provider-specific work at the front of the flow:
+
+- GitHub: parse owner/repo, list the git tree, and fetch raw files.
+- GitLab: parse project path, list the repository tree with pagination, and
+  fetch raw files.
+- Google Drive: list a folder recursively with OAuth, download binary files,
+  and export Google Docs/Sheets/Slides to Dify-supported Office formats.
+
+After file listing, all providers use the same normalized item contract:
+
+```json
+{
+  "provider": "github | gitlab | googledrive",
+  "filePath": "docs/runbook.md",
+  "fileSha": "provider-specific-change-id",
+  "fileExt": "md",
+  "fileIndex": 1,
+  "totalFiles": 10,
+  "isUpdate": false,
+  "difyDocumentId": null
+}
+```
+
+The remaining pipeline is shared: sync diff, skipped-file reporting, Dify
+create/update, tracker callbacks, indexing polling, final status reporting, and
+error callback handling.
+
+Legacy provider-specific workflows remain available as fallback templates while
+the generic workflow is rolled out.
 
 ---
 

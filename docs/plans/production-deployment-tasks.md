@@ -36,7 +36,7 @@
 | 13 | Import GitLab → Dify KB Sync workflow (CLI) | ✅ | 14-node template version |
 | 14 | Publish workflows via `n8n publish:workflow` CLI | ✅ | Required in n8n 2.x |
 | 15 | Activate workflows via REST API | ✅ | Both `active: true` |
-| 16 | Restart n8n to register webhook listeners | ✅ | `/webhook/rag-sync-github` HTTP 200 |
+| 16 | Restart n8n to register webhook listeners | ✅ | `/webhook/rag-sync-source` HTTP 200 |
 | 17 | Save UUID to `github-to-dify-sync.json` template | ✅ | `c81ad5e4-...` |
 | 18 | Update `PRODUCTION_MIGRATION.md` to reflect correct n8n CLI steps | ✅ | Steps 8 + 9 rewritten |
 
@@ -86,16 +86,14 @@
 | P7 | Verify all 8 secret paths `[OK]` | ⬜ | PROD_MIG Step 4.5 |
 | P8 | Revoke root token immediately | ⬜ | PROD_MIG Step 4.6 |
 | P9 | Optionally generate `/run/platform-secrets/.env.prod.runtime` for inspection, then shred it | ⬜ | PROD_MIG Step 4.7 |
-| P10 | Build images `--no-cache` | ⬜ | PROD_MIG Step 5 |
+| P10 | Build images `--no-cache` (Alpine-based: web ~240 MB, db-migrate ~315 MB, service-base ~1.1 GB) | ⬜ | PROD_MIG Step 5 |
+| P10a | Prune old images + build cache after build: `docker image prune -a -f && docker builder prune -a -f` | ⬜ | Frees ~400+ GB of old layers |
 | P11 | Start full stack with `/home/bali/09_automationplatform/scripts/platform-containers.sh prod start` | ⬜ | PROD_MIG Step 6 |
 | P12 | Confirm no `/run/platform-secrets/.env.prod*` runtime env file remains after start | ⬜ | PROD_MIG Step 6 |
 | P13 | Verify: `db-migrate` Exited(0), `dify-migrate` Exited(0) | ⬜ | PROD_MIG Step 6 |
 | P14 | Run `ENVIRONMENT=prod bash scripts/seed-keycloak-platform-admin.sh` for `platform-admin` | ⬜ | PROD_MIG Step 7 |
 | P15 | n8n: create owner account via REST API | ⬜ | PROD_MIG Step 8.1 |
-| P16 | n8n: import GitHub + GitLab workflows via CLI | ⬜ | PROD_MIG Step 8.2 |
-| P17 | n8n: publish workflows via CLI | ⬜ | PROD_MIG Step 8.3 |
-| P18 | n8n: activate workflows via REST API | ⬜ | PROD_MIG Step 8.4 |
-| P19 | n8n: restart to register webhooks, test `/webhook/rag-sync-github` | ⬜ | PROD_MIG Step 8.5 |
+| P16 | n8n: verify `rag-sync-source` webhook is live (auto-imported on start) | ⬜ | PROD_MIG Step 8.2 |
 | P20 | Dify: create admin account via API (`POST /console/api/setup`) | ⬜ | PROD_MIG Step 9.1 |
 | P21 | Dify: configure LLM provider (Settings → Model Providers) | ⬜ | PROD_MIG Step 9.2 |
 | P22 | Seed Dify config to Vault (`platform/global/dify/config`) — `default_app_url`, `console_password`, `model_api_base`, `model_api_key`, `chat_model`, `embedding_model` | ⬜ | PROD_MIG Step 10.1 |
@@ -274,14 +272,17 @@ See PRODUCTION_MIGRATION.md Step 10.1.
 
 ## n8n Webhook Reference
 
-| Webhook path | Workflow | Trigger |
-|-------------|----------|---------|
-| `POST /webhook/rag-sync-github` | GitHub → Dify KB Sync | Called by api-gateway when a GitHub KB sync is triggered |
-| `POST /webhook/rag-sync-gitlab` | GitLab → Dify KB Sync | Called by api-gateway when a GitLab KB sync is triggered |
+All source types (GitHub, GitLab, Google Drive) use a single unified webhook:
 
-Production URLs (once nginx is up):
-- `https://theaitools.ca/n8n/webhook/rag-sync-github`
-- `https://theaitools.ca/n8n/webhook/rag-sync-gitlab`
+| Webhook path | Workflow | Sources |
+|-------------|----------|---------|
+| `POST /webhook/rag-sync-source` | Generic Source to Dify Sync | GitHub, GitLab, Google Drive |
+
+Production URL (once nginx is up):
+- `https://theaitools.ca/n8n/webhook/rag-sync-source`
+
+The workflow is imported and activated automatically by `infra/n8n/init-workflows.sh`
+on every container start — no manual import needed.
 
 ---
 
@@ -298,12 +299,14 @@ Dify dataset ID + API key stored in Vault: secret/platform/global/dify/{kbId}
     ↓
 User triggers sync
     ↓
-api-gateway posts to n8n webhook (rag-sync-github or rag-sync-gitlab)
+api-gateway posts to n8n webhook (rag-sync-source)
     ↓
-n8n fetches files → uploads to Dify → polls indexing → reports status back
+n8n detects sourceType (github/gitlab/googledrive) → fetches files
+    ↓
+n8n uploads to Dify → polls indexing → reports status back
 ```
 
 **Required before any sync works:**
 - Dify admin account exists (Step 9.1)
 - Dify LLM provider configured (Step 9.2) — without embedding model, indexing fails
-- n8n webhooks active (Steps 8.1–8.5)
+- n8n webhooks active (Steps 8.1–8.2)

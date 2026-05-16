@@ -2,11 +2,11 @@
 
 import type { Dispatch, ReactElement, SetStateAction } from "react";
 import { useEffect, useState } from "react";
-import type { IntegrationForm } from "./types";
-import { normalizeRepositoryInput } from "./types";
+import { listTemplates } from "../prompt-templates/api";
 import type { PromptTemplate } from "../prompt-templates/types";
 import { CATEGORY_ICONS, CATEGORY_LABELS } from "../prompt-templates/types";
-import { listTemplates } from "../prompt-templates/api";
+import type { IntegrationForm } from "./types";
+import { normalizeRepositoryInput } from "./types";
 
 type AuthMode = "choose" | "oauth" | "pat";
 type OAuthStep = "provider" | "details";
@@ -370,25 +370,29 @@ export function CreateSourceModal(props: Props): ReactElement | null {
                 <span>Client ID</span>
                 <input
                   id="oauth-app-client-id"
-                  name="oauth-app-client-id"
+                  name={`oauth-app-client-id-${Math.random().toString(36).slice(2)}`}
                   value={appClientId}
                   onChange={(e) => setAppClientId(e.target.value)}
                   placeholder={`${meta.label} Client ID`}
-                  autoComplete="new-password"
+                  autoComplete="off"
                   data-form-type="other"
+                  spellCheck="false"
+                  data-1p-ignore
                 />
               </label>
               <label>
                 <span>Client Secret</span>
                 <input
                   id="oauth-app-client-secret"
-                  name="oauth-app-client-secret"
+                  name={`oauth-app-client-secret-${Math.random().toString(36).slice(2)}`}
                   type="password"
                   value={appClientSecret}
                   onChange={(e) => setAppClientSecret(e.target.value)}
                   placeholder={`${meta.label} Client Secret`}
                   autoComplete="new-password"
                   data-form-type="other"
+                  spellCheck="false"
+                  data-1p-ignore
                 />
               </label>
             </div>

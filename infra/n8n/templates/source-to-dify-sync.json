@@ -1,0 +1,502 @@
+{
+  "id": "rag-sync-source-template",
+  "name": "Generic Source to Dify Sync",
+  "nodes": [
+    {
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        256,
+        304
+      ],
+      "webhookId": "rag-sync-source",
+      "parameters": {
+        "path": "rag-sync-source",
+        "options": {},
+        "httpMethod": "POST",
+        "responseMode": "onReceived"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "parse-params",
+      "name": "Parse Sync Params",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        480,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst kbId = body.kbId;\nconst sourceUrl = String(body.sourceUrl || '').trim();\nconst sourceTypeRaw = String(body.sourceType || '').trim().toLowerCase();\nconst sourceType = sourceTypeRaw === 'gdrive' || sourceTypeRaw === 'google' ? 'googledrive' : sourceTypeRaw;\nconst sourceBranch = body.sourceBranch || 'main';\nconst sourcePath = body.sourcePath || '';\nconst sourcePaths = Array.isArray(body.sourcePaths) ? body.sourcePaths : [];\nconst difyDatasetId = body.difyDatasetId;\nconst difyApiUrl = body.difyApiUrl || 'http://dify-api:5001';\nconst difyApiKey = body.difyApiKey || '';\nconst syncJobId = body.syncJobId;\nconst progressCallbackUrl = body.progressCallbackUrl;\nconst progressCallbackToken = body.progressCallbackToken || '';\nconst sourceToken = body.sourceToken || '';\nconst sourceRefreshToken = body.sourceRefreshToken || '';\n\nif (!kbId || !sourceUrl || !difyDatasetId || !syncJobId || !difyApiKey) {\n  throw new Error('Missing required sync parameters');\n}\nif (!['github', 'gitlab', 'googledrive'].includes(sourceType)) {\n  throw new Error('Unsupported generic sync sourceType: ' + (sourceType || '<empty>'));\n}\n\nconst params = {\n  kbId,\n  provider: sourceType,\n  sourceType,\n  sourceUrl,\n  branch: sourceBranch,\n  path: sourcePath,\n  sourcePaths,\n  difyDatasetId,\n  difyApiUrl,\n  difyApiKey,\n  syncJobId,\n  progressCallbackUrl,\n  progressCallbackToken,\n  sourceToken,\n  sourceRefreshToken,\n  syncStartedAt: new Date().toISOString()\n};\n\nif (sourceType === 'github') {\n  const match = sourceUrl.match(/github\\.com\\/([^/]+)\\/([^/#?]+)/i);\n  if (!match) throw new Error('Invalid GitHub URL: ' + sourceUrl);\n  params.owner = match[1];\n  params.repo = match[2].replace(/\\.git$/i, '');\n} else if (sourceType === 'gitlab') {\n  const match = sourceUrl.match(/gitlab\\.com\\/([^?#]+?)(?:\\/-\\/.*)?$/i);\n  if (!match) throw new Error('Invalid GitLab URL: ' + sourceUrl);\n  params.projectPath = match[1].replace(/\\.git$/i, '').replace(/\\/+$/g, '');\n  params.encodedProjectPath = encodeURIComponent(params.projectPath);\n} else if (sourceType === 'googledrive') {\n  const folderMatch = sourceUrl.match(/\\/folders\\/([a-zA-Z0-9_-]+)/) || sourceUrl.match(/[?&]id=([a-zA-Z0-9_-]+)/);\n  if (!folderMatch) throw new Error('Invalid Google Drive folder URL: ' + sourceUrl);\n  if (!sourceToken) throw new Error('Google Drive sync requires an OAuth access token. Reconnect the integration and try again.');\n  params.driveFolderId = folderMatch[1];\n}\n\nreturn [{ json: params }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "init-step-cb",
+      "name": "Init Step Callback",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        704,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst params = $('Parse Sync Params').first().json;\nif (params.progressCallbackUrl) {\n  const headers = { 'Content-Type': 'application/json' };\n  if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: 'running',\n        filesProcessed: 0,\n        filesTotal: 0,\n        step: {\n          task: 'Fetch File Tree',\n          stepName: 'fetch_file_tree',\n          status: 'running',\n          startedAt: params.syncStartedAt,\n        },\n        logMessage:           'Sync started for KB ' + params.kbId,\n      },\n      json: true,\n    });\n  } catch {}\n}\nreturn items;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "get-repo-tree",
+      "name": "List Source Files",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        928,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const params = $('Parse Sync Params').first().json;\n\nfunction authHeaders() {\n  if (params.provider === 'github') {\n    return {\n      Accept: 'application/vnd.github+json',\n      'User-Agent': 'platform-rag-sync/1.0',\n      ...(params.sourceToken ? { Authorization: 'token ' + params.sourceToken } : {})\n    };\n  }\n  if (params.provider === 'gitlab') {\n    return {\n      'User-Agent': 'platform-rag-sync/1.0',\n      ...(params.sourceToken ? { Authorization: 'Bearer ' + params.sourceToken } : {})\n    };\n  }\n  return {\n    Authorization: 'Bearer ' + params.sourceToken,\n    Accept: 'application/json'\n  };\n}\n\nasync function requestJson(options, label) {\n  try {\n    return await this.helpers.httpRequest({ ...options, json: true, returnFullResponse: false });\n  } catch (error) {\n    const status = error?.response?.statusCode || error?.statusCode || '';\n    const body = error?.response?.body;\n    const detail = typeof body === 'string' ? body : (body?.message || body?.error || error?.message || String(error));\n    throw new Error(label + ' failed' + (status ? ' HTTP ' + status : '') + ': ' + detail);\n  }\n}\n\nasync function listGitHub() {\n  const tree = await requestJson.call(this, {\n    method: 'GET',\n    url: 'https://api.github.com/repos/' + encodeURIComponent(params.owner) + '/' + encodeURIComponent(params.repo) + '/git/trees/' + encodeURIComponent(params.branch) + '?recursive=1',\n    headers: authHeaders()\n  }, 'GitHub file tree');\n  if (tree.truncated) throw new Error('GitHub repository tree exceeds 100,000 files and was truncated. Use a more specific source path to limit the scope.');\n  return (tree.tree || []).map(file => ({\n    path: file.path,\n    type: file.type,\n    sha: file.sha\n  }));\n}\n\nasync function listGitLab() {\n  const filterPaths = (params.sourcePaths && params.sourcePaths.length > 0) ? params.sourcePaths : (params.path ? [params.path] : [null]);\n  const files = [];\n  for (const filterPath of filterPaths) {\n    for (let page = 1; page <= 100; page++) {\n      let url = 'https://gitlab.com/api/v4/projects/' + params.encodedProjectPath + '/repository/tree?ref=' + encodeURIComponent(params.branch) + '&recursive=true&per_page=100&page=' + page;\n      if (filterPath) url += '&path=' + encodeURIComponent(filterPath);\n      const pageFiles = await requestJson.call(this, { method: 'GET', url, headers: authHeaders() }, 'GitLab file tree');\n      for (const file of pageFiles || []) {\n        files.push({ path: file.path, type: file.type === 'tree' ? 'tree' : 'blob', sha: file.id || file.sha || file.path });\n      }\n      if (!Array.isArray(pageFiles) || pageFiles.length < 100) break;\n    }\n  }\n  return files;\n}\n\nconst GOOGLE_EXPORTS = {\n  'application/vnd.google-apps.document': { ext: 'docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },\n  'application/vnd.google-apps.spreadsheet': { ext: 'xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },\n  'application/vnd.google-apps.presentation': { ext: 'pptx', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' }\n};\n\nfunction drivePath(prefix, name, exportInfo) {\n  const cleanName = String(name || 'untitled').replace(/[\\\\/]+/g, '-');\n  if (!exportInfo) return prefix ? prefix + '/' + cleanName : cleanName;\n  const withoutGoogleExt = cleanName.replace(/\\.[^.]+$/, '');\n  return (prefix ? prefix + '/' : '') + withoutGoogleExt + '.' + exportInfo.ext;\n}\n\nasync function listDriveFolder(folderId, prefix = '', depth = 0) {\n  if (depth > 12) return [];\n  const all = [];\n  let pageToken = '';\n  do {\n    const query = encodeURIComponent(\"'\" + folderId + \"' in parents and trashed = false\");\n    const fields = encodeURIComponent('nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,size)');\n    const url = 'https://www.googleapis.com/drive/v3/files?q=' + query + '&fields=' + fields + '&pageSize=1000' + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '');\n    const data = await requestJson.call(this, { method: 'GET', url, headers: authHeaders() }, 'Google Drive file list');\n    for (const file of data.files || []) {\n      if (file.mimeType === 'application/vnd.google-apps.folder') {\n        all.push(...await listDriveFolder.call(this, file.id, prefix ? prefix + '/' + file.name : file.name, depth + 1));\n        continue;\n      }\n      const exportInfo = GOOGLE_EXPORTS[file.mimeType] || null;\n      const path = drivePath(prefix, file.name, exportInfo);\n      all.push({\n        path,\n        type: 'blob',\n        sha: [file.id, file.modifiedTime || '', file.md5Checksum || file.size || '', exportInfo?.ext || ''].join(':'),\n      });\n    }\n    pageToken = data.nextPageToken || '';\n  } while (pageToken);\n  return all;\n}\n\nlet tree;\nif (params.provider === 'github') tree = await listGitHub.call(this);\nelse if (params.provider === 'gitlab') tree = await listGitLab.call(this);\nelse tree = await listDriveFolder.call(this, params.driveFolderId);\n\nreturn [{ json: { ...params, tree } }];"
+      },
+      "typeVersion": 2,
+      "continueOnFail": true
+    },
+    {
+      "id": "handle-tree-error",
+      "name": "Handle Tree Error",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1040,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const input = $input.first();\nconst params = $('Parse Sync Params').first().json;\n\n// When continueOnFail=true, failed HTTP nodes put the error on json\nconst statusCode = input.json.statusCode || 0;\nconst hasError = !!input.json.error || statusCode >= 400;\n\nif (hasError) {\n  const rawMsg = input.json.message || input.json.error || 'Failed to fetch source file list';\n  const displayMsg = statusCode ? 'HTTP ' + statusCode + ': ' + rawMsg : rawMsg;\n\n  if (params.progressCallbackUrl) {\n    const headers = { 'Content-Type': 'application/json' };\n    if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n    try {\n      await this.helpers.httpRequest({\n        method: 'POST',\n        url: params.progressCallbackUrl,\n        headers,\n        body: {\n          syncJobId: params.syncJobId,\n          status: 'failed',\n          errorMessage: displayMsg,\n          step: {\n            task: 'List Source Files',\n            stepName: 'fetch_file_tree',\n            status: 'failed',\n            completedAt: new Date().toISOString(),\n            errorMessage: displayMsg,\n          },\n          logMessage: 'List Source Files failed: ' + displayMsg,\n          logSeverity: 'ERROR',\n        },\n        json: true,\n      });\n    } catch {}\n  }\n  throw new Error('List Source Files failed: ' + displayMsg);\n}\n\nreturn [$input.first()];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "filter-files",
+      "name": "Filter Supported Files",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        1152,
+        304
+      ],
+      "parameters": {
+        "url": "=https://api-gateway:4000/rag/knowledge-bases/{{ $('Parse Sync Params').first().json.kbId }}/sync-diff",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Rag-Sync-Token",
+              "value": "={{ $('Parse Sync Params').first().json.progressCallbackToken }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"syncJobId\": \"{{ $('Parse Sync Params').first().json.syncJobId }}\",\n  \"tree\": {{ JSON.stringify($input.first().json.tree || []) }}\n}",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "typeVersion": 4,
+      "continueOnFail": true
+    },
+    {
+      "id": "report-skipped-files",
+      "name": "Report Skipped Files",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1206,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst params = $('Parse Sync Params').first().json;\nconst skippedFiles = response.skippedFiles || [];\n\nif (skippedFiles.length > 0 && params.progressCallbackUrl) {\n  const headers = { 'Content-Type': 'application/json' };\n  if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n\n  const byExt = {};\n  for (const f of skippedFiles) {\n    const ext = f.ext || 'unknown';\n    byExt[ext] = (byExt[ext] || 0) + 1;\n  }\n  const extSummary = Object.entries(byExt)\n    .map(([ext, cnt]) => `.${ext} (${cnt})`)\n    .join(', ');\n\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: 'running',\n        step: {\n          task: 'Filter Files',\n          stepName: 'filter_extensions',\n          status: 'completed',\n          completedAt: new Date().toISOString(),\n          message: `Skipped ${skippedFiles.length} file(s) \u2014 unsupported format: ${extSummary}`,\n        },\n        logMessage: `Skipped ${skippedFiles.length} unsupported file(s): ${extSummary}`,\n        logSeverity: 'INFO',\n      },\n      json: true,\n    });\n  } catch {}\n}\n\nreturn $input.all();"
+      }
+    },
+    {
+      "id": "map-diff-files",
+      "name": "Map Diff Files",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1260,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const response = $input.first().json || {};\nconst params = $('Parse Sync Params').first().json;\n\n// Handle if the sync-diff node returned an error directly\nif (response.error || response.message) {\n  if (params.progressCallbackUrl) {\n    const headers = { 'Content-Type': 'application/json' };\n    if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n    this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: 'failed',\n        errorMessage: String(response.error || response.message || 'Error communicating with gateway'),\n        logSeverity: 'ERROR',\n      },\n      json: true,\n    }).catch(() => {});\n  }\n  throw new Error(String(response.error || response.message || 'Error communicating with gateway'));\n}\n\nconst files = response.files || [];\n\nif (files.length === 0) {\n  if (params.progressCallbackUrl) {\n    const headers = { 'Content-Type': 'application/json' };\n    if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n    // First mark Fetch File Tree as completed so it doesn't stay 'running'\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: 'running',\n        filesProcessed: 0,\n        filesTotal: 0,\n        step: {\n          task: 'Fetch File Tree',\n          stepName: 'fetch_file_tree',\n          status: 'completed',\n          completedAt: new Date().toISOString(),\n          message: 'No files to update',\n        },\n      },\n      json: true,\n    }).catch(() => {});\n    // Then report the skip-sync completion\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: 'completed',\n        filesProcessed: 0,\n        filesTotal: 0,\n        step: {\n          task: 'Skip Sync',\n          stepName: 'skip_sync',\n          status: 'completed',\n          completedAt: new Date().toISOString(),\n          message: 'No files needed updating or creating',\n        },\n        logMessage: 'Sync complete: No files modified since last sync',\n        logSeverity: 'INFO',\n      },\n      json: true,\n    }).catch(() => {});\n  }\n  return [];\n}\n\nreturn files.map((item, index) => ({\n  json: {\n    ...params,\n    provider: params.provider,\n    filePath: item.path,\n    fileSha: item.sha,\n    fileExt: (item.path.split('.').pop() || '').toLowerCase(),\n    fileIndex: index + 1,\n    totalFiles: files.length,\n    difyDocumentId: item.difyDocumentId || null,\n    isUpdate: !!item.isUpdate\n  }\n}));"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "upload-start-cb",
+      "name": "Upload Start Callback",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1376,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst params = $('Parse Sync Params').first().json;\nif (params.progressCallbackUrl) {\n  const headers = { 'Content-Type': 'application/json' };\n  if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: 'running',\n        filesTotal: items.length,\n        filesProcessed: 0,\n        step: {\n          task: 'Fetch File Tree',\n          stepName: 'fetch_file_tree',\n          status: 'completed',\n          completedAt: new Date().toISOString(),\n          message: 'Found ' + items.length + ' supported files',\n        },\n        logMessage: 'File tree ready: ' + items.length + ' files to upload',\n      },\n      json: true,\n    });\n  } catch {}\n}\nreturn items;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "fetch-file-content",
+      "name": "Fetch File Content",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1600,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst params = $('Parse Sync Params').first().json;\n\nconst GOOGLE_EXPORTS = {\n  'application/vnd.google-apps.document': { ext: 'docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },\n  'application/vnd.google-apps.spreadsheet': { ext: 'xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },\n  'application/vnd.google-apps.presentation': { ext: 'pptx', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' }\n};\n\nfunction headersFor(item) {\n  if (item.json.provider === 'github') {\n    return { 'User-Agent': 'platform-rag-sync/1.0', ...(item.json.sourceToken ? { Authorization: 'token ' + item.json.sourceToken } : {}) };\n  }\n  if (item.json.provider === 'gitlab') {\n    return { 'User-Agent': 'platform-rag-sync/1.0', ...(item.json.sourceToken ? { Authorization: 'Bearer ' + item.json.sourceToken } : {}) };\n  }\n  return { Authorization: 'Bearer ' + item.json.sourceToken };\n}\n\nasync function downloadFile(url, headers, label) {\n  try {\n    return await this.helpers.httpRequest({\n      method: 'GET',\n      url,\n      headers,\n      encoding: 'arraybuffer',\n      returnFullResponse: false,\n      json: false\n    });\n  } catch (error) {\n    const status = error?.response?.statusCode || error?.statusCode || '';\n    throw new Error(label + ' failed' + (status ? ' HTTP ' + status : '') + ': ' + (error?.message || String(error)));\n  }\n}\n\nasync function requestJson(options, label) {\n  try {\n    return await this.helpers.httpRequest({ ...options, json: true, returnFullResponse: false });\n  } catch (error) {\n    const status = error?.response?.statusCode || error?.statusCode || '';\n    throw new Error(label + ' failed' + (status ? ' HTTP ' + status : '') + ': ' + (error?.message || String(error)));\n  }\n}\n\nfunction drivePath(prefix, name, exportInfo) {\n  const cleanName = String(name || 'untitled').replace(/[\\\\/]+/g, '-');\n  if (!exportInfo) return prefix ? prefix + '/' + cleanName : cleanName;\n  const withoutGoogleExt = cleanName.replace(/\\.[^.]+$/, '');\n  return (prefix ? prefix + '/' : '') + withoutGoogleExt + '.' + exportInfo.ext;\n}\n\nasync function findDriveFile(folderId, wantedPath, prefix = '', depth = 0) {\n  if (depth > 12) return null;\n  let pageToken = '';\n  do {\n    const query = encodeURIComponent(\"'\" + folderId + \"' in parents and trashed = false\");\n    const fields = encodeURIComponent('nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,size)');\n    const url = 'https://www.googleapis.com/drive/v3/files?q=' + query + '&fields=' + fields + '&pageSize=1000' + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '');\n    const data = await requestJson.call(this, { method: 'GET', url, headers: { Authorization: 'Bearer ' + params.sourceToken, Accept: 'application/json' } }, 'Google Drive file lookup');\n    for (const file of data.files || []) {\n      if (file.mimeType === 'application/vnd.google-apps.folder') {\n        const nested = await findDriveFile.call(this, file.id, wantedPath, prefix ? prefix + '/' + file.name : file.name, depth + 1);\n        if (nested) return nested;\n        continue;\n      }\n      const exportInfo = GOOGLE_EXPORTS[file.mimeType] || null;\n      const path = drivePath(prefix, file.name, exportInfo);\n      if (path === wantedPath) return { ...file, exportInfo, path };\n    }\n    pageToken = data.nextPageToken || '';\n  } while (pageToken);\n  return null;\n}\n\nfunction mimeForExt(ext) {\n  return {\n    md: 'text/markdown', markdown: 'text/markdown', txt: 'text/plain', html: 'text/html', htm: 'text/html', xml: 'application/xml', csv: 'text/csv', rst: 'text/plain', mdx: 'text/markdown',\n    pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', xls: 'application/vnd.ms-excel'\n  }[ext] || 'application/octet-stream';\n}\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  let url;\n  let mimeType = mimeForExt(item.json.fileExt);\n  if (item.json.provider === 'github') {\n    url = 'https://raw.githubusercontent.com/' + item.json.owner + '/' + item.json.repo + '/' + encodeURIComponent(item.json.branch) + '/' + encodeURIComponent(item.json.filePath).replace(/%2F/g, '/');\n  } else if (item.json.provider === 'gitlab') {\n    url = 'https://gitlab.com/api/v4/projects/' + item.json.encodedProjectPath + '/repository/files/' + encodeURIComponent(item.json.filePath) + '/raw?ref=' + encodeURIComponent(item.json.branch);\n  } else if (item.json.provider === 'googledrive') {\n    const file = await findDriveFile.call(this, item.json.driveFolderId, item.json.filePath);\n    if (!file) throw new Error('Google Drive file no longer found: ' + item.json.filePath);\n    if (file.exportInfo) {\n      url = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(file.id) + '/export?mimeType=' + encodeURIComponent(file.exportInfo.mimeType);\n      mimeType = file.exportInfo.mimeType;\n    } else {\n      url = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(file.id) + '?alt=media';\n      mimeType = file.mimeType || mimeType;\n    }\n  }\n  const data = await downloadFile.call(this, url, headersFor(item), 'Fetch ' + item.json.filePath);\n  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);\n  item.binary = item.binary || {};\n  item.binary.fileData = await this.helpers.prepareBinaryData(buffer, item.json.filePath.split('/').pop() || item.json.filePath, mimeType);\n}\n\nreturn items;"
+      },
+      "typeVersion": 2,
+      "continueOnFail": true
+    },
+    {
+      "id": "upload-to-dify",
+      "name": "Upload Doc to Dify",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1824,
+        304
+      ],
+      "parameters": {
+        "jsCode": "// H1: PII Pre-Ingestion Redaction - strip PII before embedding into vector store\nfunction redactPii(text) {\n  let r = text, counts = {emails:0, phones:0, secrets:0, cards:0};\n  r = r.replace(/[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g, m => { counts.emails++; return '[EMAIL REDACTED]'; });\n  r = r.replace(/(\\+?1[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}/g, m => { counts.phones++; return '[PHONE REDACTED]'; });\n  r = r.replace(/(sk-|ghp_|glpat-|xox[baprs]-)[a-zA-Z0-9_\\-]{10,}/g, m => { counts.secrets++; return '[SECRET REDACTED]'; });\n  r = r.replace(/\\b(?:\\d[ \\-]?){13,16}\\b/g, m => { counts.cards++; return '[CC REDACTED]'; });\n  return { redacted: r, counts };\n}\n\nconst TEXT_EXTS = new Set(['md','markdown','txt','html','htm','xml','csv','rst','mdx']);\nconst MIME_TYPES = {\n  'pdf':  'application/pdf',\n  'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',\n  'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',\n  'xls':  'application/vnd.ms-excel',\n  'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',\n  'ppt':  'application/vnd.ms-powerpoint',\n  'epub': 'application/epub+zip',\n  'eml':  'message/rfc822',\n  'msg':  'application/vnd.ms-outlook',\n};\n// Generic source sync accepts Google Slides exported as pptx in addition to standard Dify ETL binary formats.\n// ppt, eml, msg, epub require Unstructured ETL (ETL_TYPE=Unstructured in Dify).\nconst DIFY_BINARY_EXTS = new Set(['pdf','docx','xlsx','xls','pptx']);\n\nfunction parseDifyPayload(statusCode, headers, raw) {\n  const contentType = String(headers['content-type'] || '');\n  let payload = raw;\n  if (contentType.includes('application/json') && raw) {\n    try { payload = JSON.parse(raw); } catch {}\n  }\n  if (statusCode < 200 || statusCode >= 300) {\n    const message = typeof payload === 'object' && payload !== null\n      ? (payload.message || payload.error || JSON.stringify(payload))\n      : (raw || ('HTTP ' + statusCode));\n    throw new Error('Dify upload failed ' + statusCode + ': ' + message);\n  }\n  return typeof payload === 'object' && payload !== null ? payload : JSON.parse(raw || '{}');\n}\n\nfunction multipartDifyRequest(urlString, apiKey, fileName, contentType, fileBuffer, data) {\n  const { Buffer } = require('buffer');\n  const http = require('http');\n  const https = require('https');\n  const { URL } = require('url');\n  const url = new URL(urlString);\n  const boundary = '----rapidrag-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2);\n  const safeName = String(fileName).replace(/[\"\\r\\n]/g, '_');\n  const dataJson = JSON.stringify(data);\n  const head = Buffer.from(\n    '--' + boundary + '\\r\\n' +\n    'Content-Disposition: form-data; name=\"file\"; filename=\"' + safeName + '\"\\r\\n' +\n    'Content-Type: ' + contentType + '\\r\\n\\r\\n'\n  );\n  const middle = Buffer.from(\n    '\\r\\n--' + boundary + '\\r\\n' +\n    'Content-Disposition: form-data; name=\"data\"\\r\\n\\r\\n' +\n    dataJson + '\\r\\n'\n  );\n  const tail = Buffer.from('--' + boundary + '--\\r\\n');\n  const body = Buffer.concat([head, fileBuffer, middle, tail]);\n  const transport = url.protocol === 'https:' ? https : http;\n  return new Promise((resolve, reject) => {\n    const req = transport.request(url, {\n      method: 'POST',\n      headers: {\n        Authorization: 'Bearer ' + apiKey,\n        'Content-Type': 'multipart/form-data; boundary=' + boundary,\n        'Content-Length': body.length,\n      },\n    }, (res) => {\n      const chunks = [];\n      res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));\n      res.on('end', () => {\n        const raw = Buffer.concat(chunks).toString('utf8');\n        try { resolve(parseDifyPayload(res.statusCode || 0, res.headers || {}, raw)); }\n        catch (error) { reject(error); }\n      });\n    });\n    req.on('error', reject);\n    req.write(body);\n    req.end();\n  });\n}\n\nconst items = $input.all();\nconst results = [];\nfor (let itemIndex = 0; itemIndex < items.length; itemIndex++) {\n  const item = items[itemIndex];\n  const { filePath, fileExt, difyApiUrl, difyDatasetId, difyApiKey, isUpdate, difyDocumentId } = item.json;\n  const binaryFile = item.binary && item.binary.fileData ? item.binary.fileData : null;\n  let docId = null, difyBatch = null, uploadError = null;\n  try {\n    if (!binaryFile) {\n      uploadError = 'Fetch File Content did not return fileData for ' + filePath;\n    } else if (!TEXT_EXTS.has(fileExt) && !DIFY_BINARY_EXTS.has(fileExt)) {\n      uploadError = '.' + fileExt + ' requires Unstructured ETL mode in Dify (set ETL_TYPE=Unstructured). Skipping: ' + filePath;\n    } else {\n      const fileBuffer = await this.helpers.getBinaryDataBuffer(itemIndex, 'fileData');\n      if (TEXT_EXTS.has(fileExt)) {\n        const rawText = fileBuffer.toString('utf8');\n        const piiResult = redactPii(rawText);\n        const text = piiResult.redacted;\n        if (piiResult.counts.emails + piiResult.counts.phones + piiResult.counts.secrets + piiResult.counts.cards > 0) {\n          console.log('[PII-REDACT] ' + filePath + ': emails=' + piiResult.counts.emails + ' phones=' + piiResult.counts.phones + ' secrets=' + piiResult.counts.secrets + ' cards=' + piiResult.counts.cards);\n        }\n        const endpoint = isUpdate && difyDocumentId\n          ? `/v1/datasets/${difyDatasetId}/documents/${difyDocumentId}/update_by_text`\n          : `/v1/datasets/${difyDatasetId}/document/create_by_text`;\n        const response = await this.helpers.httpRequest({\n          method: 'POST',\n          url: difyApiUrl + endpoint,\n          headers: {\n            Authorization: 'Bearer ' + difyApiKey,\n            'Content-Type': 'application/json',\n          },\n          body: {\n            name: filePath,\n            text,\n            indexing_technique: 'high_quality',\n            process_rule: {\n              mode: 'custom',\n              rules: {\n                pre_processing_rules: [\n                  { id: 'remove_extra_spaces', enabled: true },\n                  { id: 'remove_urls_emails', enabled: false },\n                ],\n                segmentation: { separator: '\\n\\n', max_tokens: 1000, chunk_overlap: 200 },\n              },\n            },\n          },\n          json: true,\n          returnFullResponse: true,\n        });\n        const payload = response.body ?? response;\n        docId = payload.document?.id ?? null;\n        difyBatch = payload.batch ?? null;\n        if (!docId || !difyBatch) {\n          uploadError = payload.message || 'Dify did not return a document id and batch';\n        }\n      } else {\n        const fileName = filePath.split('/').pop() || filePath;\n        const contentType = MIME_TYPES[fileExt] || binaryFile.mimeType || 'application/octet-stream';\n        const endpoint = isUpdate && difyDocumentId\n          ? `/v1/datasets/${difyDatasetId}/documents/${difyDocumentId}/update_by_file`\n          : `/v1/datasets/${difyDatasetId}/document/create_by_file`;\n        const payload = await multipartDifyRequest(difyApiUrl + endpoint, difyApiKey, fileName, contentType, fileBuffer, {\n          name: filePath,\n          indexing_technique: 'high_quality',\n          process_rule: { mode: 'automatic' },\n        });\n        docId = payload.document?.id ?? null;\n        difyBatch = payload.batch ?? null;\n        if (!docId || !difyBatch) {\n          uploadError = payload.message || 'Dify did not return a document id and batch';\n        }\n      }\n    }\n  } catch (e) {\n    uploadError = e?.response?.body?.message || e?.response?.body?.error || e?.message || String(e);\n  }\n  results.push({ json: { ...item.json, difyDocId: docId, difyBatch, uploadError, uploadMethod: TEXT_EXTS.has(fileExt) ? 'text' : 'file' } });\n}\nreturn results;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "report-progress",
+      "name": "Report File Progress",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2048,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst params = $('Parse Sync Params').first().json;\nfor (const item of items) {\n  if (!params.progressCallbackUrl) continue;\n  const headers = { 'Content-Type': 'application/json' };\n  if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: 'running',\n        filesProcessed: item.json.fileIndex,\n        filesTotal: item.json.totalFiles,\n        chunksProcessed: item.json.fileIndex,\n        step: {\n          task: 'Upload Files',\n          stepName: 'upload_files',\n          status: item.json.uploadError ? 'failed' : 'running',\n          message: item.json.fileIndex + '/' + item.json.totalFiles + ' processed',\n          errorMessage: item.json.uploadError || undefined,\n        },\n        logMessage: 'Processed ' + item.json.filePath + (item.json.uploadError ? ' | ERROR: ' + item.json.uploadError : ''),\n        logSeverity: item.json.uploadError ? 'ERROR' : 'INFO',\n        difyDocumentId: item.json.difyDocId || undefined,\n        filePath: item.json.filePath || undefined,\n        fileSha: item.json.fileSha || undefined\n      },\n      json: true,\n    });\n  } catch {}\n}\nreturn items;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "aggregate-doc-ids",
+      "name": "Aggregate Doc IDs",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2272,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst documentRefs = items\n  .filter(item => item.json.difyDocId != null && item.json.difyBatch != null)\n  .map(item => ({\n    filePath: item.json.filePath,\n    difyDocId: item.json.difyDocId,\n    batchId: item.json.difyBatch,\n  }));\nconst docIds = documentRefs.map(ref => ref.difyDocId);\nconst batchIds = documentRefs.map(ref => ref.batchId);\nconst uploadErrors = items\n  .filter(item => item.json.uploadError)\n  .map(item => ({ filePath: item.json.filePath, error: item.json.uploadError }));\nconst params = $('Parse Sync Params').first().json;\nconst totalFiles = items.reduce((max, item) => Math.max(max, Number(item.json.totalFiles || 0)), 0);\nreturn [{ json: { docIds, batchIds, documentRefs, uploadErrors, params, uploadedCount: docIds.length, totalFiles } }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "indexing-start-cb",
+      "name": "Indexing Start Callback",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2496,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst summary = $input.first().json;\nconst params = $('Parse Sync Params').first().json;\nif (params.progressCallbackUrl) {\n  const headers = { 'Content-Type': 'application/json' };\n  if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: summary.uploadErrors.length ? 'failed' : 'running',\n        filesProcessed: summary.totalFiles,\n        filesTotal: summary.totalFiles,\n        step: {\n          task: 'Upload Files',\n          stepName: 'upload_files',\n          status: summary.uploadErrors.length ? 'failed' : 'completed',\n          completedAt: new Date().toISOString(),\n          message: summary.uploadedCount + ' files uploaded',\n          errorMessage: summary.uploadErrors.length ? summary.uploadErrors[0].filePath + ': ' + summary.uploadErrors[0].error : undefined,\n        },\n        errorMessage: summary.uploadErrors.length ? summary.uploadErrors[0].filePath + ': ' + summary.uploadErrors[0].error : undefined,\n        logMessage: summary.uploadErrors.length\n          ? 'Upload failed for ' + summary.uploadErrors.length + ' files'\n          : 'All ' + summary.uploadedCount + ' files uploaded to Dify. Starting indexing poll...',\n        logSeverity: summary.uploadErrors.length ? 'ERROR' : 'INFO',\n      },\n      json: true,\n    });\n  } catch {}\n}\nreturn items;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "dify-indexing-start-cb",
+      "name": "Dify Indexing Start Callback",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2720,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst summary = $input.first().json;\nconst params = $('Parse Sync Params').first().json;\nif (params.progressCallbackUrl && summary.batchIds.length > 0) {\n  const headers = { 'Content-Type': 'application/json' };\n  if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: 'running',\n        step: {\n          task: 'Dify Indexing',\n          stepName: 'dify_indexing',\n          status: 'running',\n          startedAt: new Date().toISOString(),\n          message: 'Indexing ' + summary.batchIds.length + ' files',\n        },\n        logMessage: 'Indexing ' + summary.batchIds.length + ' files in Dify...',\n      },\n      json: true,\n    });\n  } catch {}\n}\nreturn items;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "poll-dify-indexing",
+      "name": "Poll Dify Indexing",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2944,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const { docIds, batchIds, documentRefs, params, uploadErrors, totalFiles, uploadedCount } = $input.first().json;\nconst refsByBatch = Object.fromEntries((documentRefs || []).map(ref => [ref.batchId, ref]));\nconst retryableError = (error) => {\n  const normalized = String(error || '').toLowerCase();\n  return ['too many requests', 'rate limit', 'ratelimit', '429', 'timeout', 'timed out', 'temporary', 'temporarily', 'embedding', 'upstream', 'unavailable', 'overloaded', 'try again'].some(token => normalized.includes(token));\n};\nif (!batchIds.length) {\n  return [{ json: {\n    docIds: [],\n    batchIds: [],\n    documentRefs: [],\n    results: {},\n    failedDocuments: [],\n    completedCount: 0,\n    errorCount: 0,\n    timedOut: false,\n    uploadErrors: uploadErrors || [],\n    finalStatus: uploadErrors && uploadErrors.length ? 'failed' : 'completed',\n    params,\n    totalFiles,\n    uploadedCount,\n  } }];\n}\nconst maxAttempts = 24;\nconst intervalMs = 5000;\nconst results = {};\nconst failedByDocId = {};\nfor (let attempt = 0; attempt < maxAttempts; attempt++) {\n  await new Promise(r => setTimeout(r, intervalMs));\n  let allDone = true;\n  for (const batchId of batchIds) {\n    if (results[batchId] === 'completed' || results[batchId] === 'error') continue;\n    const ref = refsByBatch[batchId] || {};\n    try {\n      const data = await this.helpers.httpRequest({\n        method: 'GET',\n        url: params.difyApiUrl + '/v1/datasets/' + params.difyDatasetId + '/documents/' + batchId + '/indexing-status',\n        headers: { Authorization: 'Bearer ' + params.difyApiKey },\n        json: true,\n      });\n      const rows = Array.isArray(data.data) ? data.data : [];\n      const statuses = rows.map(item => item.indexing_status).filter(Boolean);\n      const erroredRows = rows.filter(item => item.indexing_status === 'error');\n      for (const row of erroredRows) {\n        const difyDocId = row.id || row.document_id || row.doc_id || ref.difyDocId;\n        const error = row.error || row.error_message || row.message || 'Dify indexing failed';\n        failedByDocId[difyDocId || batchId] = {\n          filePath: ref.filePath || row.name,\n          difyDocId,\n          batchId,\n          indexingStatus: 'error',\n          error,\n          retryable: retryableError(error),\n        };\n      }\n      const hasError = erroredRows.length > 0 || statuses.includes('error');\n      const hasPending = statuses.some(status => !['completed', 'error'].includes(status));\n      const status = hasError ? 'error' : (hasPending ? 'indexing' : (statuses.length ? 'completed' : undefined));\n      if (status) results[batchId] = status;\n      if (status !== 'completed' && status !== 'error') allDone = false;\n    } catch (e) {\n      allDone = false;\n    }\n  }\n  if (allDone) break;\n}\nconst timedOutBatches = batchIds.filter(batchId => !['completed', 'error'].includes(results[batchId]));\nfor (const batchId of timedOutBatches) {\n  const ref = refsByBatch[batchId] || {};\n  failedByDocId[ref.difyDocId || batchId] = {\n    filePath: ref.filePath,\n    difyDocId: ref.difyDocId,\n    batchId,\n    indexingStatus: results[batchId] || 'timeout',\n    error: 'Indexing timed out',\n    retryable: true,\n  };\n}\nconst failedDocuments = Object.values(failedByDocId);\nconst completedCount = Object.values(results).filter(s => s === 'completed').length;\nconst errorCount = failedDocuments.length;\nconst timedOut = timedOutBatches.length > 0;\nconst hasFailures = errorCount > 0 || timedOut || (uploadErrors && uploadErrors.length > 0);\nreturn [{ json: {\n  docIds, batchIds, documentRefs, results, failedDocuments, completedCount, errorCount, timedOut,\n  uploadErrors: uploadErrors || [],\n  finalStatus: hasFailures ? 'failed' : 'completed',\n  params,\n  totalFiles,\n  uploadedCount,\n} }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "report-final",
+      "name": "Report Final Status",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        3168,
+        304
+      ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst summary = $input.first().json;\nconst params = $('Parse Sync Params').first().json;\nconst firstUploadError = summary.uploadErrors && summary.uploadErrors.length ? (summary.uploadErrors[0].filePath + ': ' + summary.uploadErrors[0].error) : '';\nconst failedDocuments = summary.failedDocuments || [];\nconst firstFailedDoc = failedDocuments.length ? failedDocuments[0] : null;\nconst failedDocSummary = firstFailedDoc ? ((firstFailedDoc.filePath || firstFailedDoc.difyDocId || 'unknown document') + (firstFailedDoc.error ? ': ' + firstFailedDoc.error : '')) : '';\nconst finalError = firstUploadError || (failedDocuments.length > 0 ? (failedDocuments.length + ' docs failed indexing: ' + failedDocSummary) : (summary.timedOut ? 'Indexing timed out' : ''));\n\nif (params.progressCallbackUrl) {\n  const headers = { 'Content-Type': 'application/json' };\n  if (params.progressCallbackToken) headers['X-Rag-Sync-Token'] = params.progressCallbackToken;\n  try {\n    // If upload errors exist AND indexing was started for some files, finalize dify_indexing first\n    // so it doesn't stay stuck in \"running\". Send as status=running so job isn't closed yet.\n    if (summary.uploadErrors && summary.uploadErrors.length > 0 && summary.uploadedCount > 0) {\n      await this.helpers.httpRequest({\n        method: 'POST',\n        url: params.progressCallbackUrl,\n        headers,\n        body: {\n          syncJobId: params.syncJobId,\n          status: 'running',\n          step: {\n            task: 'Dify Indexing',\n            stepName: 'dify_indexing',\n            status: summary.completedCount > 0 ? 'completed' : 'failed',\n            completedAt: new Date().toISOString(),\n            message: summary.completedCount + '/' + summary.uploadedCount + ' files indexed',\n            errorMessage: failedDocuments.length > 0 ? failedDocSummary : undefined,\n            failedDocuments: failedDocuments.length > 0 ? failedDocuments : undefined,\n          },\n        },\n        json: true,\n      });\n    }\n    // Send final job status\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: params.progressCallbackUrl,\n      headers,\n      body: {\n        syncJobId: params.syncJobId,\n        status: summary.finalStatus,\n        filesProcessed: summary.totalFiles,\n        filesTotal: summary.totalFiles,\n        chunksProcessed: summary.completedCount,\n        errorMessage: finalError || undefined,\n        step: summary.uploadErrors && summary.uploadErrors.length ? {\n          task: 'Upload Files',\n          stepName: 'upload_files',\n          status: 'failed',\n          completedAt: new Date().toISOString(),\n          message: 'Upload failed for ' + summary.uploadErrors.length + ' file(s)',\n          errorMessage: firstUploadError,\n        } : {\n          task: 'Dify Indexing',\n          stepName: 'dify_indexing',\n          status: summary.finalStatus,\n          completedAt: new Date().toISOString(),\n          message: summary.finalStatus === 'completed'\n            ? summary.totalFiles + ' / ' + summary.totalFiles + ' indexed'\n            : summary.completedCount + ' indexed, ' + failedDocuments.length + ' errors',\n          errorMessage: finalError || undefined,\n          failedDocuments,\n        },\n        logMessage: finalError ? ('Sync failed: ' + finalError) : ('Sync complete: ' + summary.completedCount + '/' + summary.totalFiles + ' docs indexed'),\n        logSeverity: summary.finalStatus === 'failed' ? 'ERROR' : 'INFO',\n      },\n      json: true,\n    });\n  } catch {}\n}\nreturn items;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "position": [
+        256,
+        600
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "report-failure-webhook",
+      "name": "Report Failure Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        480,
+        600
+      ],
+      "parameters": {
+        "url": "=https://api-gateway:4000/rag/sync-error-handler",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Rag-Sync-Token",
+              "value": "={{ ($json.execution?.data?.resultData?.runData?.['Parse Sync Params']?.[0]?.data?.main?.[0]?.[0]?.json?.progressCallbackToken || $json.execution?.data?.resultData?.runData?.['Webhook Trigger']?.[0]?.data?.main?.[0]?.[0]?.json?.body?.progressCallbackToken || '') }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"syncJobId\": \"{{ ($json.execution?.data?.resultData?.runData?.['Parse Sync Params']?.[0]?.data?.main?.[0]?.[0]?.json?.syncJobId || $json.execution?.data?.resultData?.runData?.['Webhook Trigger']?.[0]?.data?.main?.[0]?.[0]?.json?.body?.syncJobId || $json.execution?.data?.resultData?.runData?.['Webhook Trigger']?.[0]?.data?.main?.[0]?.[0]?.json?.syncJobId || '') }}\",\n  \"status\": \"failed\",\n  \"errorMessage\": {{ JSON.stringify($json.execution?.error?.message || $json.execution?.error?.description || 'Workflow execution failed') }}\n}",
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "typeVersion": 4
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Sync Params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Sync Params": {
+      "main": [
+        [
+          {
+            "node": "Init Step Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Step Callback": {
+      "main": [
+        [
+          {
+            "node": "List Source Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Tree Error": {
+      "main": [
+        [
+          {
+            "node": "Filter Supported Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Supported Files": {
+      "main": [
+        [
+          {
+            "node": "Report Skipped Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Diff Files": {
+      "main": [
+        [
+          {
+            "node": "Upload Start Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Start Callback": {
+      "main": [
+        [
+          {
+            "node": "Fetch File Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch File Content": {
+      "main": [
+        [
+          {
+            "node": "Upload Doc to Dify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Doc to Dify": {
+      "main": [
+        [
+          {
+            "node": "Report File Progress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report File Progress": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Doc IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Doc IDs": {
+      "main": [
+        [
+          {
+            "node": "Indexing Start Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Indexing Start Callback": {
+      "main": [
+        [
+          {
+            "node": "Dify Indexing Start Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dify Indexing Start Callback": {
+      "main": [
+        [
+          {
+            "node": "Poll Dify Indexing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Dify Indexing": {
+      "main": [
+        [
+          {
+            "node": "Report Final Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Report Failure Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report Skipped Files": {
+      "main": [
+        [
+          {
+            "node": "Map Diff Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Source Files": {
+      "main": [
+        [
+          {
+            "node": "Handle Tree Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "errorWorkflow": "4f8dbb73-d6c5-4a55-8178-8c4f51c76d01"
+  },
+  "versionId": "734b5007-e90c-4479-ab5c-e8a852c09694",
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "description": "Syncs GitHub, GitLab, or Google Drive sources to a Dify Knowledge Base through one shared upload/indexing pipeline. Triggered by workflow-service via webhook."
+}

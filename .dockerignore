@@ -6,3 +6,11 @@ node_modules
 .next
 coverage
 *.log
+docs/
+tests/
+ci/
+scripts/
+infra/
+*.md
+.github/
+.vscode/

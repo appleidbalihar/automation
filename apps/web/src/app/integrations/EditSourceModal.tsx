@@ -259,15 +259,29 @@ export function EditSourceModal(props: Props): ReactElement | null {
                           <span>Client ID {integration.oauthAppConfigured ? <span className="ops-oauth-cred-badge ops-oauth-cred-badge-ok">✓ Set</span> : null}</span>
                           {/* Show masked placeholder when configured — never show actual stored value */}
                           <input
+                            name={`oauth-app-client-id-${Math.random().toString(36).slice(2)}`}
                             value={appClientId}
                             onChange={(e) => setAppClientId(e.target.value)}
                             placeholder={clientIdPlaceholder}
                             autoComplete="off"
+                            data-form-type="other"
+                            spellCheck="false"
+                            data-1p-ignore
                           />
                         </label>
                         <label>
                           <span>Client Secret {integration.oauthAppConfigured ? <span className="ops-oauth-cred-badge ops-oauth-cred-badge-ok">✓ Set</span> : null}</span>
-                          <input type="password" value={appClientSecret} onChange={(e) => setAppClientSecret(e.target.value)} placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client Secret`} autoComplete="off" />
+                          <input
+                            name={`oauth-app-client-secret-${Math.random().toString(36).slice(2)}`}
+                            type="password"
+                            value={appClientSecret}
+                            onChange={(e) => setAppClientSecret(e.target.value)}
+                            placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client Secret`}
+                            autoComplete="new-password"
+                            data-form-type="other"
+                            spellCheck="false"
+                            data-1p-ignore
+                          />
                         </label>
                       </div>
                       <p className="ops-oauth-app-creds-note">{integration.oauthAppConfigured ? "App credentials are configured. Leave blank to keep existing." : "Enter your OAuth App credentials to connect."}</p>
@@ -299,15 +313,29 @@ export function EditSourceModal(props: Props): ReactElement | null {
                           <span>Client ID {integration.oauthAppConfigured ? <span className="ops-oauth-cred-badge ops-oauth-cred-badge-ok">✓ Set</span> : null}</span>
                           {/* Show blank input — never echo back the stored client_id value from state */}
                           <input
+                            name={`oauth-app-client-id-${Math.random().toString(36).slice(2)}`}
                             value={appClientId}
                             onChange={(e) => setAppClientId(e.target.value)}
                             placeholder={clientIdPlaceholder}
                             autoComplete="off"
+                            data-form-type="other"
+                            spellCheck="false"
+                            data-1p-ignore
                           />
                         </label>
                         <label>
                           <span>Client Secret {integration.oauthAppConfigured ? <span className="ops-oauth-cred-badge ops-oauth-cred-badge-ok">✓ Set</span> : null}</span>
-                          <input type="password" value={appClientSecret} onChange={(e) => setAppClientSecret(e.target.value)} placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client Secret`} autoComplete="off" />
+                          <input
+                            name={`oauth-app-client-secret-${Math.random().toString(36).slice(2)}`}
+                            type="password"
+                            value={appClientSecret}
+                            onChange={(e) => setAppClientSecret(e.target.value)}
+                            placeholder={integration.oauthAppConfigured ? "••••••••••••••••  (set — paste new value to update)" : `${providerLabel} Client Secret`}
+                            autoComplete="new-password"
+                            data-form-type="other"
+                            spellCheck="false"
+                            data-1p-ignore
+                          />
                         </label>
                       </div>
                       <p className="ops-oauth-app-creds-note">{integration.oauthAppConfigured ? "App credentials are configured. Leave blank to keep existing." : "Leave blank to use admin-configured credentials."}</p>

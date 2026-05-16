@@ -9,7 +9,7 @@ type DifyConfig = {
   llm: { model: string; baseUrl: string; apiKeySet: boolean };
   embedding: { model: string; baseUrl: string; apiKeySet: boolean; maxChunks: number };
   reranker: { provider: string; model: string; apiBase: string; apiKeySet: boolean; enabled: boolean };
-  workflows: { github: string; gitlab: string; googledrive: string; web: string };
+  workflows: { source?: string; github: string; gitlab: string; googledrive: string; web: string };
   console: { appUrl: string; email: string; passwordSet: boolean };
 };
 
@@ -227,7 +227,7 @@ export function DifyConfigPanel(): ReactElement {
   const [reranker, setReranker] = useState({ provider: "", model: "", apiBase: "", apiKey: "", enabled: true });
   const [rerankerApiKeySet, setRerankerApiKeySet] = useState(false);
 
-  const [workflows, setWorkflows] = useState({ github: "", gitlab: "", googledrive: "", web: "" });
+  const [workflows, setWorkflows] = useState({ source: "", github: "", gitlab: "", googledrive: "", web: "" });
 
   const [console_, setConsole] = useState({ appUrl: "", email: "", password: "" });
   const [consolePasswordSet, setConsolePasswordSet] = useState(false);
@@ -281,7 +281,13 @@ export function DifyConfigPanel(): ReactElement {
         });
         setRerankerApiKeySet(data.reranker.apiKeySet);
 
-        setWorkflows(data.workflows);
+        setWorkflows({
+          source: data.workflows.source ?? "",
+          github: data.workflows.github,
+          gitlab: data.workflows.gitlab,
+          googledrive: data.workflows.googledrive,
+          web: data.workflows.web
+        });
 
         setConsole({ appUrl: data.console.appUrl, email: data.console.email, password: "" });
         setConsolePasswordSet(data.console.passwordSet);
@@ -488,8 +494,9 @@ export function DifyConfigPanel(): ReactElement {
         {/* ── n8n Workflow IDs — read-only ── */}
         <Section title="n8n Workflow IDs" readOnly>
           <p style={{ fontSize: "0.8rem", color: "#6b7280", marginBottom: "12px" }}>
-            Workflow IDs are set during platform setup and managed in code. Contact an operator to change them.
+            GitHub, GitLab, and Google Drive use the generic source sync workflow by default. Legacy provider-specific IDs can still be configured as fallback overrides.
           </p>
+          <ReadOnlyRow label="Generic Source Sync" value={workflows.source ?? ""} />
           <ReadOnlyRow label="GitHub Sync" value={workflows.github} />
           <ReadOnlyRow label="GitLab Sync" value={workflows.gitlab} />
           <ReadOnlyRow label="Google Drive Sync" value={workflows.googledrive} />

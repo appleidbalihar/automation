@@ -11,6 +11,8 @@ const nextConfig = {
   // and break authentication. The trailing-slash redirect for the root page
   // (/rapidrag/ → /rapidrag) is handled cleanly by the outer nginx rewrite.
 
+  output: 'standalone',
+
   experimental: {
     optimizePackageImports: ["@platform/ui-kit"]
   }
