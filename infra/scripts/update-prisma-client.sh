@@ -5,7 +5,7 @@
 
 set -e
 
-CONTAINER="09_automationplatform-workflow-service-1"
+CONTAINER="rapidrag-workflow-service-1"
 
 echo "Step 1: Copying updated schema.prisma into Prisma client..."
 docker cp packages/db/prisma/schema.prisma \

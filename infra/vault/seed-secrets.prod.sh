@@ -104,8 +104,10 @@ vault_write "app/dify/config" \
 N8N_ENCRYPTION_KEY="$(openssl rand -hex 40)"
 N8N_DB_PASSWORD="$(openssl rand -base64 28 | tr -d '/+=')"
 N8N_WEBHOOK_TOKEN="$(openssl rand -hex 40)"
+N8N_OWNER_EMAIL="admin@platform.local"
+N8N_OWNER_PASSWORD="Admin@Platform2026!"
 vault_write "app/n8n/config" \
-  "{\"encryption_key\": \"${N8N_ENCRYPTION_KEY}\", \"db_password\": \"${N8N_DB_PASSWORD}\", \"webhook_token\": \"${N8N_WEBHOOK_TOKEN}\"}"
+  "{\"encryption_key\": \"${N8N_ENCRYPTION_KEY}\", \"db_password\": \"${N8N_DB_PASSWORD}\", \"webhook_token\": \"${N8N_WEBHOOK_TOKEN}\", \"owner_email\": \"${N8N_OWNER_EMAIL}\", \"owner_password\": \"${N8N_OWNER_PASSWORD}\"}"
 
 echo ""
 echo "All production secrets seeded to Vault (8 paths under platform/prod/)."

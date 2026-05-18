@@ -43,7 +43,7 @@ Then: `docker compose stop n8n && docker compose rm -f n8n && docker compose up 
 The `connections` JSON in `workflow_history` pointed to old names ("Filter Markdown Files", "Respond to Webhook" etc.). Fixed to reference all 14 new node names in the correct linear order.
 
 ### 3. `N8N_PATH=/n8n/` added to docker-compose
-Added so n8n editor works at `https://dev.eclassmanager.com/n8n/`. The webhooks stay at `/webhook/...` (not sub-pathed). Internal webhook URL `http://n8n:5678/webhook/rag-sync-github` is correct.
+Added so n8n editor works at `https://dev.rapidrag.ai/n8n/`. The webhooks stay at `/webhook/...` (not sub-pathed). Internal webhook URL `http://n8n:5678/webhook/rag-sync-github` is correct.
 
 ### 4. Empty `Authorization: token ` header causing GitHub 401
 When the KB has no GitHub token configured (public repo), the node sends `Authorization: token ` (with empty value). GitHub rejects this with 401, which n8n reports as "Not Found".
@@ -91,7 +91,7 @@ When the KB has no GitHub token configured (public repo), the node sends `Author
 
 ### Confirm latest live GitHub workflow version
 ```bash
-docker exec 09_automationplatform-n8n-db-1 psql -U n8n -d n8n -c \
+docker exec 09_rapidrag-n8n-db-1 psql -U n8n -d n8n -c \
   "SELECT \"activeVersionId\", \"versionId\", \"updatedAt\" FROM workflow_entity WHERE id = '4f8dbb73-d6c5-4a55-8178-8c4f51c76d01';"
 ```
 
@@ -100,10 +100,10 @@ Expected newest version after the latest edits:
 
 ### Read the latest execution error
 ```bash
-EXEC_ID=$(docker exec 09_automationplatform-n8n-db-1 psql -U n8n -d n8n -t -c \
+EXEC_ID=$(docker exec 09_rapidrag-n8n-db-1 psql -U n8n -d n8n -t -c \
   "SELECT id FROM execution_entity ORDER BY \"startedAt\" DESC LIMIT 1;" | tr -d ' \n')
 
-docker exec 09_automationplatform-n8n-db-1 psql -U n8n -d n8n -t -c \
+docker exec 09_rapidrag-n8n-db-1 psql -U n8n -d n8n -t -c \
   "SELECT data FROM execution_data WHERE \"executionId\" = $EXEC_ID;" | python3 -c "
 import sys, json
 raw = sys.stdin.read().strip()
@@ -152,7 +152,7 @@ TOKEN="0a4e28221f3b67506644d40b023b12c9a0a367061accd66d38033307e9cf05a8"
 DIFY_KEY="dataset-9fT7yHhX5Q5f3ImtBmJzqFRF"
 SYNC_JOB_ID="test-$(date +%s)"
 
-docker exec 09_automationplatform-postgres-1 psql -U platform -d automation -c "
+docker exec 09_rapidrag-postgres-1 psql -U platform -d automation -c "
 INSERT INTO \"RagKbSyncJob\" (id, \"knowledgeBaseId\", trigger, status, \"filesProcessed\", \"chunksProcessed\", \"createdAt\")
 VALUES ('$SYNC_JOB_ID', 'cmoaho7ye00002qaxm0n32tqq', 'manual', 'running', 0, 0, NOW());"
 
@@ -178,7 +178,7 @@ curl -s -X POST "http://localhost:5679/webhook/rag-sync-github" \
 # Step 1: Update workflow_entity.nodes with corrected node JSON (via SQL)
 
 # Step 2: Sync to workflow_history (insert new row — updates don't work)
-docker exec 09_automationplatform-n8n-db-1 psql -U n8n -d n8n -c "
+docker exec 09_rapidrag-n8n-db-1 psql -U n8n -d n8n -c "
 INSERT INTO workflow_history (\"versionId\", \"workflowId\", \"authors\", \"nodes\", \"connections\", \"name\", \"autosaved\")
 SELECT '<new-uuid>', '4f8dbb73-d6c5-4a55-8178-8c4f51c76d01', 'admin', nodes, connections, name, false
 FROM workflow_entity WHERE id = '4f8dbb73-d6c5-4a55-8178-8c4f51c76d01';
@@ -194,7 +194,7 @@ docker compose stop n8n && docker compose rm -f n8n && docker compose up -d n8n
 ### Verify n8n loaded the correct workflow version
 After restart, confirm the activated workflow uses the expected versionId:
 ```bash
-docker exec 09_automationplatform-n8n-db-1 psql -U n8n -d n8n -c \
+docker exec 09_rapidrag-n8n-db-1 psql -U n8n -d n8n -c \
   "SELECT \"activeVersionId\", \"versionId\", \"updatedAt\" FROM workflow_entity WHERE id = '4f8dbb73-d6c5-4a55-8178-8c4f51c76d01';"
 ```
 
@@ -217,9 +217,9 @@ docker exec 09_automationplatform-n8n-db-1 psql -U n8n -d n8n -c \
 | n8n webhook token | `0a4e28221f3b67506644d40b023b12c9a0a367061accd66d38033307e9cf05a8` |
 | n8n internal URL | `http://n8n:5678` (container-to-container) |
 | n8n host URL | `http://localhost:5679` (from host) |
-| n8n editor URL | `https://dev.eclassmanager.com/n8n/` |
-| n8n DB container | `09_automationplatform-n8n-db-1` user `n8n` db `n8n` |
-| Platform DB container | `09_automationplatform-postgres-1` user `platform` db `automation` |
+| n8n editor URL | `https://dev.rapidrag.ai/n8n/` |
+| n8n DB container | `09_rapidrag-n8n-db-1` user `n8n` db `n8n` |
+| Platform DB container | `09_rapidrag-postgres-1` user `platform` db `automation` |
 | Progress callback URL | `https://api-gateway:4000/rag/knowledge-bases/{kbId}/sync-progress` |
 | Progress callback auth | Header `X-Rag-Sync-Token: {token}` |
 

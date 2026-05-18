@@ -9,6 +9,15 @@ COPY packages ./packages
 
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @platform/ui-kit build
+
+# NEXT_PUBLIC_* vars must be present at build time — Next.js inlines them into the client bundle.
+ARG NEXT_PUBLIC_PLATFORM_URL
+ARG NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL
+ARG NEXT_PUBLIC_API_BASE_URL
+ENV NEXT_PUBLIC_PLATFORM_URL=$NEXT_PUBLIC_PLATFORM_URL
+ENV NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL=$NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL
+ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
+
 RUN pnpm --filter web build
 
 FROM node:22-alpine AS runtime

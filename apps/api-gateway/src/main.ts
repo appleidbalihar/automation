@@ -214,8 +214,8 @@ const eventPublisher = new EventPublisher(config.rabbitmqUrl);
 // ─── OAuth2 Connect Integration ───────────────────────────────────────────────
 
 const OAUTH_SECRET = String(process.env.PLATFORM_OAUTH_SECRET ?? "").trim();
-const OAUTH_CALLBACK_BASE_URL = String(process.env.OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/rapidrag/connect").trim();
-const OAUTH_POST_CONNECT_REDIRECT = String(process.env.OAUTH_POST_CONNECT_REDIRECT ?? "https://dev.eclassmanager.com/rapidrag/integrations").trim();
+const OAUTH_CALLBACK_BASE_URL = String(process.env.OAUTH_CALLBACK_BASE_URL ?? "https://dev.rapidrag.ai/connect").trim();
+const OAUTH_POST_CONNECT_REDIRECT = String(process.env.OAUTH_POST_CONNECT_REDIRECT ?? "https://dev.rapidrag.ai/integrations").trim();
 const VAULT_ADDR_OAUTH = String(process.env.VAULT_ADDR ?? "http://vault:8200").trim();
 const VAULT_KV_MOUNT_OAUTH = String(process.env.VAULT_KV_MOUNT ?? "secret").trim();
 const VAULT_NAMESPACE_OAUTH = String(process.env.VAULT_NAMESPACE ?? "").trim();

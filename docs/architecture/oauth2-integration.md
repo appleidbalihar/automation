@@ -24,15 +24,15 @@ The UI source type is `googledrive`; the OAuth route provider is `google`.
 
 The web modal builds callback URLs from:
 
-- `NEXT_PUBLIC_PLATFORM_URL`, default `https://dev.eclassmanager.com/rapidrag`
-- `NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL`, default `https://dev.eclassmanager.com/rapidrag/connect`
+- `NEXT_PUBLIC_PLATFORM_URL`, default `https://dev.rapidrag.ai`
+- `NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL`, default `https://dev.rapidrag.ai/connect`
 
 Default callback URLs shown in the UI:
 
 ```text
-https://dev.eclassmanager.com/rapidrag/connect/oauth/callback/github
-https://dev.eclassmanager.com/rapidrag/connect/oauth/callback/gitlab
-https://dev.eclassmanager.com/rapidrag/connect/oauth/callback/google
+https://dev.rapidrag.ai/connect/oauth/callback/github
+https://dev.rapidrag.ai/connect/oauth/callback/gitlab
+https://dev.rapidrag.ai/connect/oauth/callback/google
 ```
 
 The API gateway receives callbacks at:

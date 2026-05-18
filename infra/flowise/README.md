@@ -18,7 +18,7 @@ node infra/flowise/seed-flowise.js
 Optional environment variables:
 
 ```bash
-FLOWISE_CONTAINER_NAME=09_automationplatform-flowise-1
+FLOWISE_CONTAINER_NAME=09_rapidrag-flowise-1
 FLOWISE_TECH_ENGINEER_REPO_LINK=https://github.com/appleidbalihar/automation
 FLOWISE_TECH_ENGINEER_REPO_BRANCH=master
 FLOWISE_OPENAI_CHAT_MODEL=gpt-4o-mini

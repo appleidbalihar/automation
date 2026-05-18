@@ -1,3 +1,5 @@
+name: rapidrag
+
 x-shared-env: &shared-env
   DATABASE_URL: ${DATABASE_URL}
   REDIS_URL: ${REDIS_URL}
@@ -285,7 +287,7 @@ services:
       - tls_workflow_service:/tls
 
   workflow-service:
-    image: 09_automationplatform-service-base
+    image: 09_rapidrag-service-base
     build: *backend-build
     environment:
       <<: *shared-env
@@ -317,7 +319,7 @@ services:
       - tls_logging_service:/tls
 
   logging-service:
-    image: 09_automationplatform-service-base
+    image: 09_rapidrag-service-base
     build: *backend-build
     environment:
       <<: *shared-env
@@ -347,15 +349,15 @@ services:
       - tls_api_gateway:/tls
 
   api-gateway:
-    image: 09_automationplatform-service-base
+    image: 09_rapidrag-service-base
     build: *backend-build
     environment:
       <<: *shared-env
       PORT: 4000
       SERVICE_NAME: api-gateway
       PLATFORM_OAUTH_SECRET: ${PLATFORM_OAUTH_SECRET}
-      OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/rapidrag/connect}
-      OAUTH_POST_CONNECT_REDIRECT: ${OAUTH_POST_CONNECT_REDIRECT:-https://dev.eclassmanager.com/rapidrag/integrations}
+      OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.rapidrag.ai/connect}
+      OAUTH_POST_CONNECT_REDIRECT: ${OAUTH_POST_CONNECT_REDIRECT:-https://dev.rapidrag.ai/integrations}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
       GITLAB_CLIENT_ID: ${GITLAB_CLIENT_ID:-}
@@ -380,10 +382,14 @@ services:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.web
+      args:
+        NEXT_PUBLIC_PLATFORM_URL: ${NEXT_PUBLIC_PLATFORM_URL:-https://dev.rapidrag.ai}
+        NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.rapidrag.ai/connect}
+        NEXT_PUBLIC_API_BASE_URL: ${WEB_NEXT_PUBLIC_API_BASE_URL:-}
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${WEB_NEXT_PUBLIC_API_BASE_URL:-}
-      NEXT_PUBLIC_PLATFORM_URL: ${NEXT_PUBLIC_PLATFORM_URL:-https://dev.eclassmanager.com/rapidrag}
-      NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.eclassmanager.com/rapidrag/connect}
+      NEXT_PUBLIC_PLATFORM_URL: ${NEXT_PUBLIC_PLATFORM_URL:-https://dev.rapidrag.ai}
+      NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL: ${OAUTH_CALLBACK_BASE_URL:-https://dev.rapidrag.ai/connect}
       WEB_INTERNAL_API_BASE_URL: ${WEB_INTERNAL_API_BASE_URL:-https://api-gateway:4000}
       PORT: 3000
       KEYCLOAK_URL: ${WEB_KEYCLOAK_URL:-https://keycloak:8443}
@@ -732,13 +738,15 @@ services:
       N8N_PROTOCOL: http
       # Sub-path prefix so n8n generates correct asset URLs when served at /n8n/
       N8N_PATH: /n8n/
-      N8N_EDITOR_BASE_URL: https://dev.eclassmanager.com/n8n/
+      N8N_EDITOR_BASE_URL: ${N8N_EDITOR_BASE_URL:-https://dev.rapidrag.ai/n8n/}
       # Allow direct LAN access on http://192.168.2.16:5679 during local setup.
       # Public/production access should still be routed through HTTPS.
       N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE:-false}
       # Public webhook base used for provider push events and externally reachable n8n webhooks.
-      WEBHOOK_URL: ${N8N_WEBHOOK_BASE_URL:-https://dev.eclassmanager.com/n8n/}
+      WEBHOOK_URL: ${N8N_WEBHOOK_BASE_URL:-https://dev.rapidrag.ai/n8n/}
       N8N_USER_MANAGEMENT_DISABLED: "true"
+      N8N_OWNER_EMAIL: ${N8N_OWNER_EMAIL:-admin@platform.local}
+      N8N_OWNER_PASSWORD: ${N8N_OWNER_PASSWORD:-}
       NODE_EXTRA_CA_CERTS: /tls/ca.pem
       # Needed by Code nodes that build native multipart uploads for Dify files.
       NODE_FUNCTION_ALLOW_BUILTIN: buffer,http,https,url
@@ -761,29 +769,79 @@ services:
 
 volumes:
   postgres_data:
+    name: 09_automationplatform_postgres_data
+    external: true
   redis_data:
+    name: 09_automationplatform_redis_data
+    external: true
   rabbitmq_data:
+    name: 09_automationplatform_rabbitmq_data
+    external: true
   opensearch_data:
+    name: 09_automationplatform_opensearch_data
+    external: true
   minio_data:
+    name: 09_automationplatform_minio_data
+    external: true
   keycloak_data:
+    name: 09_automationplatform_keycloak_data
+    external: true
   vault_data:
+    name: 09_automationplatform_vault_data
+    external: true
   tls_api_gateway:
+    name: 09_automationplatform_tls_api_gateway
+    external: true
   tls_workflow_service:
+    name: 09_automationplatform_tls_workflow_service
+    external: true
   tls_logging_service:
+    name: 09_automationplatform_tls_logging_service
+    external: true
   rotation_control:
+    name: 09_automationplatform_rotation_control
+    external: true
   tls_postgres:
+    name: 09_automationplatform_tls_postgres
+    external: true
   tls_rabbitmq:
+    name: 09_automationplatform_tls_rabbitmq
+    external: true
   tls_redis:
+    name: 09_automationplatform_tls_redis
+    external: true
   tls_keycloak:
+    name: 09_automationplatform_tls_keycloak
+    external: true
   tls_minio:
+    name: 09_automationplatform_tls_minio
+    external: true
   tls_web:
+    name: 09_automationplatform_tls_web
+    external: true
   tls_web_ingress:
+    name: 09_automationplatform_tls_web_ingress
+    external: true
   # Dify volumes
   dify_db_data:
+    name: 09_automationplatform_dify_db_data
+    external: true
   dify_redis_data:
+    name: 09_automationplatform_dify_redis_data
+    external: true
   dify_storage:
+    name: 09_automationplatform_dify_storage
+    external: true
   tls_dify_api:
+    name: 09_automationplatform_tls_dify_api
+    external: true
   # n8n volumes
   n8n_db_data:
+    name: 09_automationplatform_n8n_db_data
+    external: true
   n8n_data:
+    name: 09_automationplatform_n8n_data
+    external: true
   tls_n8n:
+    name: 09_automationplatform_tls_n8n
+    external: true

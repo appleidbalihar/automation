@@ -35,8 +35,15 @@ if ! command -v jq >/dev/null 2>&1; then echo "ERROR: jq is required" >&2; exit 
 
 # Locate approle credentials
 if [[ -z "${APPROLE_DIR}" ]]; then
+  for vol_name in "rapidrag_vault_data" "09_rapidrag_vault_data" "09_automationplatform_vault_data" "$(basename "$(pwd)")_vault_data"; do
+    mp="$(docker volume inspect "${vol_name}" --format '{{.Mountpoint}}' 2>/dev/null || true)"
+    [[ -n "${mp}" && -f "${mp}/approle/deploy-${ENVIRONMENT}/role_id" ]] && \
+      APPROLE_DIR="${mp}/approle" && break
+  done
+fi
+
+if [[ -z "${APPROLE_DIR}" ]]; then
   for candidate in \
-    "$(docker volume inspect "$(basename "$(pwd)")_vault_data" --format '{{.Mountpoint}}' 2>/dev/null || true)/approle" \
     "/var/lib/docker/volumes/$(basename "$(pwd)")_vault_data/_data/approle" \
     "./vault_data/approle"; do
     if [[ -f "${candidate}/deploy-${ENVIRONMENT}/role_id" ]]; then

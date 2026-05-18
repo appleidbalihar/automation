@@ -9,17 +9,17 @@ Slack Phase 1 is bot-first. Users talk to RapidRAG through a Slack bot DM or `/k
 Development:
 
 ```text
-OAuth Redirect URL: https://dev.eclassmanager.com/rapidrag/api/slack/oauth/callback
-Event Subscriptions Request URL: https://dev.eclassmanager.com/rapidrag/api/slack/events
-Slash Command /kb Request URL: https://dev.eclassmanager.com/rapidrag/api/slack/events
+OAuth Redirect URL: https://dev.rapidrag.ai/api/slack/oauth/callback
+Event Subscriptions Request URL: https://dev.rapidrag.ai/api/slack/events
+Slash Command /kb Request URL: https://dev.rapidrag.ai/api/slack/events
 ```
 
 Production:
 
 ```text
-OAuth Redirect URL: https://theaitools.ca/rapidrag/api/slack/oauth/callback
-Event Subscriptions Request URL: https://theaitools.ca/rapidrag/api/slack/events
-Slash Command /kb Request URL: https://theaitools.ca/rapidrag/api/slack/events
+OAuth Redirect URL: https://rapidrag.ai/api/slack/oauth/callback
+Event Subscriptions Request URL: https://rapidrag.ai/api/slack/events
+Slash Command /kb Request URL: https://rapidrag.ai/api/slack/events
 ```
 
 Manual customer-owned bots use:

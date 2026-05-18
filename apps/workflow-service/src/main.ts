@@ -234,7 +234,7 @@ function buildAbsoluteApiUrl(request: any, path: string): string {
   const forwardedHost = String(request.headers["x-forwarded-host"] ?? "").split(",")[0].trim();
   const requestHost = String(request.headers.host ?? "").split(",")[0].trim();
   const host = forwardedHost || (/^(workflow-service|api-gateway)(:|$)/i.test(requestHost) ? "" : requestHost);
-  return host ? `${proto}://${host}/rapidrag/api${path}` : `/rapidrag/api${path}`;
+  return host ? `${proto}://${host}/api${path}` : `/api${path}`;
 }
 
 function signSlackState(payload: Record<string, unknown>, secret: string): string {
@@ -2486,6 +2486,18 @@ async function waitForDifyQueueToClear(input: {
   const retryAttempt = input.retryAttempt ?? 0;
   const maxRetries = input.maxRetries ?? 5;
 
+  // Push initial stats immediately so the UI shows progress from the first poll
+  const initialStats = await getDifyIndexingStats(input.difyAppUrl, input.datasetId, input.datasetApiKey);
+  const { docs: _initialDocs, ...initialStatsWithoutDocs } = initialStats;
+  await updateSyncJobStep(input.syncJobId, {
+    task: "AI Indexing",
+    stepName: "dify_indexing",
+    status: "running",
+    message: `Indexing: ${initialStats.completed} completed, ${initialStats.inProgress} in-progress, ${initialStats.queuing} queuing, ${initialStats.error} errors`,
+    difyStats: { ...initialStatsWithoutDocs, retryAttempt, maxRetries }
+  }).catch(() => undefined);
+  if (initialStats.inProgress === 0 && initialStats.queuing === 0) return initialStats;
+
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
     const stats = await getDifyIndexingStats(input.difyAppUrl, input.datasetId, input.datasetApiKey);
@@ -3617,60 +3629,77 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
   const effectiveSourceSecrets = { ...sourceSecrets };
   if (String(sourceSecrets.auth_method ?? "") === "oauth") {
     const expiry = nonEmptyString(sourceSecrets.token_expiry);
-    if (expiry) {
-      const expiresAt = new Date(expiry).getTime();
-      const nowPlusFive = Date.now() + 5 * 60 * 1000;
-      if (expiresAt < nowPlusFive) {
-        const refreshToken = nonEmptyString(sourceSecrets.gitlab_refresh) ?? nonEmptyString(sourceSecrets.gdrive_refresh);
-        const sourceTypeStr = String(kb.sourceType ?? "");
-        const refreshUrl = sourceTypeStr === "gitlab" ? "https://gitlab.com/oauth/token" : "https://oauth2.googleapis.com/token";
-        const clientIdKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_ID" : "GOOGLE_CLIENT_ID";
-        const clientSecretKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_SECRET" : "GOOGLE_CLIENT_SECRET";
-        const clientId = String(process.env[clientIdKey] ?? sourceSecrets.oauth_client_id ?? "").trim();
-        const clientSecret = String(process.env[clientSecretKey] ?? sourceSecrets.oauth_client_secret ?? "").trim();
-        if (refreshToken && clientId && clientSecret) {
-          try {
-            const refreshRes = await fetch(refreshUrl, {
-              method: "POST",
-              headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-              body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId, client_secret: clientSecret }).toString()
-            });
-            const refreshPayload = (await refreshRes.json()) as Record<string, unknown>;
-            const newToken = String(refreshPayload.access_token ?? "").trim();
-            const newExpiry = Number(refreshPayload.expires_in ?? 0);
-            if (newToken) {
-              const newTokenExpiry = newExpiry > 0 ? new Date(Date.now() + newExpiry * 1000).toISOString() : undefined;
-              const ownerId = String(kb.ownerId ?? triggeredById).trim() || triggeredById;
-              const updatedSecrets: Record<string, string> = {
-                ...Object.fromEntries(Object.entries(sourceSecrets).map(([k, v]) => [k, String(v)])),
-                ...(sourceTypeStr === "gitlab" ? { gitlab_token: newToken } : { gdrive_token: newToken }),
-                ...(newTokenExpiry ? { token_expiry: newTokenExpiry } : {})
-              };
-              await writeVaultKv(userSourceSecretPath(ownerId, kbId), updatedSecrets).catch((e) =>
-                logInfo("OAuth token refresh Vault write failed", { service: "workflow-service", kbId, error: e instanceof Error ? e.message : String(e) })
-              );
-              if (sourceTypeStr === "gitlab") effectiveSourceSecrets.gitlab_token = newToken;
-              else effectiveSourceSecrets.gdrive_token = newToken;
-            }
-          } catch (err) {
-            logInfo("OAuth token refresh failed — using existing token", { service: "workflow-service", kbId, error: err instanceof Error ? err.message : String(err) });
+    const sourceTypeStr = String(kb.sourceType ?? "");
+    const isExpired = expiry ? new Date(expiry).getTime() < Date.now() + 5 * 60 * 1000 : false;
+
+    if (isExpired) {
+      const refreshToken = nonEmptyString(sourceSecrets.gitlab_refresh) ?? nonEmptyString(sourceSecrets.gdrive_refresh);
+      const refreshUrl = sourceTypeStr === "gitlab" ? "https://gitlab.com/oauth/token" : "https://oauth2.googleapis.com/token";
+      const clientIdKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_ID" : "GOOGLE_CLIENT_ID";
+      const clientSecretKey = sourceTypeStr === "gitlab" ? "GITLAB_CLIENT_SECRET" : "GOOGLE_CLIENT_SECRET";
+      const clientId = String(process.env[clientIdKey] ?? sourceSecrets.oauth_client_id ?? "").trim();
+      const clientSecret = String(process.env[clientSecretKey] ?? sourceSecrets.oauth_client_secret ?? "").trim();
+
+      const failSync = async (message: string) => {
+        const syncJob = await prisma.ragKbSyncJob.create({
+          data: {
+            knowledgeBaseId: kbId,
+            trigger,
+            triggeredById,
+            status: "failed",
+            startedAt: new Date(),
+            completedAt: new Date(),
+            n8nWebhookUrl: n8nWorkflowId ? `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}` : null,
+            errorMessage: message
           }
-        } else if (!refreshToken) {
-          // No refresh token and token is expired — fail immediately before preflight
-          const syncJob = await prisma.ragKbSyncJob.create({
-            data: {
-              knowledgeBaseId: kbId,
-              trigger,
-              triggeredById,
-              status: "failed",
-              startedAt: new Date(),
-              completedAt: new Date(),
-              n8nWebhookUrl: n8nWorkflowId ? `${config.n8nApiBaseUrl}/webhook/${n8nWorkflowId}` : null,
-              errorMessage: "OAuth access token expired. Please reconnect the integration."
-            }
-          });
-          return syncJob.id;
+        });
+        return syncJob.id;
+      };
+
+      if (!refreshToken) {
+        return failSync("OAuth access token expired. Please reconnect the integration.");
+      }
+
+      if (!clientId || !clientSecret) {
+        return failSync("OAuth token expired but OAuth App credentials (Client ID / Secret) are missing. Please reconnect the integration to re-enter your OAuth App credentials.");
+      }
+
+      let refreshed = false;
+      try {
+        const refreshRes = await fetch(refreshUrl, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+          body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId, client_secret: clientSecret }).toString()
+        });
+        const refreshPayload = (await refreshRes.json()) as Record<string, unknown>;
+        if (refreshPayload.error) throw new Error(String(refreshPayload.error_description ?? refreshPayload.error));
+        const newToken = String(refreshPayload.access_token ?? "").trim();
+        const newRefreshToken = String(refreshPayload.refresh_token ?? "").trim();
+        const newExpiry = Number(refreshPayload.expires_in ?? 0);
+        if (newToken) {
+          const newTokenExpiry = newExpiry > 0 ? new Date(Date.now() + newExpiry * 1000).toISOString() : undefined;
+          const ownerId = String(kb.ownerId ?? triggeredById).trim() || triggeredById;
+          const updatedSecrets: Record<string, string> = {
+            ...Object.fromEntries(Object.entries(sourceSecrets).map(([k, v]) => [k, String(v)])),
+            ...(sourceTypeStr === "gitlab" ? { gitlab_token: newToken } : { gdrive_token: newToken }),
+            ...(newRefreshToken && sourceTypeStr === "gitlab" ? { gitlab_refresh: newRefreshToken } : {}),
+            ...(newRefreshToken && sourceTypeStr !== "gitlab" ? { gdrive_refresh: newRefreshToken } : {}),
+            ...(newTokenExpiry ? { token_expiry: newTokenExpiry } : {})
+          };
+          await writeVaultKv(userSourceSecretPath(ownerId, kbId), updatedSecrets).catch((e) =>
+            logInfo("OAuth token refresh Vault write failed", { service: "workflow-service", kbId, error: e instanceof Error ? e.message : String(e) })
+          );
+          if (sourceTypeStr === "gitlab") effectiveSourceSecrets.gitlab_token = newToken;
+          else effectiveSourceSecrets.gdrive_token = newToken;
+          refreshed = true;
+          logInfo("OAuth token refreshed successfully", { service: "workflow-service", kbId, provider: sourceTypeStr });
         }
+      } catch (err) {
+        logInfo("OAuth token refresh failed", { service: "workflow-service", kbId, error: err instanceof Error ? err.message : String(err) });
+      }
+
+      if (!refreshed) {
+        return failSync("OAuth access token expired and could not be refreshed automatically. Please reconnect the integration.");
       }
     }
   }
@@ -5005,6 +5034,20 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
       }
     });
 
+    // After a job completes/fails, prune history to keep only the last 10 per KB
+    if (isCompleted) {
+      (prisma as any).ragKbSyncJob.findMany({
+        where: { knowledgeBaseId: existingJob.knowledgeBaseId },
+        orderBy: { createdAt: "desc" },
+        select: { id: true }
+      }).then((jobs: { id: string }[]) => {
+        if (jobs.length > 10) {
+          const idsToDelete = jobs.slice(10).map((j) => j.id);
+          return (prisma as any).ragKbSyncJob.deleteMany({ where: { id: { in: idsToDelete } } });
+        }
+      }).catch(() => undefined);
+    }
+
     // Upsert step into stepsJson
     if (body.step) {
       const stepToStore = body.step.stepName === "dify_indexing" && failedDocuments.length
@@ -5254,7 +5297,7 @@ app.get("/slack/oauth/callback", async (request, reply) => {
   const oauth = (await response.json()) as any;
   if (!oauth.ok) {
     await (prisma as any).slackDeployment.updateMany({ where: { id: deploymentId, ownerId }, data: { status: "error", errorMessage: safeString(oauth.error) || "Slack OAuth failed" } });
-    return reply.redirect(`/rapidrag/chat-channels?slack_connected=false&deploymentId=${encodeURIComponent(deploymentId)}`);
+    return reply.redirect(`/chat-channels?slack_connected=false&deploymentId=${encodeURIComponent(deploymentId)}`);
   }
   await writeVaultKv(slackDeploymentSecretPath(ownerId, deploymentId), {
     bot_token: oauth.access_token,
@@ -5271,7 +5314,7 @@ app.get("/slack/oauth/callback", async (request, reply) => {
       errorMessage: null
     }
   });
-  return reply.redirect(`/rapidrag/chat-channels?slack_connected=true&deploymentId=${encodeURIComponent(deploymentId)}`);
+  return reply.redirect(`/chat-channels?slack_connected=true&deploymentId=${encodeURIComponent(deploymentId)}`);
 });
 
 app.post("/slack/validate-token", async (request, reply) => {

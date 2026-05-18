@@ -2107,6 +2107,77 @@ a {
   margin-top: 4px;
 }
 
+/* Dify indexing stats */
+.ops-dify-stats-block {
+  display: grid;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.ops-dify-mini-bar-wrap {
+  position: relative;
+  height: 6px;
+  background: #e5e7eb;
+  border-radius: 4px;
+  overflow: hidden;
+  max-width: 320px;
+}
+
+.ops-dify-mini-bar-fill {
+  height: 100%;
+  background: #10b981;
+  border-radius: 4px;
+  transition: width 1s ease;
+}
+
+.ops-dify-mini-bar-pulse {
+  background: #6366f1;
+  animation: dify-bar-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes dify-bar-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.45; }
+}
+
+.ops-dify-mini-bar-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding-left: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #111827;
+  white-space: nowrap;
+  pointer-events: none;
+  line-height: 1;
+  top: 8px;
+}
+
+.ops-dify-stats-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.ops-dify-stat {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-weight: 500;
+  background: #f3f4f6;
+  color: #374151;
+}
+
+.ops-dify-stat-total      { background: #f3f4f6; color: #111827; font-weight: 600; }
+.ops-dify-stat-inprogress { background: #eff6ff; color: #1d4ed8; }
+.ops-dify-stat-queuing    { background: #fefce8; color: #854d0e; }
+.ops-dify-stat-completed  { background: #f0fdf4; color: #166534; }
+.ops-dify-stat-error      { background: #fef2f2; color: #991b1b; }
+.ops-dify-stat-retry      { background: #faf5ff; color: #6b21a8; }
+
 .ops-step-badge {
   display: inline-flex;
   align-items: center;

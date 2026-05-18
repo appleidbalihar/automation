@@ -22,7 +22,7 @@
 #   Phase 6: api-gateway → web → web-ingress
 #
 # INSTALL (one-time on production server):
-#   sudo cp /home/bali/rapidrag/infra/systemd/rapidrag.service /etc/systemd/system/
+#   sudo cp /home/bali/09_rapidrag/infra/systemd/rapidrag.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable rapidrag   # enable auto-start on boot
 #   sudo systemctl start rapidrag    # start now
@@ -35,7 +35,7 @@
 
 [Unit]
 Description=RapidRAG Docker Compose Stack (Phased Startup)
-Documentation=file:///home/bali/rapidrag/README.md
+Documentation=file:///home/bali/09_rapidrag/README.md
 # After= ensures ordering (starts after docker if docker is running) but does NOT
 # cause this service to fail if docker isn't active yet. We handle docker readiness
 # ourselves in ExecStartPre with a polling loop.
@@ -45,7 +45,8 @@ Wants=network-online.target docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/home/bali/rapidrag
+WorkingDirectory=/home/bali/09_rapidrag
+Environment=ENVIRONMENT=dev
 
 # Wait for Docker socket to be truly ready before starting.
 # This loop polls up to 20 minutes (300 × 4s) — handles the BoltDB fdatasync
@@ -60,14 +61,14 @@ ExecStartPre=/bin/bash -c '\
   docker info >/dev/null 2>&1 || { echo "Docker not ready after 20 minutes"; exit 1; }'
 
 # Run the phased startup script via bash — avoids SELinux exec restrictions on /home
-ExecStart=/bin/bash /home/bali/rapidrag/infra/scripts/phased-startup.sh
+ExecStart=/bin/bash /home/bali/09_rapidrag/infra/scripts/phased-startup.sh
 
 # On stop: bring down the stack gracefully (preserving volumes).
 # Vault secrets are not needed for stop — placeholder env is sufficient.
 ExecStop=/bin/bash -c 'docker compose \
-  -f /home/bali/rapidrag/docker-compose.yml \
-  -f /home/bali/rapidrag/docker-compose.prod.yml \
-  --env-file /home/bali/rapidrag/.env.production \
+  -f /home/bali/09_rapidrag/docker-compose.yml \
+  -f /home/bali/09_rapidrag/docker-compose.prod.yml \
+  --env-file /home/bali/09_rapidrag/.env.production \
   down --timeout 30 || true'
 
 # Restart on failure with generous intervals
@@ -76,7 +77,7 @@ RestartSec=120s
 
 # Allow up to 30 minutes for all phases (Docker wait + dify-migrate ~12min + rest)
 TimeoutStartSec=1800
-TimeoutStopSec=60
+TimeoutStopSec=300
 
 StandardOutput=journal
 StandardError=journal

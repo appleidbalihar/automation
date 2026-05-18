@@ -41,7 +41,16 @@ if ! command -v jq >/dev/null 2>&1; then echo "ERROR: jq is required" >&2; exit 
 
 # Locate the approle credentials directory
 if [[ -z "${APPROLE_DIR}" ]]; then
-  # Try common paths: docker volume mount or host path
+  # Try all known vault_data volume names (project name may vary)
+  for vol_name in "rapidrag_vault_data" "09_rapidrag_vault_data" "09_automationplatform_vault_data"; do
+    mp="$(docker volume inspect "${vol_name}" --format '{{.Mountpoint}}' 2>/dev/null || true)"
+    [[ -n "${mp}" && -f "${mp}/approle/deploy-${ENVIRONMENT}/role_id" ]] && \
+      APPROLE_DIR="${mp}/approle" && break
+  done
+fi
+
+if [[ -z "${APPROLE_DIR}" ]]; then
+  # Fallback: inspect the compose-configured vault_data volume for this project
   for candidate in \
     "$(docker volume inspect "$(basename "$(pwd)")_vault_data" --format '{{.Mountpoint}}' 2>/dev/null || true)/approle" \
     "/var/lib/docker/volumes/$(basename "$(pwd)")_vault_data/_data/approle" \
@@ -56,7 +65,7 @@ fi
 if [[ -z "${APPROLE_DIR}" || ! -f "${APPROLE_DIR}/deploy-${ENVIRONMENT}/role_id" ]]; then
   echo "ERROR: Could not find deploy-${ENVIRONMENT} AppRole credentials." >&2
   echo "Set APPROLE_DIR to the path containing deploy-${ENVIRONMENT}/role_id and secret_id." >&2
-  echo "Example: APPROLE_DIR=/var/lib/docker/volumes/09_automationplatform_vault_data/_data/approle" >&2
+  echo "Example: APPROLE_DIR=/var/lib/docker/volumes/09_rapidrag_vault_data/_data/approle" >&2
   exit 1
 fi
 
@@ -120,6 +129,8 @@ DIFY_REDIS_PASS="$(vault_field "app/dify/config" "redis_password")"
 N8N_ENC="$(vault_field "app/n8n/config" "encryption_key")"
 N8N_DB_PASS="$(vault_field "app/n8n/config" "db_password")"
 N8N_WEBHOOK="$(vault_field "app/n8n/config" "webhook_token")"
+N8N_OWNER_PASS="$(vault_field "app/n8n/config" "owner_password")"
+N8N_OWNER_EMAIL_VAL="$(vault_field "app/n8n/config" "owner_email")"
 
 # Revoke the short-lived token immediately — credentials are already in memory
 curl -sS -X POST -H "X-Vault-Token: ${VAULT_TOKEN}" \
@@ -172,6 +183,8 @@ DIFY_REDIS_PASSWORD=${DIFY_REDIS_PASS}
 N8N_ENCRYPTION_KEY=${N8N_ENC}
 N8N_DB_PASSWORD=${N8N_DB_PASS}
 N8N_WEBHOOK_TOKEN=${N8N_WEBHOOK}
+N8N_OWNER_PASSWORD=${N8N_OWNER_PASS}
+N8N_OWNER_EMAIL=${N8N_OWNER_EMAIL_VAL}
 EOF
 chmod 600 "${OUTPUT_FILE}"
 

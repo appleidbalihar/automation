@@ -217,7 +217,7 @@ The platform runs the following Docker containers:
 - Image: `n8nio/n8n:latest`
 - Port: host `5679` -> container `5678`
 - Purpose: workflow runner for document sync and channel workflows.
-- Notes: `N8N_PATH` is `/n8n/`; `WEBHOOK_URL` defaults to `https://dev.eclassmanager.com/n8n/`.
+- Notes: `N8N_PATH` is `/n8n/`; `WEBHOOK_URL` defaults to `https://dev.rapidrag.ai/n8n/`.
 - Data volume: `n8n_data`.
 
 ## Persistent Data Volumes
@@ -239,9 +239,9 @@ Stateful services must keep their writable state in named Docker volumes. App/ru
 Start and restart through the platform wrapper so Vault-rendered runtime env files are generated and shredded automatically:
 
 ```bash
-/home/bali/09_automationplatform/scripts/platform-containers.sh dev start
-/home/bali/09_automationplatform/scripts/platform-containers.sh dev restart keycloak web web-ingress
-/home/bali/09_automationplatform/scripts/platform-containers.sh dev status
+/home/bali/09_rapidrag/scripts/platform-containers.sh dev start
+/home/bali/09_rapidrag/scripts/platform-containers.sh dev restart keycloak web web-ingress
+/home/bali/09_rapidrag/scripts/platform-containers.sh dev status
 ```
 
 ## Sidecars And Control Jobs

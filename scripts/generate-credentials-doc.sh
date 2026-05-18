@@ -12,7 +12,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OUTPUT_FILE="${OUTPUT_FILE:-/root/platform-credentials-${ENVIRONMENT}.md}"
 
 # ── Vault bootstrap ────────────────────────────────────────────────────────────
-VAULT_DATA_DIR=$(docker volume inspect "$(basename "${REPO_ROOT}")_vault_data" --format '{{.Mountpoint}}' 2>/dev/null || true)
+VAULT_DATA_DIR=""
+for vol_name in "rapidrag_vault_data" "09_rapidrag_vault_data" "09_automationplatform_vault_data" "$(basename "${REPO_ROOT}")_vault_data"; do
+  mp="$(docker volume inspect "${vol_name}" --format '{{.Mountpoint}}' 2>/dev/null || true)"
+  if [[ -n "${mp}" && -f "${mp}/vault-init.json" ]]; then
+    VAULT_DATA_DIR="${mp}"
+    break
+  fi
+done
 if [[ -z "${VAULT_DATA_DIR}" ]]; then
   echo "ERROR: Could not find vault_data volume. Is the stack running?" >&2
   exit 1
@@ -49,6 +56,12 @@ RMQ_USER=$(kv_field "platform/${ENV}/infra/rabbitmq/config" username)
 RMQ_PASS=$(kv_field "platform/${ENV}/infra/rabbitmq/config" password)
 REDIS_PASS=$(kv_field "platform/${ENV}/infra/redis/config" password)
 
+N8N_OWNER_EMAIL=$(kv_field "platform/${ENV}/app/n8n/config" owner_email)
+N8N_OWNER_PASS=$(kv_field "platform/${ENV}/app/n8n/config" owner_password)
+if [[ "${N8N_OWNER_EMAIL}" == "(not set)" || -z "${N8N_OWNER_EMAIL}" ]]; then
+  N8N_OWNER_EMAIL="admin@platform.local"
+fi
+
 DIFY_CONSOLE_EMAIL=$(kv_field "platform/global/dify/config" console_email)
 DIFY_CONSOLE_PASS=$(kv_field "platform/global/dify/config" console_password)
 DIFY_APP_URL=$(kv_field "platform/global/dify/config" default_app_url)
@@ -66,7 +79,7 @@ LLM_BASE=$(kv_field "platform/global/llm" base_url)
 VAULT_TOKEN_OUT="${ROOT_TOKEN}"
 
 if [[ "${ENV}" == "prod" ]]; then
-  DOMAIN="theaitools.ca"
+  DOMAIN="rapidrag.ai"
   WEB_URL="https://${DOMAIN}/rapidrag/"
   N8N_URL="https://${DOMAIN}/n8n/"
   DIFY_WEB_URL="https://${DOMAIN}/dify/"
@@ -78,8 +91,8 @@ if [[ "${ENV}" == "prod" ]]; then
   N8N_LOCAL="http://localhost:5679  (SSH tunnel required)"
   DIFY_LOCAL="http://localhost:3002  (SSH tunnel required)"
 else
-  DOMAIN="dev.eclassmanager.com"
-  WEB_URL="https://${DOMAIN}/rapidrag/   or   https://localhost:3443/rapidrag/"
+  DOMAIN="dev.rapidrag.ai"
+  WEB_URL="https://${DOMAIN}/   or   https://localhost:3443/"
   N8N_URL="http://localhost:5679"
   DIFY_WEB_URL="http://localhost:3002"
   KC_URL="https://localhost:8443"
@@ -137,7 +150,7 @@ cat > "${OUTPUT_FILE}" <<EOF
 
 | Service | URL | Login | Password |
 |---------|-----|-------|----------|
-| **n8n Workflow Editor** | ${N8N_LOCAL} | \`admin@platform.local\` | set during Step 8 |
+| **n8n Workflow Editor** | ${N8N_LOCAL} | \`${N8N_OWNER_EMAIL}\` | \`${N8N_OWNER_PASS}\` |
 | **Dify Web UI** | ${DIFY_LOCAL} | \`${DIFY_CONSOLE_EMAIL}\` | \`${DIFY_CONSOLE_PASS}\` |
 | **Dify API (internal)** | ${DIFY_APP_URL} | \`${DIFY_CONSOLE_EMAIL}\` | \`${DIFY_CONSOLE_PASS}\` |
 

@@ -3,7 +3,7 @@
 **Version:** 1.0
 **Date:** 2026-04-30
 **Environment:** RHEL/CentOS 7, Docker 26.1.3, Spinning HDD, SELinux Enforcing
-**Applies to:** Any server running the 09_automationplatform Docker Compose stack
+**Applies to:** Any server running the 09_rapidrag Docker Compose stack
 
 ---
 
@@ -29,13 +29,13 @@ After every server reboot, the following symptoms appeared:
 [root@localhost ~]# docker ps
 ^C   ← hangs indefinitely, must Ctrl+C
 
-[root@localhost ~]# systemctl status automationplatform
-● automationplatform.service
+[root@localhost ~]# systemctl status rapidrag
+● rapidrag.service
    Active: inactive (dead)
 ```
 
 - `docker ps` hangs forever (no output, no error)
-- `automationplatform` service shows `inactive (dead)` instead of `active`
+- `rapidrag` service shows `inactive (dead)` instead of `active`
 - All 33 Docker containers are not running
 - Manual intervention was required every reboot to start the platform
 
@@ -63,16 +63,16 @@ BoltDB calls `fdatasync()` on every write to ensure journal integrity. On a **sp
 Boot → dockerd starts → "Daemon has completed initialization" (fast)
      → BoltDB fdatasync blocks goroutine 1 for 3-10 minutes
      → docker ps hangs (socket not accepting connections)
-     → automationplatform service fails with dependency error
+     → rapidrag service fails with dependency error
 ```
 
-### 2.2 Why `automationplatform` Was `inactive (dead)`
+### 2.2 Why `rapidrag` Was `inactive (dead)`
 
-The original service used `Requires=docker.service`. When systemd evaluates this dependency, it checks if docker is in `active` state — not `activating`. Since Docker stays in `activating` (BoltDB hang) for 3-10 minutes, systemd immediately fails automationplatform with:
+The original service used `Requires=docker.service`. When systemd evaluates this dependency, it checks if docker is in `active` state — not `activating`. Since Docker stays in `activating` (BoltDB hang) for 3-10 minutes, systemd immediately fails rapidrag with:
 
 ```
-Dependency failed for Automation Platform Docker Compose Stack
-automationplatform.service: Job failed with result 'dependency'
+Dependency failed for RapidRAG Docker Compose Stack
+rapidrag.service: Job failed with result 'dependency'
 ```
 
 This happens before the service even starts its ExecStartPre commands.
@@ -96,12 +96,12 @@ The fix has **four components** that work together:
 | **A. Docker daemon config** | `/etc/docker/daemon.json` | Disables live-restore to prevent stale container re-attachment |
 | **B. Pre-start cleanup + RAM disks** | `/etc/systemd/system/docker.service.d/pre-clean.conf` | Mounts tmpfs for BoltDB, wipes stale state before Docker starts |
 | **C. Startup guard** | `/etc/systemd/system/docker.service.d/startup-guard.conf` | Adds restart-on-failure and timeout for Docker |
-| **D. Platform service** | `/etc/systemd/system/automationplatform.service` | Self-polling Docker wait loop, phased startup script |
+| **D. Platform service** | `/etc/systemd/system/rapidrag.service` | Self-polling Docker wait loop, phased startup script |
 | **E. Phased startup script** | `infra/scripts/phased-startup.sh` | Starts 33 containers in 6 dependency-ordered phases |
 
 **Key insight:** By mounting `network/files/` and `buildkit/` on tmpfs (RAM), Docker's BoltDB `fdatasync` completes in microseconds instead of minutes. By deleting `volumes/metadata.db` before start, Docker rebuilds this index fresh without slow disk operations. Result: **Docker responds to `docker ps` in ~4-10 seconds** instead of 3-10 minutes.
 
-**Key insight 2:** By removing `Requires=docker.service` from automationplatform and replacing it with an internal polling loop, the service **never fails** due to Docker being in `activating` state — it simply waits until Docker responds.
+**Key insight 2:** By removing `Requires=docker.service` from rapidrag and replacing it with an internal polling loop, the service **never fails** due to Docker being in `activating` state — it simply waits until Docker responds.
 
 ---
 
@@ -192,50 +192,19 @@ RestartSec=15s
 
 ---
 
-### File D: `/etc/systemd/system/automationplatform.service`
+### File D: `/etc/systemd/system/rapidrag.service`
 
 **Purpose:** Systemd service that auto-starts the Docker Compose stack on boot. Uses internal Docker polling instead of `Requires=` dependency.
 
-```ini
-[Unit]
-Description=Automation Platform Docker Compose Stack (Phased Startup)
-Documentation=file:///home/bali/09_automationplatform/README.md
-After=docker.service containerd.service network-online.target
-Wants=network-online.target docker.service
+The canonical file is in the repo at `infra/systemd/rapidrag.service`. Install it with:
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/home/bali/09_automationplatform
-
-ExecStartPre=/bin/bash -c '\
-  echo "Waiting for Docker to be ready..."; \
-  for i in $(seq 1 300); do \
-    docker info >/dev/null 2>&1 && \
-    echo "Docker ready after $((i*4))s" && break || \
-    sleep 4; \
-  done; \
-  docker info >/dev/null 2>&1 || { echo "Docker not ready after 20 minutes"; exit 1; }'
-
-ExecStart=/bin/bash /home/bali/09_automationplatform/infra/scripts/phased-startup.sh
-
-ExecStop=/bin/bash /home/bali/09_automationplatform/scripts/platform-containers.sh prod down
-
-Restart=on-failure
-RestartSec=120s
-
-TimeoutStartSec=1800
-TimeoutStopSec=60
-
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo cp ${APP_DIR}/infra/systemd/rapidrag.service /etc/systemd/system/rapidrag.service
+sudo systemctl daemon-reload
 ```
 
 **⚠️ KEY DESIGN DECISION — No `Requires=docker.service`:**
-Using `Requires=` causes systemd to fail automationplatform if Docker is still `activating`. On a spinning HDD, Docker can take 3-10 minutes to become `active`. The polling loop (300 × 4s = 20 min max wait) handles this gracefully.
+Using `Requires=` causes systemd to fail rapidrag if Docker is still `activating`. On a spinning HDD, Docker can take 3-10 minutes to become `active`. The polling loop (300 × 4s = 20 min max wait) handles this gracefully.
 
 **⚠️ SELinux Note:** `ExecStart` uses `/bin/bash /path/to/script` NOT `/path/to/script` directly. This is required because SELinux on RHEL/CentOS 7 will block direct execution of scripts in `/home` directories with `status=203/EXEC`. Calling via `/bin/bash` works because `/bin/bash` has the correct SELinux context.
 
@@ -292,7 +261,7 @@ Phase 6: api-gateway → web → web-ingress (nginx)
 
 ### Prerequisites
 - Root access on the production server
-- The `09_automationplatform` repository deployed to a known path (e.g. `/opt/automationplatform` or `/home/bali/09_automationplatform`)
+- The `09_rapidrag` repository deployed to a known path (e.g. `/opt/rapidrag` or `/home/bali/09_rapidrag`)
 - Docker already installed (version 20+ required)
 - `systemctl` available (RHEL/CentOS/Fedora)
 
@@ -301,7 +270,7 @@ Phase 6: api-gateway → web → web-ingress (nginx)
 ```bash
 # Adjust these to match your production environment
 DOCKER_DATA_ROOT=$(docker info 2>/dev/null | grep "Docker Root Dir" | awk '{print $NF}')
-APP_DIR="/home/bali/09_automationplatform"   # Change to production app path
+APP_DIR="/home/bali/09_rapidrag"   # Change to production app path
 
 echo "Docker data root: $DOCKER_DATA_ROOT"
 echo "App directory: $APP_DIR"
@@ -353,38 +322,12 @@ RestartSec=15s
 EOF
 ```
 
-### Step 4: Create the automationplatform systemd service
+### Step 4: Install the rapidrag systemd service
+
+The service file is in the repo — copy it to systemd:
 
 ```bash
-# Replace APP_DIR with actual path before running
-cat > /etc/systemd/system/automationplatform.service << EOF
-[Unit]
-Description=Automation Platform Docker Compose Stack (Phased Startup)
-After=docker.service containerd.service network-online.target
-Wants=network-online.target docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=${APP_DIR}
-
-ExecStartPre=/bin/bash -c 'echo "Waiting for Docker to be ready..."; for i in \$(seq 1 300); do docker info >/dev/null 2>&1 && echo "Docker ready after \$((i*4))s" && break || sleep 4; done; docker info >/dev/null 2>&1 || { echo "Docker not ready after 20 minutes"; exit 1; }'
-
-ExecStart=/bin/bash ${APP_DIR}/infra/scripts/phased-startup.sh
-
-ExecStop=/bin/bash ${APP_DIR}/scripts/platform-containers.sh prod down
-
-Restart=on-failure
-RestartSec=120s
-TimeoutStartSec=1800
-TimeoutStopSec=60
-
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
+sudo cp ${APP_DIR}/infra/systemd/rapidrag.service /etc/systemd/system/rapidrag.service
 ```
 
 ### Step 5: Make the phased startup script executable
@@ -401,12 +344,12 @@ bash -n ${APP_DIR}/infra/scripts/phased-startup.sh && echo "Script syntax OK"
 ```bash
 systemctl daemon-reload
 
-# Enable automationplatform to start on every boot
-systemctl enable automationplatform
+# Enable rapidrag to start on every boot
+systemctl enable rapidrag
 
 # Verify it's enabled
-systemctl is-enabled automationplatform   # should print: enabled
-systemctl is-enabled docker               # should print: enabled
+systemctl is-enabled rapidrag   # should print: enabled
+systemctl is-enabled docker     # should print: enabled
 ```
 
 ### Step 7: Test the configuration (without rebooting)
@@ -433,11 +376,11 @@ systemctl status docker
 # Check all containers are running
 docker ps
 
-# Check automationplatform service
-systemctl status automationplatform
+# Check rapidrag service
+systemctl status rapidrag
 
 # Follow startup progress
-journalctl -u automationplatform -f
+journalctl -u rapidrag -f
 ```
 
 ---
@@ -448,18 +391,18 @@ journalctl -u automationplatform -f
 
 ```
 NAMES                                                  STATUS
-09_automationplatform-api-gateway-1                    Up X minutes
-09_automationplatform-web-1                            Up X minutes
-09_automationplatform-web-ingress-1                    Up X minutes
-09_automationplatform-postgres-1                       Up X minutes (healthy)
-09_automationplatform-vault-1                          Up X minutes
+rapidrag-api-gateway-1                       Up X minutes
+rapidrag-web-1                               Up X minutes
+rapidrag-web-ingress-1                       Up X minutes
+rapidrag-postgres-1                          Up X minutes (healthy)
+rapidrag-vault-1                             Up X minutes
 ... (29 more containers)
 ```
 
-### Expected `systemctl status automationplatform` output:
+### Expected `systemctl status rapidrag` output:
 
 ```
-● automationplatform.service - Automation Platform Docker Compose Stack (Phased Startup)
+● rapidrag.service - RapidRAG Docker Compose Stack (Phased Startup)
    Active: active (exited)    ← "exited" is CORRECT for Type=oneshot with RemainAfterExit
 ```
 
@@ -486,7 +429,7 @@ mountpoint /path/to/docker-data/buildkit        # should say "is a mountpoint"
 ### Follow the phased startup in real-time:
 
 ```bash
-journalctl -u automationplatform -f
+journalctl -u rapidrag -f
 ```
 
 ### Expected log progression:
@@ -545,15 +488,15 @@ mountpoint /path/to/docker-data/buildkit
 ls -la /path/to/docker-data/volumes/metadata.db
 ```
 
-### Problem: `automationplatform` shows `inactive (dead)` after boot
+### Problem: `rapidrag` shows `inactive (dead)` after boot
 
 **Check journal:**
 ```bash
-journalctl -u automationplatform --since "boot"
+journalctl -u rapidrag --since "boot"
 ```
 
 **If "Waiting for Docker to be ready..." never appears:**
-The service never started. Check if it's enabled: `systemctl is-enabled automationplatform`
+The service never started. Check if it's enabled: `systemctl is-enabled rapidrag`
 
 **If "Docker not ready after 20 minutes" appears:**
 Docker truly failed to start. Check: `journalctl -u docker --since "boot"`
@@ -577,7 +520,7 @@ This is an HDD limitation. Flask DB migrations on a spinning disk take 5-12 minu
 If you see `❌ Timeout waiting for ... after 720s`, increase the timeout in `phased-startup.sh`:
 ```bash
 # Find this line in phased-startup.sh:
-wait_for_container_exit 09_automationplatform-dify-migrate-1 720
+wait_for_container_exit rapidrag-dify-migrate-1 720
 
 # Change 720 to 900 (15 minutes) if needed
 ```
@@ -597,7 +540,7 @@ When `docker ps` hangs and returns no output after server reboot, the cause is *
 With `live-restore: false`, Docker does NOT keep containers running during daemon restart. Instead:
 - On shutdown: Docker stops all containers gracefully
 - On start: Docker loads clean state, no container reconnection
-- `docker compose up` (via automationplatform service) brings everything back
+- `docker compose up` (via rapidrag service) brings everything back
 
 This is the correct behavior for this platform. Do NOT change it to `true` — that was the original cause of the stale sandbox errors.
 
@@ -651,7 +594,7 @@ T+0:30  Docker service starts, pre-clean hooks run (tmpfs + wipe)
 T+0:35  dockerd process starts
 T+1:00  "Daemon has completed initialization" (still activating for systemd)
 T+3:00  Docker socket becomes responsive (BoltDB fdatasync completes)
-T+3:04  automationplatform polls docker info → "Docker ready after 4s"
+T+3:04  rapidrag polls docker info → "Docker ready after 4s"
 T+3:15  Phase 1 complete (vault, opensearch, DBs)
 T+3:45  Phase 2 complete (all vault-agents)
 T+5:45  Vault PKI bootstrap complete
@@ -666,4 +609,4 @@ T+18:00 ALL PHASES COMPLETE — Platform fully running
 
 ---
 
-*Document created: 2026-04-30 | Platform: 09_automationplatform | Server: RHEL 4.18, Spinning HDD (TOSHIBA MK1059GSMP)*
+*Document created: 2026-04-30 | Platform: 09_rapidrag | Server: RHEL 4.18, Spinning HDD (TOSHIBA MK1059GSMP)*

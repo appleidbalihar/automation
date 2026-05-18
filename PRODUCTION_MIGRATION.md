@@ -139,8 +139,8 @@ docker info | grep "Docker Root Dir"
 ## Step 2 — Clone the Repository
 
 ```bash
-git clone https://gitlab.com/appleid.balihar-group/automation.git /home/bali/rapidrag
-cd /home/bali/rapidrag
+git clone https://gitlab.com/appleid.balihar-group/automation.git /home/bali/09_rapidrag
+cd /home/bali/09_rapidrag
 ```
 
 ---
@@ -158,11 +158,11 @@ Fill in the **non-secret** values only. All passwords come from Vault (Step 4).
 |----------|-------|
 | `SECURITY_DIAGNOSTICS_TOKEN` | `$(openssl rand -hex 32)` |
 | `KEYCLOAK_PUBLIC_URL` | `https://rapidrag.ai/auth` |
-| `PLATFORM_URL` | `https://rapidrag.ai/rapidrag` |
-| `OAUTH_CALLBACK_BASE_URL` | `https://rapidrag.ai/rapidrag/connect` |
-| `OAUTH_POST_CONNECT_REDIRECT` | `https://rapidrag.ai/rapidrag/integrations` |
-| `NEXT_PUBLIC_API_BASE_URL` | `https://rapidrag.ai/rapidrag/connect` |
-| `NEXT_PUBLIC_PLATFORM_URL` | `https://rapidrag.ai/rapidrag` |
+| `PLATFORM_URL` | `https://rapidrag.ai` |
+| `OAUTH_CALLBACK_BASE_URL` | `https://rapidrag.ai/connect` |
+| `OAUTH_POST_CONNECT_REDIRECT` | `https://rapidrag.ai/integrations` |
+| `NEXT_PUBLIC_API_BASE_URL` | *(leave blank — uses internal routing)* |
+| `NEXT_PUBLIC_PLATFORM_URL` | `https://rapidrag.ai` |
 | `GITHUB_CLIENT_ID` | From GitHub OAuth App |
 | `GITLAB_CLIENT_ID` | From GitLab Application |
 | `GOOGLE_CLIENT_ID` | From Google Cloud Console |
@@ -272,10 +272,10 @@ docker image prune -a -f && docker builder prune -a -f
 ## Step 6 — Start the Full Stack
 
 ```bash
-/home/bali/rapidrag/scripts/platform-containers.sh prod start
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod start
 
 # Verify all containers are up
-/home/bali/rapidrag/scripts/platform-containers.sh prod status
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod status
 
 # Confirm the short-lived runtime env was removed
 find /run/platform-secrets -maxdepth 1 -type f -name '.env.prod*' -print
@@ -589,16 +589,16 @@ Update each OAuth provider with the production domain.
 
 ### GitHub
 - Settings → Developer Settings → OAuth Apps → Your App
-- **Homepage URL**: `https://rapidrag.ai/rapidrag`
-- **Callback URL**: `https://rapidrag.ai/rapidrag/connect/oauth/callback/github`
+- **Homepage URL**: `https://rapidrag.ai`
+- **Callback URL**: `https://rapidrag.ai/connect/oauth/callback/github`
 
 ### GitLab
 - User Settings → Applications → Your App
-- **Redirect URI**: `https://rapidrag.ai/rapidrag/connect/oauth/callback/gitlab`
+- **Redirect URI**: `https://rapidrag.ai/connect/oauth/callback/gitlab`
 
 ### Google
 - Cloud Console → Credentials → Your OAuth 2.0 Client
-- **Authorised redirect URI**: `https://rapidrag.ai/rapidrag/connect/oauth/callback/google`
+- **Authorised redirect URI**: `https://rapidrag.ai/connect/oauth/callback/google`
 
 ---
 
@@ -616,7 +616,7 @@ sudo certbot certonly --standalone -d rapidrag.ai
 ## Step 13 — Configure Outer Nginx
 
 ```bash
-sudo cp /home/bali/rapidrag/infra/nginx/rapidrag-production.conf \
+sudo cp /home/bali/09_rapidrag/infra/nginx/rapidrag-production.conf \
         /etc/nginx/sites-available/rapidrag-production
 
 sudo ln -s /etc/nginx/sites-available/rapidrag-production \
@@ -630,13 +630,23 @@ sudo nginx -t && sudo nginx -s reload
 ## Step 14 — Smoke Tests
 
 ```bash
-# Landing page
-curl -I https://rapidrag.ai/rapidrag/
+# Landing page (served at root)
+curl -I https://rapidrag.ai/
 # Expected: 200
 
 # API gateway health
-curl -sk https://rapidrag.ai/rapidrag/connect/health
+curl -sk https://rapidrag.ai/connect/health
 # Expected: {"status":"ok"}
+
+# Keycloak login page reachable (public auth flow)
+curl -sk -o /dev/null -w "%{http_code}" \
+  https://rapidrag.ai/auth/realms/automation-platform/.well-known/openid-configuration
+# Expected: 200
+
+# Keycloak admin console blocked from public
+curl -sk -o /dev/null -w "%{http_code}" \
+  https://rapidrag.ai/auth/admin/
+# Expected: 403
 
 # n8n accessible
 curl -I https://rapidrag.ai/n8n/
@@ -644,15 +654,21 @@ curl -I https://rapidrag.ai/n8n/
 
 # Prompt templates API — should return 401, not 404/502
 curl -s -o /dev/null -w "%{http_code}" \
-  https://rapidrag.ai/rapidrag/connect/rag/prompt-templates
+  https://rapidrag.ai/connect/rag/prompt-templates
 # Expected: 401
 
 # LLM generate — should return 401, not 503 (503 = Vault LLM secret missing)
 curl -s -o /dev/null -w "%{http_code}" -X POST \
-  https://rapidrag.ai/rapidrag/connect/rag/prompt-templates/generate
+  https://rapidrag.ai/connect/rag/prompt-templates/generate
 # Expected: 401
 
-# Vault is sealed/healthy
+# Rate limiting — hammer the API, 31st req within a minute should 429
+for i in $(seq 1 31); do
+  curl -s -o /dev/null -w "%{http_code}\n" https://rapidrag.ai/connect/health
+done | tail -3
+# Expected: last line is 429
+
+# Vault healthy
 curl -s http://localhost:8200/v1/sys/health | grep '"sealed":false'
 ```
 
@@ -673,9 +689,27 @@ echo "0 0,12 * * * root certbot renew --quiet && nginx -s reload" | \
 
 Install the `rapidrag` systemd service so the Docker stack starts automatically on every server boot.
 
+### 16.1 — Remove old `automationplatform` service (if present)
+
+The old service pointed to `/home/bali/09_automationplatform/` which no longer exists. Remove it before installing the new one.
+
+```bash
+# Check if the old service is installed
+systemctl status automationplatform 2>&1 | head -5
+
+# If it exists, remove it completely
+sudo systemctl stop automationplatform 2>/dev/null || true
+sudo systemctl disable automationplatform
+sudo rm -f /etc/systemd/system/automationplatform.service
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+```
+
+### 16.2 — Install and enable the `rapidrag` service
+
 ```bash
 # Copy the service file from the repo
-sudo cp /home/bali/rapidrag/infra/systemd/rapidrag.service /etc/systemd/system/
+sudo cp /home/bali/09_rapidrag/infra/systemd/rapidrag.service /etc/systemd/system/
 
 # Reload systemd and enable the service
 sudo systemctl daemon-reload
@@ -688,21 +722,35 @@ sudo systemctl start rapidrag
 sudo systemctl status rapidrag
 ```
 
+### 16.3 — Startup timing expectations
+
+The service uses a 6-phase phased startup. **Expect 15–20 minutes** for the full stack to be ready on a spinning HDD server. The systemd timeout is set to 30 minutes — this is intentional.
+
+| Phase | What starts | Gate / wait condition | Typical time |
+|-------|-------------|-----------------------|-------------|
+| Pre | Docker readiness poll | `docker info` succeeds (up to 20 min on HDD) | 0–2 min |
+| 1 | `vault` | TCP port 8200 open | ~1 min |
+| 2 | `vault-bootstrap` + 13 vault-agents + `cert-rotation-controller` | PKI bootstrap complete + 15 s TLS cert buffer | ~2–3 min |
+| 3 | `postgres`, `redis`, `rabbitmq`, `minio`, `keycloak`, `opensearch`, `n8n`, `dify-migrate` | `postgres` health check passes (HDD WAL recovery) | ~3–5 min |
+| **4** | `db-migrate` → `dify-migrate` → `dify-api`, `dify-worker` | **dify-migrate Flask DB upgrade (9–12 min on HDD)** ← main bottleneck | ~10–12 min |
+| 5 | `workflow-service`, `logging-service`, `dify-web` | 10 s sleep | ~10 s |
+| 6 | `api-gateway`, `web`, `web-ingress` | — | ~5 s |
+
+**Stop time**: ~30–60 seconds (`docker compose down --timeout 30`).
+
+To watch live progress during startup:
+```bash
+journalctl -u rapidrag -f
+```
+
 **Common service commands:**
 
 ```bash
-systemctl start rapidrag    # start the stack
-systemctl stop rapidrag     # graceful stop (preserves all volumes)
+systemctl start rapidrag    # start the stack (~15-20 min to fully ready)
+systemctl stop rapidrag     # graceful stop (~30-60 s, preserves all volumes)
 systemctl status rapidrag   # check status
-journalctl -u rapidrag -f   # stream startup logs
+journalctl -u rapidrag -f   # stream startup logs live
 ```
-
-> If the server was already running another service named `automationplatform`, disable it first:
-> ```bash
-> sudo systemctl stop automationplatform
-> sudo systemctl disable automationplatform
-> # The old service file can be left in place — it points to the old path and won't conflict
-> ```
 
 ---
 
@@ -724,22 +772,22 @@ This creates `/root/platform-credentials-prod.md` (readable only by root).
 
 ## Service Access Reference
 
-| Service | Internal Port | Production URL | Default Credentials |
-|---------|---------------|----------------|---------------------|
-| Web (Next.js) | 3000 | `https://rapidrag.ai/rapidrag/` | Keycloak login |
-| API Gateway | 4000 | `https://rapidrag.ai/rapidrag/connect/` | Bearer token |
-| Keycloak Admin | 8443 (loopback) | `https://rapidrag.ai/auth` (public) / SSH tunnel for admin console | `admin` / from Vault |
-| n8n | 5678 | `https://rapidrag.ai/n8n/` | Set during wizard |
-| Dify | 3000 | `https://rapidrag.ai/dify/` | Set during wizard |
-| MinIO Console | 9001 | Not publicly exposed — access via SSH tunnel | from Vault |
-| RabbitMQ Mgmt | 15672 | Not publicly exposed — access via SSH tunnel | from Vault |
-| Vault UI | 8200 | Not publicly exposed — access via SSH tunnel | root token |
-| OpenSearch | 9200 | Not publicly exposed — access via SSH tunnel | from Vault |
-| PostgreSQL | 5432 | Not publicly exposed | from Vault |
+| Service | Internal Port | Host Port | Production URL | Default Credentials |
+|---------|---------------|-----------|----------------|---------------------|
+| Web (Next.js + nginx) | 443 | 3443 | `https://rapidrag.ai/` | Keycloak login |
+| API Gateway | 4000 | 4000 | `https://rapidrag.ai/connect/` | Bearer token |
+| Keycloak Admin | 8443 | 8443 (loopback) | `https://rapidrag.ai/auth/` (public) / `https://rapidrag.ai/auth/admin/` (admin console) | `admin` / from Vault |
+| n8n | 5678 | 5679 | `https://rapidrag.ai/n8n/` | Set during wizard |
+| Dify Web | 3000 | 3002 | Not nginx-proxied — `http://rapidrag.ai:3002/` for initial setup only | Set during wizard |
+| MinIO Console | 9001 | 9001 | Not publicly exposed — access via SSH tunnel | from Vault |
+| RabbitMQ Mgmt | 15671 | 15671 | Not publicly exposed — access via SSH tunnel | from Vault |
+| Vault UI | 8200 | 8200 | Not publicly exposed — access via SSH tunnel | root token |
+| OpenSearch | 9200 | 9200 | Not publicly exposed — access via SSH tunnel | from Vault |
+| PostgreSQL | 5432 | 5432 | Not publicly exposed | from Vault |
 
 > To access non-public services from your workstation:
 > ```bash
-> ssh -L 9001:localhost:9001 -L 15672:localhost:15672 -L 8200:localhost:8200 user@rapidrag.ai
+> ssh -L 9001:localhost:9001 -L 15671:localhost:15671 -L 8200:localhost:8200 user@rapidrag.ai
 > ```
 
 ---
@@ -849,15 +897,15 @@ JSON does not support comments. A `_users_note` documentation field was present 
 
 ```bash
 # Stop all services
-/home/bali/rapidrag/scripts/platform-containers.sh prod down
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod down
 
 # Remove nginx config
 sudo rm /etc/nginx/sites-enabled/rapidrag-production
 sudo nginx -s reload
 
 # Check logs for diagnosis
-/home/bali/rapidrag/scripts/platform-containers.sh prod logs web
-/home/bali/rapidrag/scripts/platform-containers.sh prod logs api-gateway
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod logs web
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod logs api-gateway
 ```
 
 To do a full clean rebuild (wipes all data volumes):
@@ -877,11 +925,12 @@ Internet (Cloudflare → rapidrag.ai)
     ▼
 Host Nginx (ports 80/443)  ←  Let's Encrypt TLS
     │
-    ├── /              →  301 → /rapidrag/
-    ├── /rapidrag/     →  https://localhost:3443        (inner Docker nginx → Next.js)
-    ├── /rapidrag/connect/  →  https://localhost:4000   (api-gateway)
-    ├── /auth/         →  https://localhost:8443/       (Keycloak — loopback only, prefix stripped)
-    └── /n8n/          →  http://localhost:5679         (n8n)
+    ├── /              →  https://localhost:3443          (inner Docker nginx → Next.js)
+    ├── /connect/      →  https://localhost:4000          (api-gateway — rate limited 30r/m)
+    ├── /api/slack/    →  https://localhost:4000          (Slack webhooks — no rate limit)
+    ├── /auth/         →  https://localhost:8443/         (Keycloak — loopback only)
+    ├── /auth/admin/   →  403 BLOCKED                     (SSH tunnel for admin access)
+    └── /n8n/          →  http://localhost:5679           (n8n)
 
 Port 8443 is bound to 127.0.0.1 — not reachable from the internet.
 KC_HOSTNAME_URL=https://rapidrag.ai/auth instructs Keycloak to generate /auth/-prefixed redirect URLs.

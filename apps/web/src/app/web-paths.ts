@@ -1,4 +1,4 @@
-const BASE_PATH = "/rapidrag";
+const BASE_PATH = "";
 
 export function appPath(path: string): string {
   const normalized = path.startsWith("/") ? path : `/${path}`;

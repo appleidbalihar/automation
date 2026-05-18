@@ -1,6 +1,3 @@
-# Edge Gateway Migration Plan
-
-## Overview
 Moving the ingress infrastructure (Cloudflare Tunnel and NGINX) from the host OS into Docker containers. This ensures the host network is secure, no inbound ports are exposed to the public internet, and capacity issues are mitigated through containerized Rate Limiting and a Web Application Firewall (ModSecurity).
 
 ## Objectives
@@ -43,7 +40,7 @@ During the migration, the following adjustments were made to ensure the stack fu
    sudo firewall-cmd --permanent --add-port=7890/tcp
    sudo firewall-cmd --reload
    ```
-4. **Traffic Monitoring (GoAccess):** The GoAccess dashboard was removed from the public `theaitools.ca` domain for privacy. It is now accessed locally via the server's IP address on port 80: `http://<your-server-ip>/admin/traffic/`.
+4. **Traffic Monitoring (GoAccess):** The GoAccess dashboard was removed from the public `rapidrag.ai` domain for privacy. It is now accessed locally via the server's IP address on port 80: `http://<your-server-ip>/admin/traffic/`.
 5. **Log Configuration:** NGINX was configured to write logs to an actual file (`/var/log/nginx/goaccess.log`) instead of `/dev/stdout` to allow the GoAccess container to parse them successfully.
 
 ## Legacy Cutover Instructions
@@ -82,6 +79,6 @@ To safely cut over from the host OS services to the new containerized Edge Gatew
    ```
 
 5. **Validation:**
-   * Open your browser and navigate to `https://theaitools.ca` and `https://dev.eclassmanager.com`.
+   * Open your browser and navigate to `https://rapidrag.ai` and `https://dev.rapidrag.ai`.
    * Open `http://<your-server-ip>/admin/traffic/` to verify GoAccess is actively parsing logs.
    * If any issues occur, you can revert by stopping the docker containers (`docker compose down`) and starting the host services (`sudo systemctl start cloudflared nginx`).

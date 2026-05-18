@@ -42,7 +42,7 @@ A: Currently supported:
 A: RapidRAG uses the LLM configured in the platform's Vault secret store (`platform/global/llm`). The default configuration points to fuelix.ai (Gemini-compatible). Administrators can reconfigure this to any OpenAI-compatible API provider. The embedding model is configured separately in Dify.
 
 **Q: Is RapidRAG available as a hosted SaaS?**  
-A: The production deployment targets `theaitools.ca`. The platform is currently running in the development environment. Contact your platform administrator for access.
+A: The production deployment targets `rapidrag.ai`. The platform is currently running in the development environment. Contact your platform administrator for access.
 
 ---
 
@@ -358,7 +358,7 @@ A: Approximately 30 containers in the development stack, including application s
 A: The production deployment model supports offline capability. All container images are pre-pulled from the GitLab Container Registry and stored locally. The platform can operate without internet access once deployed, provided the LLM API endpoint is reachable (or self-hosted).
 
 **Q: What is the difference between the development and production environments?**  
-A: The development environment runs on Docker Compose (`docker-compose.yml`) on a local server. The production environment (`docker-compose.prod.yml`) targets `theaitools.ca`, uses pre-built registry images rather than local builds, and is configured with production-grade secrets and TLS certificates for the public domain. Production deployment has not yet been executed.
+A: The development environment runs on Docker Compose (`docker-compose.yml`) on a local server. The production environment (`docker-compose.prod.yml`) targets `rapidrag.ai`, uses pre-built registry images rather than local builds, and is configured with production-grade secrets and TLS certificates for the public domain. Production deployment has not yet been executed.
 
 **Q: How does secret rotation work?**  
 A: Vault Agent sidecars monitor the Vault PKI and KV stores. When a TLS certificate approaches expiry, the `cert-rotation-controller` places a rotation request on the `rotation_control` RabbitMQ queue. Each service's `tls-runtime` package receives the notification and hot-reloads the new certificate in-process without restarting the service.

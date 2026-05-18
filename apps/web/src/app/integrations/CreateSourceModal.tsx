@@ -12,8 +12,8 @@ type AuthMode = "choose" | "oauth" | "pat";
 type OAuthStep = "provider" | "details";
 type Provider = "github" | "gitlab" | "googledrive";
 
-const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.eclassmanager.com/rapidrag").replace(/\/$/, "");
-const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/rapidrag/connect").replace(/\/$/, "");
+const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.rapidrag.ai").replace(/\/$/, "");
+const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.rapidrag.ai/connect").replace(/\/$/, "");
 
 type ProviderMeta = {
   label: string;

@@ -276,7 +276,7 @@ Reranking improves precision: the final chunks passed to the AI model are ordere
 ### To temporarily disable reranking (debug/maintenance)
 
 ```bash
-docker exec 09_automationplatform-dify-db-1 psql -U dify -d dify -c "
+docker exec 09_rapidrag-dify-db-1 psql -U dify -d dify -c "
 UPDATE app_model_configs
 SET dataset_configs = (
   dataset_configs::jsonb
@@ -289,7 +289,7 @@ WHERE dataset_configs LIKE '%rerank%';
 ### To re-enable reranking
 
 ```bash
-docker exec 09_automationplatform-dify-db-1 psql -U dify -d dify -c "
+docker exec 09_rapidrag-dify-db-1 psql -U dify -d dify -c "
 UPDATE app_model_configs
 SET dataset_configs = (
   dataset_configs::jsonb

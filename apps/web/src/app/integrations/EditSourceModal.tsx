@@ -8,10 +8,8 @@ import type { Integration } from "./types";
 
 // PLATFORM_URL and OAUTH_CALLBACK_BASE are driven by env vars set in .env / .env.production.
 // Fallbacks use the /rapidrag path prefix so they're correct even without env vars.
-// Dev:  NEXT_PUBLIC_PLATFORM_URL=https://dev.eclassmanager.com/rapidrag
-// Prod: NEXT_PUBLIC_PLATFORM_URL=https://theaitools.ca/rapidrag
-const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.eclassmanager.com/rapidrag").replace(/\/$/, "");
-const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.eclassmanager.com/rapidrag/connect").replace(/\/$/, "");
+const PLATFORM_URL = (process.env.NEXT_PUBLIC_PLATFORM_URL ?? "https://dev.rapidrag.ai").replace(/\/$/, "");
+const OAUTH_CALLBACK_BASE = (process.env.NEXT_PUBLIC_OAUTH_CALLBACK_BASE_URL ?? "https://dev.rapidrag.ai/connect").replace(/\/$/, "");
 
 type Props = {
   integration: Integration | null;

@@ -237,19 +237,43 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
                         <span>{step.task}</span>
                       </div>
                       {step.errorMessage && variant !== "running" ? <small className="ops-sync-inline-err">{step.errorMessage}</small> : null}
-                      {step.difyStats && (step.logStepName === "dify_indexing" || step.logStepName === "retry_failed_indexing") ? (
-                        <div className="ops-dify-stats-row">
-                          <span className="ops-dify-stat ops-dify-stat-total">📄 {step.difyStats.total} total</span>
-                          <span className="ops-dify-stat ops-dify-stat-inprogress">🔄 {step.difyStats.inProgress} in-progress</span>
-                          <span className="ops-dify-stat ops-dify-stat-completed">✅ {step.difyStats.completed} completed</span>
-                          <span className="ops-dify-stat ops-dify-stat-queuing">⏳ {step.difyStats.queuing} queuing</span>
-                          <span className="ops-dify-stat ops-dify-stat-error">❌ {step.difyStats.error} errors</span>
-                          {step.difyStats.retryAttempt ? (
-                            <span className="ops-dify-stat ops-dify-stat-retry">
-                              Retry {step.difyStats.retryAttempt}/{step.difyStats.maxRetries ?? 5}
-                            </span>
-                          ) : null}
-                        </div>
+                      {(step.logStepName === "dify_indexing" || step.logStepName === "retry_failed_indexing") ? (
+                        step.difyStats ? (
+                          <div className="ops-dify-stats-block">
+                            {step.difyStats.total > 0 ? (
+                              <div className="ops-dify-mini-bar-wrap">
+                                <div
+                                  className="ops-dify-mini-bar-fill"
+                                  style={{ width: `${Math.round((step.difyStats.completed / step.difyStats.total) * 100)}%` }}
+                                />
+                                <span className="ops-dify-mini-bar-label">
+                                  {Math.round((step.difyStats.completed / step.difyStats.total) * 100)}% &mdash; {step.difyStats.completed} / {step.difyStats.total} files
+                                </span>
+                              </div>
+                            ) : null}
+                            <div className="ops-dify-stats-row">
+                              <span className="ops-dify-stat ops-dify-stat-total">📄 {step.difyStats.total} total</span>
+                              <span className="ops-dify-stat ops-dify-stat-inprogress">🔄 {step.difyStats.inProgress} indexing</span>
+                              <span className="ops-dify-stat ops-dify-stat-queuing">⏳ {step.difyStats.queuing} queuing</span>
+                              <span className="ops-dify-stat ops-dify-stat-completed">✅ {step.difyStats.completed} done</span>
+                              <span className="ops-dify-stat ops-dify-stat-error">❌ {step.difyStats.error} errors</span>
+                              {step.difyStats.retryAttempt ? (
+                                <span className="ops-dify-stat ops-dify-stat-retry">
+                                  Retry {step.difyStats.retryAttempt}/{step.difyStats.maxRetries ?? 5}
+                                </span>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : variant === "running" ? (
+                          <div className="ops-dify-stats-block">
+                            <div className="ops-dify-mini-bar-wrap ops-dify-mini-bar-indeterminate">
+                              <div className="ops-dify-mini-bar-fill ops-dify-mini-bar-pulse" style={{ width: "30%" }} />
+                            </div>
+                            <div className="ops-dify-stats-row">
+                              <span className="ops-dify-stat" style={{ opacity: 0.6 }}>Waiting for first index stats…</span>
+                            </div>
+                          </div>
+                        ) : null
                       ) : null}
                       {step.failedDocuments.length > 0 ? (
                         <div className="ops-failed-doc-list">

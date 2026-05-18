@@ -26,6 +26,7 @@ services:
     #   docker exec -e VAULT_TOKEN=... vault vault kv get secret/platform/prod/infra/postgres/config
     cap_add:
       - IPC_LOCK
+      - SETFCAP   # vault binary sets file capabilities on startup; without this it exits 1
     cap_drop:
       - ALL
     security_opt:

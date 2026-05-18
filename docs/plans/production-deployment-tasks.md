@@ -1,6 +1,6 @@
 # Production Deployment — Task Tracker
 
-**Target:** First production installation on `theaitools.ca`
+**Target:** First production installation on `rapidrag.ai`
 **Reference guide:** [PRODUCTION_MIGRATION.md](../../PRODUCTION_MIGRATION.md)
 **Created:** 2026-05-08 based on the dev clean-rebuild session
 
@@ -88,7 +88,7 @@
 | P9 | Optionally generate `/run/platform-secrets/.env.prod.runtime` for inspection, then shred it | ⬜ | PROD_MIG Step 4.7 |
 | P10 | Build images `--no-cache` (Alpine-based: web ~240 MB, db-migrate ~315 MB, service-base ~1.1 GB) | ⬜ | PROD_MIG Step 5 |
 | P10a | Prune old images + build cache after build: `docker image prune -a -f && docker builder prune -a -f` | ⬜ | Frees ~400+ GB of old layers |
-| P11 | Start full stack with `/home/bali/09_automationplatform/scripts/platform-containers.sh prod start` | ⬜ | PROD_MIG Step 6 |
+| P11 | Start full stack with `/home/bali/09_rapidrag/scripts/platform-containers.sh prod start` | ⬜ | PROD_MIG Step 6 |
 | P12 | Confirm no `/run/platform-secrets/.env.prod*` runtime env file remains after start | ⬜ | PROD_MIG Step 6 |
 | P13 | Verify: `db-migrate` Exited(0), `dify-migrate` Exited(0) | ⬜ | PROD_MIG Step 6 |
 | P14 | Run `ENVIRONMENT=prod bash scripts/seed-keycloak-platform-admin.sh` for `platform-admin` | ⬜ | PROD_MIG Step 7 |
@@ -99,7 +99,7 @@
 | P22 | Seed Dify config to Vault (`platform/global/dify/config`) — `default_app_url`, `console_password`, `model_api_base`, `model_api_key`, `chat_model`, `embedding_model` | ⬜ | PROD_MIG Step 10.1 |
 | P23 | Seed LLM config to Vault (`platform/global/llm`) — `api_key`, `model`, `base_url` (used by AI Agent Prompt page) | ⬜ | PROD_MIG Step 10.2 |
 | P24 | Configure OAuth callback URLs (GitHub, GitLab, Google) | ⬜ | PROD_MIG Step 11 |
-| P25 | Install Let's Encrypt cert for `theaitools.ca` | ⬜ | PROD_MIG Step 12 |
+| P25 | Install Let's Encrypt cert for `rapidrag.ai` | ⬜ | PROD_MIG Step 12 |
 | P26 | Configure and reload outer nginx | ⬜ | PROD_MIG Step 13 |
 | P27 | Run all smoke tests | ⬜ | PROD_MIG Step 14 |
 | P28 | Enable certbot auto-renewal cron | ⬜ | PROD_MIG Step 15 |
@@ -131,12 +131,12 @@ Configure Slack app settings:
 
 | Slack App Area | Production Value |
 |----------------|------------------|
-| OAuth Redirect URL | `https://theaitools.ca/rapidrag/api/slack/oauth/callback` |
-| Event Subscriptions Request URL | `https://theaitools.ca/rapidrag/api/slack/events` |
+| OAuth Redirect URL | `https://rapidrag.ai/api/slack/oauth/callback` |
+| Event Subscriptions Request URL | `https://rapidrag.ai/api/slack/events` |
 | App Home Messages Tab | On; allow users to send slash commands and messages |
 | Bot event subscription | `message.im` |
 | Slash command | `/kb` |
-| Slash command Request URL | `https://theaitools.ca/rapidrag/api/slack/events` |
+| Slash command Request URL | `https://rapidrag.ai/api/slack/events` |
 | Slash command description | `Query RapidRAG knowledge bases` |
 | Slash command usage hint | `[list \| use <name> \| all \| status \| help]` |
 
@@ -198,7 +198,7 @@ Use nginx `limit_req` only after staging validation for abusive floods. If nginx
 
 Run after production deploy:
 
-1. Open `https://theaitools.ca/rapidrag/chat-channels`.
+1. Open `https://rapidrag.ai/chat-channels`.
 2. Click `Connect Slack`.
 3. Enter a deployment name.
 4. Click `Add RapidRAG Bot to Slack`.
@@ -245,7 +245,7 @@ The browser "Settings → Import" does NOT correctly publish workflows for webho
 ### 4. Restart containers only through the platform wrapper
 The wrapper generates a short-lived runtime env from Vault, runs Docker Compose with the production override, then shreds the runtime env file:
 ```bash
-/home/bali/09_automationplatform/scripts/platform-containers.sh prod restart <service-name>
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod restart <service-name>
 ```
 After any start or restart, verify no runtime env file remains under `/run/platform-secrets`.
 
@@ -279,7 +279,7 @@ All source types (GitHub, GitLab, Google Drive) use a single unified webhook:
 | `POST /webhook/rag-sync-source` | Generic Source to Dify Sync | GitHub, GitLab, Google Drive |
 
 Production URL (once nginx is up):
-- `https://theaitools.ca/n8n/webhook/rag-sync-source`
+- `https://rapidrag.ai/n8n/webhook/rag-sync-source`
 
 The workflow is imported and activated automatically by `infra/n8n/init-workflows.sh`
 on every container start — no manual import needed.

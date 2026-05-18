@@ -164,7 +164,7 @@ These gaps carry compliance risk, answer-quality risk, or block production.
 | H4 | **Retrieval Metrics (Recall@k, MRR)** | Measure whether the right chunks are actually retrieved | No evidence the vector index is returning relevant content |
 | H5 | **Post-Retrieval Authorization Check** | Re-verify user permissions after vector search returns results | Pre-retrieval filter alone can miss edge cases in shared KB scenarios |
 | H6 | **Output Gating / Output Validation** | Scan LLM output before returning to user | Risk of sensitive data leakage across KBs; prompt injection from malicious doc content |
-| H7 | **Production Deployment** | Platform running on `theaitools.ca` | 0/36 production tasks (P1–P36) completed; platform is dev-only |
+| H7 | **Production Deployment** | Platform running on `rapidrag.ai` | 0/36 production tasks (P1–P36) completed; platform is dev-only |
 | H8 | **LLM Provider Configuration** | Dify LLM + embedding model configured (D2/D3) | Without embedding model, all KB indexing fails silently |
 
 ### 3.2 Medium Priority Gaps
@@ -199,7 +199,7 @@ These gaps carry compliance risk, answer-quality risk, or block production.
 
 ## 4. Production Deployment Status
 
-**Target:** `theaitools.ca`
+**Target:** `rapidrag.ai`
 **Current State:** Development environment fully operational (all 34 containers running in dev since 2026-05-08 rebuild).
 
 ### Outstanding Blockers (must fix before any production deploy)
@@ -212,7 +212,7 @@ These gaps carry compliance risk, answer-quality risk, or block production.
 | 🔴 Critical | Dify admin account not created in prod | P20 |
 | 🟡 High | n8n workflows not imported/activated in prod | P15–P19 |
 | 🟡 High | Slack platform bot app not created for prod | P31 |
-| 🟡 High | SSL certificate + outer nginx not configured for `theaitools.ca` | P25–P26 |
+| 🟡 High | SSL certificate + outer nginx not configured for `rapidrag.ai` | P25–P26 |
 | 🟡 High | OAuth callback URLs (GitHub, GitLab, Google) not configured for prod | P24 |
 | 🟢 Normal | Smoke tests not run | P27 |
 | 🟢 Normal | Certbot auto-renewal not enabled | P28 |

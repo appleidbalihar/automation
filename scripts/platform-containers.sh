@@ -8,13 +8,15 @@
 # otherwise falls back to placeholder values so Compose can parse quietly.
 #
 # Usage:
-#   scripts/platform-containers.sh dev start
+#   scripts/platform-containers.sh dev start              # full phased cold boot
+#   scripts/platform-containers.sh dev start --phase 5    # resume from phase 5
 #   scripts/platform-containers.sh dev restart workflow-service api-gateway web web-ingress
 #   scripts/platform-containers.sh prod stop workflow-service
 #   scripts/platform-containers.sh prod status
 #
 # Actions:
-#   start    docker compose up -d [services...]
+#   start    phased startup (all 6 phases) when no services given;
+#            docker compose up -d [services...] when services are specified
 #   restart  docker compose up -d --force-recreate [services...]
 #   stop     docker compose stop [services...]
 #   down     docker compose down
@@ -123,7 +125,14 @@ fi
 
 case "${ACTION}" in
   start)
-    run_compose up -d "$@"
+    if [[ $# -eq 0 ]]; then
+      # Full cold boot — use phased startup for correct dependency order
+      # (Vault → agents → infra → migrations → services → gateway)
+      cleanup_runtime_env  # phased-startup.sh manages its own runtime env
+      ENVIRONMENT="${ENVIRONMENT}" exec bash "${ROOT_DIR}/infra/scripts/phased-startup.sh" "$@"
+    else
+      run_compose up -d "$@"
+    fi
     ;;
   restart)
     run_compose up -d --force-recreate "$@"
@@ -136,7 +145,12 @@ case "${ACTION}" in
       echo "ERROR: down does not accept service names. Use stop for selected services." >&2
       exit 1
     fi
-    run_compose down
+    if systemctl is-active --quiet rapidrag 2>/dev/null; then
+      echo "Service is managed by systemd — stopping via: systemctl stop rapidrag"
+      exec sudo systemctl stop rapidrag
+    else
+      run_compose down
+    fi
     ;;
   status)
     run_compose ps "$@"

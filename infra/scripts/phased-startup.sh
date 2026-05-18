@@ -156,7 +156,7 @@ wait_for_container_exit() {
 
 # Wait for postgres to be healthy via pg_isready inside the container
 wait_for_postgres() {
-  local container="${1:-09_automationplatform-postgres-1}" max="${2:-180}"
+  local container="${1:-rapidrag-postgres-1}" max="${2:-180}"
   info "Waiting for postgres to be healthy..."
   local elapsed=0
   while true; do
@@ -192,10 +192,10 @@ wait_for_vault_bootstrap() {
     # vault-bootstrap creates approle files; check if vault-bootstrap container is done
     # OR check if the approle directory exists in the vault_data volume
     local status
-    status=$(docker inspect --format='{{.State.Status}}' 09_automationplatform-vault-bootstrap-1 2>/dev/null || echo "unknown")
+    status=$(docker inspect --format='{{.State.Status}}' rapidrag-vault-bootstrap-1 2>/dev/null || echo "unknown")
     # vault-bootstrap runs in watch mode (restart: unless-stopped) so it stays running
     # We check if it has logged "Bootstrap complete" at least once
-    if docker logs 09_automationplatform-vault-bootstrap-1 2>&1 | grep -q "PKI bootstrap complete\|PKI bootstrap already completed\|watch mode enabled"; then
+    if docker logs rapidrag-vault-bootstrap-1 2>&1 | grep -q "PKI bootstrap complete\|PKI bootstrap already completed\|watch mode enabled"; then
       log "Vault PKI bootstrap complete"
       return 0
     fi
@@ -279,7 +279,7 @@ phase3() {
 
   # Gate: wait for postgres to be healthy before running migrations
   # Postgres does WAL recovery on HDD which takes 90-120s. Use 300s timeout.
-  wait_for_postgres 09_automationplatform-postgres-1 300
+  wait_for_postgres rapidrag-postgres-1 300
 }
 
 phase4() {
@@ -291,12 +291,12 @@ phase4() {
 
   # Run platform DB migration first
   "${DOCKER_COMPOSE[@]}" up -d db-migrate
-  wait_for_container_exit 09_automationplatform-db-migrate-1 180
+  wait_for_container_exit rapidrag-db-migrate-1 180
 
   # Wait for dify-migrate to complete (started in phase 3 alongside postgres)
   # dify-migrate runs Flask DB upgrade which takes 9-12 minutes on this spinning HDD.
   # Observed times: first boot = 9m31s, second boot = 11m46s. Use 720s (12 minutes).
-  wait_for_container_exit 09_automationplatform-dify-migrate-1 720
+  wait_for_container_exit rapidrag-dify-migrate-1 720
 
   # Now start dify-api and dify-worker (migrations are done)
   "${DOCKER_COMPOSE[@]}" up -d dify-api dify-worker
@@ -341,7 +341,7 @@ phase6() {
 # =============================================================================
 
 info "============================================================"
-info "Automation Platform — Phased Startup"
+info "RapidRAG — Phased Startup"
 info "Working directory: $COMPOSE_DIR"
 info "Environment: $ENVIRONMENT"
 info "Starting from phase: $START_PHASE"
@@ -357,6 +357,6 @@ load_runtime_env_from_vault
 [[ "$START_PHASE" -le 6 ]] && phase6
 
 info "============================================================"
-log "ALL PHASES COMPLETE — Automation Platform is running"
+log "ALL PHASES COMPLETE — RapidRAG is running"
 info "============================================================"
 "${DOCKER_COMPOSE[@]}" ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null | head -40 || true

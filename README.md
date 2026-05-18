@@ -8,7 +8,7 @@ RapidRAG is a fully managed RAG-as-a-Service platform. Connect your docs, repos,
 2. `corepack prepare pnpm@9.15.0 --activate`
 3. `pnpm install`
 4. `cp .env.example .env`
-5. `/home/bali/09_automationplatform/scripts/platform-containers.sh dev start`
+5. `/home/bali/09_rapidrag/scripts/platform-containers.sh dev start`
 6. `ENVIRONMENT=dev bash scripts/seed-keycloak-platform-admin.sh`
 
 ## Access points (containerized, secure-only)

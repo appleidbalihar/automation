@@ -103,8 +103,10 @@ vault_write "app/dify/config" \
 N8N_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 N8N_DB_PASSWORD="dev-n8n-$(openssl rand -hex 16)"
 N8N_WEBHOOK_TOKEN="$(openssl rand -hex 32)"
+N8N_OWNER_EMAIL="admin@platform.local"
+N8N_OWNER_PASSWORD="Admin@Platform2026!"
 vault_write "app/n8n/config" \
-  "{\"encryption_key\": \"${N8N_ENCRYPTION_KEY}\", \"db_password\": \"${N8N_DB_PASSWORD}\", \"webhook_token\": \"${N8N_WEBHOOK_TOKEN}\"}"
+  "{\"encryption_key\": \"${N8N_ENCRYPTION_KEY}\", \"db_password\": \"${N8N_DB_PASSWORD}\", \"webhook_token\": \"${N8N_WEBHOOK_TOKEN}\", \"owner_email\": \"${N8N_OWNER_EMAIL}\", \"owner_password\": \"${N8N_OWNER_PASSWORD}\"}"
 
 echo ""
 echo "All dev secrets seeded to Vault (8 paths under platform/dev/)."

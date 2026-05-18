@@ -126,7 +126,7 @@ ENVIRONMENT=dev bash scripts/list-secrets.sh
 ### Step 5 — Generate runtime env and start everything
 
 ```bash
-/home/bali/09_automationplatform/scripts/platform-containers.sh dev start
+/home/bali/09_rapidrag/scripts/platform-containers.sh dev start
 ```
 
 The wrapper generates the runtime env file from Vault, passes it to Docker Compose, and shreds it when Compose returns.
@@ -207,7 +207,7 @@ echo "Root token revoked."
 ### Step 6 — Generate runtime env and start everything
 
 ```bash
-/home/bali/09_automationplatform/scripts/platform-containers.sh prod start
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod start
 ```
 
 ### Step 7 — Create first Keycloak admin user
@@ -279,13 +279,13 @@ Every time you restart or redeploy services, use the platform wrapper. It create
 ### Dev
 
 ```bash
-/home/bali/09_automationplatform/scripts/platform-containers.sh dev start
+/home/bali/09_rapidrag/scripts/platform-containers.sh dev start
 ```
 
 ### Production
 
 ```bash
-/home/bali/09_automationplatform/scripts/platform-containers.sh prod start
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod start
 ```
 
 ---
@@ -327,7 +327,7 @@ ENVIRONMENT=prod ROTATE_ALL=true bash scripts/rotate-secret.sh
 
 ```bash
 # Restart only the affected service (example: postgres password change)
-/home/bali/09_automationplatform/scripts/platform-containers.sh prod restart postgres api-gateway workflow-service logging-service
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod restart postgres api-gateway workflow-service logging-service
 ```
 
 ### Services affected by each secret
@@ -475,7 +475,7 @@ curl -sk -X POST \
 ### Force-renew all certificates (restart the Vault Agent sidecars)
 
 ```bash
-/home/bali/09_automationplatform/scripts/platform-containers.sh prod restart \
+/home/bali/09_rapidrag/scripts/platform-containers.sh prod restart \
   api-gateway-vault-agent \
   workflow-service-vault-agent \
   logging-service-vault-agent \
