@@ -3630,12 +3630,6 @@ a {
   color: #475569;
 }
 
-.rr-badge-soon {
-  border-color: rgba(15, 118, 110, 0.28);
-  background: #f0fdfa;
-  color: #0f766e;
-}
-
 /* ── Sections ────────────────────────────────────────────────────────────── */
 .rr-section {
   padding: 80px 0;
@@ -3756,195 +3750,6 @@ a {
 .rr-check {
   font-size: 18px;
   flex-shrink: 0;
-}
-
-/* ── Coming Soon Feature Band ────────────────────────────────────────────── */
-.rr-coming-soon-section {
-  background:
-    linear-gradient(135deg, rgba(240, 253, 250, 0.95), rgba(236, 254, 255, 0.9)),
-    #f8fafc;
-  border-top: 1px solid #ccfbf1;
-  border-bottom: 1px solid #ccfbf1;
-}
-
-.rr-coming-soon-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(360px, 0.8fr);
-  gap: 44px;
-  align-items: center;
-}
-
-.rr-coming-soon-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 16px;
-}
-
-.rr-feature-card {
-  padding: 20px;
-  border: 1px solid #b2f5ea;
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.86);
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
-}
-
-.rr-feature-kicker {
-  display: inline-flex;
-  margin-bottom: 10px;
-  color: #0f766e;
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.rr-feature-card h3 {
-  margin: 0 0 10px;
-  color: #0b2239;
-  font-size: 17px;
-  line-height: 1.3;
-}
-
-.rr-feature-card p {
-  margin: 0;
-  color: #475569;
-  font-size: 14px;
-  line-height: 1.6;
-}
-
-.rr-widget-preview {
-  display: flex;
-  justify-content: center;
-}
-
-.rr-widget-browser {
-  position: relative;
-  width: min(100%, 420px);
-  min-height: 440px;
-  border: 1px solid #bae6fd;
-  border-radius: 18px;
-  background: #ffffff;
-  box-shadow: 0 24px 60px rgba(8, 47, 73, 0.16);
-  overflow: hidden;
-}
-
-.rr-widget-browser-bar {
-  height: 42px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 0 16px;
-  background: #f8fafc;
-  border-bottom: 1px solid #e2e8f0;
-}
-
-.rr-widget-browser-bar span {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: #cbd5e1;
-}
-
-.rr-widget-page-lines {
-  display: grid;
-  gap: 12px;
-  padding: 30px 24px;
-}
-
-.rr-widget-page-lines span {
-  height: 14px;
-  border-radius: 999px;
-  background: #e2e8f0;
-}
-
-.rr-widget-page-lines span:nth-child(1) {
-  width: 66%;
-}
-
-.rr-widget-page-lines span:nth-child(2) {
-  width: 90%;
-}
-
-.rr-widget-page-lines span:nth-child(3) {
-  width: 54%;
-}
-
-.rr-widget-card {
-  position: absolute;
-  right: 22px;
-  bottom: 22px;
-  width: min(320px, calc(100% - 44px));
-  padding: 16px;
-  border: 1px solid #ccfbf1;
-  border-radius: 16px;
-  background: #ffffff;
-  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18);
-}
-
-.rr-widget-card-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 14px;
-}
-
-.rr-widget-card-header strong,
-.rr-widget-card-header small {
-  display: block;
-}
-
-.rr-widget-card-header strong {
-  color: #0b2239;
-  font-size: 14px;
-}
-
-.rr-widget-card-header small {
-  color: #0f766e;
-  font-size: 12px;
-  margin-top: 2px;
-}
-
-.rr-widget-avatar {
-  width: 34px;
-  height: 34px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #0f766e, #0891b2);
-  color: #fff;
-  font-size: 14px;
-  font-weight: 900;
-}
-
-.rr-widget-message {
-  width: fit-content;
-  max-width: 92%;
-  margin-bottom: 9px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.rr-widget-message-bot {
-  background: #f1f5f9;
-  color: #334155;
-}
-
-.rr-widget-message-user {
-  margin-left: auto;
-  background: #0f766e;
-  color: #fff;
-}
-
-.rr-widget-footer {
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid #e2e8f0;
-  color: #94a3b8;
-  font-size: 11px;
-  text-align: center;
 }
 
 /* ── Steps ───────────────────────────────────────────────────────────────── */
@@ -4383,18 +4188,8 @@ a {
 
   .rr-problem-grid,
   .rr-benefits-grid,
-  .rr-coming-soon-grid,
   .rr-security-grid {
     grid-template-columns: 1fr;
-  }
-
-  .rr-coming-soon-layout {
-    grid-template-columns: 1fr;
-    gap: 28px;
-  }
-
-  .rr-widget-browser {
-    min-height: 390px;
   }
 
   .rr-steps {

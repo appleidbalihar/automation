@@ -207,7 +207,7 @@ function pickDurationMs(o: Record<string, unknown>): number | null {
   return null;
 }
 
-function formatDuration(ms: number | null): string {
+export function formatDuration(ms: number | null): string {
   if (ms === null || ms < 0) return "—";
   if (ms < 1000) return `${Math.round(ms)}ms`;
   const s = ms / 1000;
@@ -305,6 +305,23 @@ export function isFailedDifyIndexingStep(step: NormalizedSyncStep): boolean {
     step.status !== "running" &&
     (step.status === "failed" || step.errorMessage != null || step.failedDocuments.length > 0)
   );
+}
+
+export function isSyncTimedOut(job: SyncJob | null | undefined): boolean {
+  if (!job || String(job.status).toLowerCase() !== "failed") return false;
+  return String(job.errorMessage ?? "").includes("timed out");
+}
+
+// True when the retry-failed-indexing flow can recover the job — covers both explicit
+// Dify errors AND timeout cases where Dify indexing was already underway.
+export function canRetryAfterFailure(job: SyncJob | null | undefined): boolean {
+  if (hasFailedDifyIndexing(job)) return true;
+  if (isSyncTimedOut(job)) {
+    return normalizeSyncSteps(job?.stepsJson).some(
+      (s) => s.logStepName === "dify_indexing" || s.logStepName === "retry_failed_indexing"
+    );
+  }
+  return false;
 }
 
 export function stepBadgeVariant(status: string): "pending" | "running" | "completed" | "failed" {

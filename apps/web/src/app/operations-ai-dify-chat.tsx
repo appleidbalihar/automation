@@ -188,7 +188,7 @@ function syncStatusLabel(job: RagKbSyncJob | null): string {
   if (!job) return "never configured";
   switch (job.status) {
     case "running": return "running";
-    case "pending": return job.errorMessage === "No n8n workflow configured for this knowledge base" ? "pending workflow assignment" : "pending";
+    case "pending": return job.errorMessage === "No sync workflow configured for this knowledge base" ? "pending workflow assignment" : "pending";
     case "failed": return "failed";
     case "completed": return "completed";
     case "never_synced": return "never synced";

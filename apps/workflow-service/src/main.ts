@@ -2813,7 +2813,7 @@ async function autoRetryFailedDifyIndexingForJob(input: {
 
   await (prisma as any).ragKbSyncJob.update({
     where: { id: input.syncJobId },
-    data: { status: "running", completedAt: null, errorMessage: "Monitoring Dify indexing..." }
+    data: { status: "running", completedAt: null, errorMessage: "Monitoring AI indexing..." }
   });
 
   let round = 0;
@@ -3571,7 +3571,7 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
         status: "failed",
         startedAt: new Date(),
         completedAt: new Date(),
-        errorMessage: `Dify provisioning failed: ${error instanceof Error ? error.message : String(error)}`
+        errorMessage: `Knowledge base provisioning failed:${error instanceof Error ? error.message : String(error)}`
       }
     });
     return syncJob.id;
@@ -3827,7 +3827,7 @@ async function triggerKbSync(kbId: string, triggeredById: string, trigger: strin
     // No n8n workflow configured — mark as pending for manual processing
     await (prisma as any).ragKbSyncJob.update({
       where: { id: syncJob.id },
-      data: { status: "pending", errorMessage: "No n8n workflow configured for this knowledge base" }
+      data: { status: "pending", errorMessage: "No sync workflow configured for this knowledge base" }
     });
   }
 
@@ -3971,7 +3971,7 @@ app.post("/rag/integrations", async (request, reply) => {
           status: "failed",
           startedAt: new Date(),
           completedAt: new Date(),
-          errorMessage: `Dify provisioning failed: ${error instanceof Error ? error.message : String(error)}`
+          errorMessage: `Knowledge base provisioning failed:${error instanceof Error ? error.message : String(error)}`
         }
       });
     }
@@ -4306,7 +4306,7 @@ app.post("/rag/knowledge-bases", async (request, reply) => {
           status: "failed",
           startedAt: new Date(),
           completedAt: new Date(),
-          errorMessage: `Dify provisioning failed: ${error instanceof Error ? error.message : String(error)}`
+          errorMessage: `Knowledge base provisioning failed:${error instanceof Error ? error.message : String(error)}`
         }
       });
     }
@@ -4501,6 +4501,195 @@ app.get("/rag/knowledge-bases/:id/sync-history", async (request, reply) => {
     take: limit
   });
   return { knowledgeBaseId: id, jobs };
+});
+
+// ─── Sync Timeout Auto-Tuning ────────────────────────────────────────────────
+// Called by n8n at the start of each Poll Dify Indexing run.
+// Computes optimal maxAttempts from last 30 days of completed syncs.
+// Falls back to 48 (4 min) if no historical data exists.
+app.get("/rag/sync-timeout", async (request, reply) => {
+  const query = request.query as { sourceType?: string };
+  const FALLBACK = 48;
+  const MIN_ATTEMPTS = 12; // 60 s absolute minimum
+
+  try {
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    // Build where clause — optionally filter by source type via KB join
+    const kbIdsForSourceType: string[] | null = query.sourceType
+      ? ((await (prisma as any).ragKnowledgeBase.findMany({
+          where: { sourceType: query.sourceType },
+          select: { id: true }
+        })) as { id: string }[]).map((kb: { id: string }) => kb.id)
+      : null;
+
+    const whereClause: Record<string, unknown> = {
+      status: "completed",
+      createdAt: { gte: thirtyDaysAgo },
+      filesProcessed: { gt: 0 },
+      startedAt: { not: null },
+      completedAt: { not: null }
+    };
+    if (kbIdsForSourceType) whereClause.knowledgeBaseId = { in: kbIdsForSourceType };
+
+    const jobs: { startedAt: Date; completedAt: Date; filesProcessed: number }[] =
+      await (prisma as any).ragKbSyncJob.findMany({
+        where: whereClause,
+        select: { startedAt: true, completedAt: true, filesProcessed: true }
+      });
+
+    if (!jobs.length) {
+      return { maxAttempts: FALLBACK, dataPoints: 0, intervalMs: 5000, totalTimeoutMs: FALLBACK * 5000, note: "No historical data — using default" };
+    }
+
+    // Compute ms-per-file for each job, take the worst case, apply 1.5× safety
+    let maxMsPerFile = 0;
+    for (const job of jobs) {
+      const durationMs = job.completedAt.getTime() - job.startedAt.getTime();
+      const msPerFile = durationMs / job.filesProcessed;
+      if (msPerFile > maxMsPerFile) maxMsPerFile = msPerFile;
+    }
+
+    const suggested = Math.ceil((maxMsPerFile * 1.5) / 5000);
+    const maxAttempts = Math.max(suggested, MIN_ATTEMPTS);
+
+    return {
+      maxAttempts,
+      dataPoints: jobs.length,
+      intervalMs: 5000,
+      totalTimeoutMs: maxAttempts * 5000,
+      note: `Based on ${jobs.length} completed syncs (last 30 days), worst-case ${Math.round(maxMsPerFile / 1000)}s/file × 1.5 safety`
+    };
+  } catch {
+    return { maxAttempts: FALLBACK, dataPoints: 0, intervalMs: 5000, totalTimeoutMs: FALLBACK * 5000, note: "Error computing — using default" };
+  }
+});
+
+// ─── Sync Analytics ──────────────────────────────────────────────────────────
+// Returns per-KB and per-source-type sync performance stats for the last 30 days.
+// Also piggybacked 30-day cleanup of terminal sync job records.
+app.get("/rag/sync-analytics", async (_request, reply) => {
+  const RETENTION_DAYS = 30;
+  const thirtyDaysAgo = new Date(Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  const TABLE_SIZE_WARNING_BYTES = 500 * 1024 * 1024; // 500 MB
+
+  // 1. Cleanup: delete terminal jobs older than retention window
+  await (prisma as any).ragKbSyncJob.deleteMany({
+    where: {
+      createdAt: { lt: thirtyDaysAgo },
+      status: { in: ["completed", "failed", "cancelled"] }
+    }
+  });
+
+  // 2. Fetch all jobs in retention window with KB info
+  const jobs: any[] = await (prisma as any).ragKbSyncJob.findMany({
+    where: { createdAt: { gte: thirtyDaysAgo } },
+    include: { knowledgeBase: { select: { name: true, sourceType: true } } }
+  });
+
+  // 3. Aggregate per-KB
+  const kbMap = new Map<string, {
+    kbName: string; sourceType: string; totalRuns: number; completedRuns: number; failedRuns: number;
+    durations: number[]; msPerFileArr: number[]; filesPerMinArr: number[];
+  }>();
+
+  for (const job of jobs) {
+    const kb = job.knowledgeBase;
+    if (!kb) continue;
+    const key = job.knowledgeBaseId;
+    if (!kbMap.has(key)) kbMap.set(key, { kbName: kb.name, sourceType: kb.sourceType ?? "unknown", totalRuns: 0, completedRuns: 0, failedRuns: 0, durations: [], msPerFileArr: [], filesPerMinArr: [] });
+    const entry = kbMap.get(key)!;
+    entry.totalRuns++;
+    if (job.status === "completed") {
+      entry.completedRuns++;
+      if (job.startedAt && job.completedAt) {
+        const dur = job.completedAt.getTime() - job.startedAt.getTime();
+        entry.durations.push(dur);
+        if (job.filesProcessed > 0) {
+          entry.msPerFileArr.push(dur / job.filesProcessed);
+          entry.filesPerMinArr.push((job.filesProcessed / dur) * 60000);
+        }
+      }
+    } else if (job.status === "failed") {
+      entry.failedRuns++;
+    }
+  }
+
+  const avg = (arr: number[]) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+  const minArr = (arr: number[]) => arr.length ? Math.min(...arr) : null;
+  const maxArr = (arr: number[]) => arr.length ? Math.max(...arr) : null;
+
+  const byKb = Array.from(kbMap.values()).map(e => ({
+    kbName: e.kbName,
+    sourceType: e.sourceType,
+    totalRuns: e.totalRuns,
+    completedRuns: e.completedRuns,
+    failedRuns: e.failedRuns,
+    successRate: e.totalRuns > 0 ? Math.round((e.completedRuns / e.totalRuns) * 100) : null,
+    avgDurationMs: avg(e.durations),
+    minDurationMs: minArr(e.durations),
+    maxDurationMs: maxArr(e.durations),
+    avgMsPerFile: avg(e.msPerFileArr),
+    avgFilesPerMin: avg(e.filesPerMinArr)
+  })).sort((a, b) => b.totalRuns - a.totalRuns);
+
+  // 4. Aggregate per-source-type
+  const stMap = new Map<string, { totalRuns: number; completedRuns: number; durations: number[]; msPerFileArr: number[]; filesPerMinArr: number[] }>();
+  for (const job of jobs) {
+    const sourceType = job.knowledgeBase?.sourceType ?? "unknown";
+    if (!stMap.has(sourceType)) stMap.set(sourceType, { totalRuns: 0, completedRuns: 0, durations: [], msPerFileArr: [], filesPerMinArr: [] });
+    const entry = stMap.get(sourceType)!;
+    entry.totalRuns++;
+    if (job.status === "completed" && job.startedAt && job.completedAt) {
+      entry.completedRuns++;
+      const dur = job.completedAt.getTime() - job.startedAt.getTime();
+      entry.durations.push(dur);
+      if (job.filesProcessed > 0) {
+        entry.msPerFileArr.push(dur / job.filesProcessed);
+        entry.filesPerMinArr.push((job.filesProcessed / dur) * 60000);
+      }
+    }
+  }
+
+  const bySourceType = Array.from(stMap.entries())
+    .map(([sourceType, e]) => ({
+      sourceType,
+      totalRuns: e.totalRuns,
+      completedRuns: e.completedRuns,
+      successRate: e.totalRuns > 0 ? Math.round((e.completedRuns / e.totalRuns) * 100) : null,
+      avgDurationMs: avg(e.durations),
+      avgMsPerFile: avg(e.msPerFileArr),
+      avgFilesPerMin: avg(e.filesPerMinArr)
+    }))
+    .sort((a, b) => (a.avgMsPerFile ?? Infinity) - (b.avgMsPerFile ?? Infinity)); // fastest first
+
+  // 5. Table size estimate (row count × avg row size)
+  const rowCount: number = await (prisma as any).ragKbSyncJob.count();
+  const approxTableBytes = rowCount * 2048; // ~2 KB per row estimate
+
+  // 6. Current auto-timeout recommendation (reuse sync-timeout logic)
+  let currentTimeout: { maxAttempts: number; dataPoints: number; note: string } = { maxAttempts: 48, dataPoints: 0, note: "No data" };
+  try {
+    const allCompleted = jobs.filter((j: any) => j.status === "completed" && j.startedAt && j.completedAt && j.filesProcessed > 0);
+    if (allCompleted.length) {
+      let maxMsPerFile = 0;
+      for (const j of allCompleted) {
+        const mspf = (j.completedAt.getTime() - j.startedAt.getTime()) / j.filesProcessed;
+        if (mspf > maxMsPerFile) maxMsPerFile = mspf;
+      }
+      const suggested = Math.max(Math.ceil((maxMsPerFile * 1.5) / 5000), 12);
+      currentTimeout = { maxAttempts: suggested, dataPoints: allCompleted.length, note: `Worst-case ${Math.round(maxMsPerFile / 1000)}s/file × 1.5 safety` };
+    }
+  } catch { /* use default */ }
+
+  return {
+    retentionDays: RETENTION_DAYS,
+    approxTableBytes,
+    tableSizeWarning: approxTableBytes > TABLE_SIZE_WARNING_BYTES,
+    currentTimeout,
+    byKb,
+    bySourceType
+  };
 });
 
 app.post("/rag/knowledge-bases/:id/sync-cancel", async (request, reply) => {
@@ -4980,14 +5169,14 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
           filesProcessed: body.filesProcessed ?? undefined,
           filesTotal: body.filesTotal ?? undefined,
           chunksProcessed: body.chunksProcessed ?? undefined,
-          errorMessage: "Monitoring Dify indexing...",
+          errorMessage: "Monitoring AI indexing...",
           completedAt: null
         }
       });
       await updateSyncJobStep(body.syncJobId, {
         ...body.step,
         status: "running",
-        message: "Monitoring Dify indexing...",
+        message: "Monitoring AI indexing...",
         failedDocuments
       });
       void autoRetryFailedDifyIndexingForJob({
@@ -5001,7 +5190,7 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
           data: {
             status: "failed",
             completedAt: new Date(),
-            errorMessage: `Dify retry failed: ${msg}`
+            errorMessage: `AI indexing retry failed:${msg}`
           }
         }).catch(() => undefined);
         await updateSyncJobStep(body.syncJobId!, {
@@ -5009,7 +5198,7 @@ app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {
           stepName: "dify_indexing",
           status: "failed",
           completedAt: new Date().toISOString(),
-          errorMessage: `Dify retry failed: ${msg}`,
+          errorMessage: `AI indexing retry failed:${msg}`,
           failedDocuments
         }).catch(() => undefined);
       });
@@ -7223,19 +7412,28 @@ app.post("/rag/knowledge-bases/:id/apply-template", async (request, reply) => {
   return { applied: true, kbId: id, templateId, templateName: template.name, difyPromptUpdated, ...(difyPromptError ? { difyPromptError } : {}) };
 });
 
-// Auto-fail stale sync jobs that have received no progress callback for 15 minutes.
-// Uses lastProgressAt (set on every n8n callback) falling back to createdAt for jobs
-// that never sent a single callback (e.g. n8n crashed at startup).
+// Auto-fail stale sync jobs that have received no progress callback.
+// Uses a two-tier threshold:
+//   - Pre-dify steps (Fetch, Diff, Upload): 15 minutes — these are fast; no progress = truly stuck
+//   - Dify indexing phase: 60 minutes — large repos can legitimately take 30-60 min to index
+// Detection: if stepsJson contains a dify_indexing step the job has entered the Dify phase.
 async function sweepStaleJobs(): Promise<void> {
-  const staleThresholdMs = 15 * 60 * 1000; // 15 minutes
-  const staleThresholdDate = new Date(Date.now() - staleThresholdMs);
+  const shortThresholdMs = 15 * 60 * 1000; // 15 min — pre-dify steps
+  const longThresholdMs  = 60 * 60 * 1000; // 60 min — dify indexing phase
+  const now = Date.now();
   try {
     const activeJobs = await (prisma as any).ragKbSyncJob.findMany({
       where: { status: { in: ["running", "pending"] } },
-      select: { id: true, lastProgressAt: true, createdAt: true }
+      select: { id: true, lastProgressAt: true, createdAt: true, stepsJson: true }
     });
     const staleIds = activeJobs
-      .filter((j: any) => (j.lastProgressAt ?? j.createdAt) <= staleThresholdDate)
+      .filter((j: any) => {
+        const lastActivity = (j.lastProgressAt ?? j.createdAt) as Date;
+        const steps = Array.isArray(j.stepsJson) ? (j.stepsJson as Record<string, unknown>[]) : [];
+        const inDifyPhase = steps.some((s) => String(s.stepName ?? "") === "dify_indexing");
+        const threshold = inDifyPhase ? longThresholdMs : shortThresholdMs;
+        return (now - lastActivity.getTime()) >= threshold;
+      })
       .map((j: any) => j.id);
     if (staleIds.length > 0) {
       await (prisma as any).ragKbSyncJob.updateMany({

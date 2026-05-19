@@ -750,6 +750,8 @@ services:
       NODE_EXTRA_CA_CERTS: /tls/ca.pem
       # Needed by Code nodes that build native multipart uploads for Dify files.
       NODE_FUNCTION_ALLOW_BUILTIN: buffer,http,https,url
+      # Allow Code nodes to run long polling loops (default 300s is too short for large repos).
+      N8N_RUNNERS_TASK_TIMEOUT: "3600"
     entrypoint: ["tini", "--", "/bin/sh", "/n8n-init.sh"]
     ports:
       - "5679:5678"   # Admin UI on host:5679 for initial setup and template import

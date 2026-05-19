@@ -48,3 +48,40 @@ export function isActiveSyncStatus(status: string): boolean {
   const s = status.toLowerCase();
   return s === "running" || s === "pending";
 }
+
+export type SyncAnalyticsKbRow = {
+  kbName: string;
+  sourceType: string;
+  totalRuns: number;
+  completedRuns: number;
+  failedRuns: number;
+  successRate: number | null;
+  avgDurationMs: number | null;
+  minDurationMs: number | null;
+  maxDurationMs: number | null;
+  avgMsPerFile: number | null;
+  avgFilesPerMin: number | null;
+};
+
+export type SyncAnalyticsSourceRow = {
+  sourceType: string;
+  totalRuns: number;
+  completedRuns: number;
+  successRate: number | null;
+  avgDurationMs: number | null;
+  avgMsPerFile: number | null;
+  avgFilesPerMin: number | null;
+};
+
+export type SyncAnalyticsResponse = {
+  retentionDays: number;
+  approxTableBytes: number;
+  tableSizeWarning: boolean;
+  currentTimeout: { maxAttempts: number; dataPoints: number; note: string };
+  byKb: SyncAnalyticsKbRow[];
+  bySourceType: SyncAnalyticsSourceRow[];
+};
+
+export async function fetchSyncAnalytics(): Promise<SyncAnalyticsResponse> {
+  return requestJson<SyncAnalyticsResponse>("/rag/sync-analytics", "GET");
+}

@@ -44,6 +44,7 @@ export function NavigationSidebar(): ReactElement {
   if (roles.includes("admin")) {
     // Platform admin exclusive items
     navItems.push({ href: "/rag-stats", label: "Analytics", icon: "AN", section: "Admin" });
+    navItems.push({ href: "/sync-analytics", label: "Sync Analytics", icon: "SA", section: "Admin" });
     navItems.push({ href: "/logs", label: "Logs", icon: "LG", section: "Admin" });
     navItems.push({ href: "/users", label: "Users", icon: "US", section: "Admin" });
     navItems.push({ href: "/secrets", label: "Secrets", icon: "KY", section: "Admin" });

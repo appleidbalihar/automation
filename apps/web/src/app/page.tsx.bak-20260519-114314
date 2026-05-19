@@ -26,12 +26,12 @@ export default function LandingPage(): ReactElement {
       {/* ── Hero ────────────────────────────────────────────────────────── */}
       <section className="rr-hero">
         <div className="rr-hero-inner">
-          <p className="rr-eyebrow"><span className="rr-eyebrow-dot">●</span> RAG-AS-A-SERVICE · WEBSITE WIDGET COMING SOON · MCP COMING SOON</p>
+          <p className="rr-eyebrow"><span className="rr-eyebrow-dot">●</span> RAG-AS-A-SERVICE · CLOUD OR ON-PREM · GO LIVE IN MINUTES</p>
           <h1 className="rr-headline">
-            AI bot on your website.<br /><span className="rr-headline-accent">Chat channels for the rest of your team.</span>
+            RAG-as-a-Service,<br /><span className="rr-headline-accent">ready out of the box.</span>
           </h1>
           <p className="rr-subheadline">
-            Think of it as an AI assistant that actually knows your company&apos;s stuff. Connect docs, repos, websites, and drives, then deliver answers in Slack, Telegram, and WhatsApp today. Soon, put the same governed knowledge at your digital doorstep with an embeddable website widget, and expose it to approved agent workflows through MCP.
+            Think of it as an AI assistant that actually knows your company&apos;s stuff. You plug in your docs, repos, websites, whatever — and anyone on your team can just ask questions in plain language and get real answers pulled straight from your own content. No more digging through folders or pinging the one guy who knows everything.
           </p>
           <div className="rr-hero-ctas">
             <Link href="/dashboard" className="rr-btn-primary">
@@ -42,10 +42,6 @@ export default function LandingPage(): ReactElement {
             </a>
           </div>
           <div className="rr-hero-badges">
-            <span className="rr-badge rr-badge-soon">Website widget coming soon</span>
-            <span className="rr-badge rr-badge-soon">MCP coming soon</span>
-            <span className="rr-badge">Chat channels</span>
-            <span className="rr-badge">Lead capture mode</span>
             <span className="rr-badge">GitHub &amp; GitLab</span>
             <span className="rr-badge">Google Drive</span>
             <span className="rr-badge">Confluence &amp; Notion</span>
@@ -139,7 +135,7 @@ export default function LandingPage(): ReactElement {
               { icon:'🗄️', title:'Hosted vector store',        desc:'Production-grade vector DB included — no Pinecone or Weaviate bills.' },
               { icon:'🤖', title:'LLM orchestration',          desc:'Retrieval, context assembly, and prompt management handled for you.' },
               { icon:'🎯', title:'Smart AI system prompts',     desc:'Give your agent its own rules — define tone, scope, and response style per knowledge base. Your team\'s AI, your way.' },
-              { icon:'📡', title:'Chat channel + website delivery',       desc:'Bot tokens for Slack, Telegram, and WhatsApp today — with website widget and MCP access coming soon for governed visitor and agent workflows.' },
+              { icon:'📡', title:'Chat channel delivery',       desc:'Bot tokens for Slack, Telegram, WhatsApp — live in minutes, no code required.' },
               { icon:'📊', title:'Usage & audit dashboard',     desc:'Every query, answer, and source citation logged with role-based access control.' },
               { icon:'🏠', title:'On-prem deployment',          desc:'Deploy entirely within your own infrastructure — full data sovereignty, no cloud dependency required.' },
             ].map((item) => (
@@ -151,61 +147,6 @@ export default function LandingPage(): ReactElement {
                 </div>
               </div>
             ))}
-          </div>
-        </div>
-      </section>
-
-      {/* ── Coming Soon ─────────────────────────────────────────────────── */}
-      <section className="rr-section rr-coming-soon-section">
-        <div className="rr-container rr-coming-soon-layout">
-          <div>
-            <p className="rr-section-eyebrow">Coming soon</p>
-            <h2 className="rr-section-title">AI bot at your digital doorstep. MCP for agent workflows.</h2>
-            <p className="rr-section-lead">
-              The Website Chat Widget will let customers embed RapidRAG directly on their site while keeping RAG calls, knowledge-base access, and secrets server-side. MCP support is planned as the controlled bridge for approved AI agents to query RapidRAG knowledge without loose document exports.
-            </p>
-            <div className="rr-coming-soon-grid">
-              <div className="rr-feature-card">
-                <span className="rr-feature-kicker">Website Chat Widget</span>
-                <h3>Embed the AI bot where visitors arrive</h3>
-                <p>Generate a versioned script, verify the domain, bind approved knowledge bases, and answer customer questions from your own content.</p>
-              </div>
-              <div className="rr-feature-card">
-                <span className="rr-feature-kicker">Two modes</span>
-                <h3>Lead capture or quick start</h3>
-                <p>Use lead capture with name, email, consent, and Turnstile, or quick-start mode when visitors should ask immediately.</p>
-              </div>
-              <div className="rr-feature-card">
-                <span className="rr-feature-kicker">MCP access</span>
-                <h3>Governed tools for AI agents</h3>
-                <p>Planned MCP support will let approved agents query RapidRAG knowledge through controlled tools, policies, and audit logs.</p>
-              </div>
-            </div>
-          </div>
-          <div className="rr-widget-preview" aria-label="Website chat widget preview">
-            <div className="rr-widget-browser">
-              <div className="rr-widget-browser-bar">
-                <span></span><span></span><span></span>
-              </div>
-              <div className="rr-widget-page-lines">
-                <span></span>
-                <span></span>
-                <span></span>
-              </div>
-              <div className="rr-widget-card">
-                <div className="rr-widget-card-header">
-                  <span className="rr-widget-avatar">R</span>
-                  <div>
-                    <strong>RapidRAG Assistant</strong>
-                    <small>Website widget coming soon</small>
-                  </div>
-                </div>
-                <div className="rr-widget-message rr-widget-message-bot">Ask me about products, docs, policies, or onboarding.</div>
-                <div className="rr-widget-message rr-widget-message-user">What is your refund policy?</div>
-                <div className="rr-widget-message rr-widget-message-bot">I found the answer in your support KB. Here are the key terms and source links.</div>
-                <div className="rr-widget-footer">Powered by RapidRAG</div>
-              </div>
-            </div>
           </div>
         </div>
       </section>
@@ -230,11 +171,11 @@ export default function LandingPage(): ReactElement {
             <div className="rr-step-divider">→</div>
             <div className="rr-step">
               <div className="rr-step-num">3</div>
-              <h3>Deploy your AI bot</h3>
-              <p>Launch in Slack, Telegram, or WhatsApp today. Website widget and MCP support are coming soon, so the same governed knowledge can answer visitors and approved agent workflows.</p>
+              <h3>Deploy chatbots</h3>
+              <p>Generate a bot token for Slack, Telegram, or WhatsApp. Paste it into your channel — your bot is live. Users ask questions, RapidRAG retrieves relevant chunks, generates answers, and cites sources.</p>
             </div>
           </div>
-          <p className="rr-steps-callout">Total setup time: under 5 minutes for a simple source + chat channel.</p>
+          <p className="rr-steps-callout">Total setup time: under 5 minutes for a simple source + bot.</p>
         </div>
       </section>
 
@@ -276,7 +217,7 @@ export default function LandingPage(): ReactElement {
               <h3>For Companies</h3>
               <ul>
                 <li>One service unifies knowledge across GitHub, Drive, and Confluence.</li>
-                <li>Deploy to existing chat tools — Slack, Telegram, and WhatsApp are where work happens.</li>
+                <li>Deploy to existing chat tools — Slack &amp; Teams are where work happens.</li>
                 <li>Scale without hiring — one platform serves hundreds with no extra engineering.</li>
               </ul>
             </div>
@@ -307,16 +248,8 @@ export default function LandingPage(): ReactElement {
                   <td>Agents ask &ldquo;What&apos;s the refund policy for EU customers?&rdquo; → answer in seconds from the knowledge base.</td>
                 </tr>
                 <tr>
-                  <td><strong>Website Visitors</strong></td>
-                  <td>Coming soon: visitors ask product, shipping, warranty, or onboarding questions directly on your website widget.</td>
-                </tr>
-                <tr>
                   <td><strong>Legal</strong></td>
                   <td>&ldquo;Show NDAs from Q1 with a non-compete clause&rdquo; → retrieved from Google Drive folder.</td>
-                </tr>
-                <tr>
-                  <td><strong>AI Agents</strong></td>
-                  <td>Coming soon: approved MCP clients query governed RapidRAG knowledge through controlled tools instead of exported document dumps.</td>
                 </tr>
                 <tr>
                   <td><strong>HR Onboarding</strong></td>
@@ -367,11 +300,6 @@ export default function LandingPage(): ReactElement {
                   <td className="rr-td-good">Full RAG with source citations</td>
                 </tr>
                 <tr>
-                  <td>Generic website chat plugins</td>
-                  <td>No governed RAG over your synced company knowledge</td>
-                  <td className="rr-td-good">Website AI bot backed by RapidRAG KBs, coming soon</td>
-                </tr>
-                <tr>
                   <td>Traditional search (Algolia, Elastic)</td>
                   <td>Returns links, not answers</td>
                   <td className="rr-td-good">Answers directly in chat</td>
@@ -403,9 +331,6 @@ export default function LandingPage(): ReactElement {
             <div className="rr-security-item">📋 Audit logs for every query and answer</div>
             <div className="rr-security-item">🏠 On-prem deployment — run entirely within your own infrastructure for full data sovereignty</div>
             <div className="rr-security-item">🔑 HashiCorp Vault for secrets management</div>
-            <div className="rr-security-item">🌐 Verified domains for website widgets, coming soon</div>
-            <div className="rr-security-item">🔐 No browser-exposed RAG keys or AI service credentials</div>
-            <div className="rr-security-item">🧩 Controlled MCP access for approved agents, coming soon</div>
             <div className="rr-security-item">🛡️ SOC 2 Type II (in progress)</div>
             <div className="rr-security-item">🔁 99.9% uptime SLA — production-grade managed service</div>
           </div>
@@ -415,8 +340,8 @@ export default function LandingPage(): ReactElement {
       {/* ── CTA ──────────────────────────────────────────────────────────── */}
       <section className="rr-section rr-section-dark rr-cta-section">
         <div className="rr-container rr-cta-inner">
-          <h2 className="rr-title-light">Start with managed RAG today. Website widget and MCP are next.</h2>
-          <p className="rr-cta-sub">No infrastructure. No maintenance. Connect your first source now, then deploy across chat channels.</p>
+          <h2 className="rr-title-light">Start using RAG as a Service today.</h2>
+          <p className="rr-cta-sub">No infrastructure. No maintenance. Connect your first source in under 3 minutes.</p>
           <Link href="/dashboard" className="rr-btn-primary rr-btn-large">
             🚀 Get started free
           </Link>

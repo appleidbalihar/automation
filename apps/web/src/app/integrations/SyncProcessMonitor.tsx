@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchSyncHistory, fetchSyncStatus, isActiveSyncStatus } from "./api";
 import { StepLogDrawer } from "./StepLogDrawer";
 import type { Integration, SyncJob } from "./types";
-import { formatDate, isFailedDifyIndexingStep, normalizeSyncSteps, stepBadgeVariant, stepStatusEmoji } from "./types";
+import { formatDate, isFailedDifyIndexingStep, isSyncTimedOut, normalizeSyncSteps, stepBadgeVariant, stepStatusEmoji } from "./types";
 
 type Props = {
   integrations: Integration[];
@@ -136,7 +136,7 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
       <div className="integrations-panel-header ops-sync-monitor-header">
         <div>
           <h2>Sync Process Monitor</h2>
-          <p>Live steps from n8n, log drill-down, and sync history. Syncs continue running even if you navigate away.</p>
+          <p>Live steps, log drill-down, and sync history. Syncs continue running even if you navigate away.</p>
         </div>
         <div className="ops-sync-monitor-controls">
           <label className="ops-sync-monitor-select">
@@ -191,7 +191,19 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
       </div>
 
       {effectiveJob?.errorMessage && !isActiveSyncStatus(effectiveJob.status) ? (
-        <p className="integrations-status-error ops-sync-job-error">{effectiveJob.errorMessage}</p>
+        <div className="integrations-status-error ops-sync-job-error">
+          <span>{effectiveJob.errorMessage}</span>
+          {isSyncTimedOut(effectiveJob) && kbId ? (
+            <button
+              type="button"
+              className="ops-action-btn ops-action-retry ops-inline-retry-btn"
+              onClick={() => void onRetryFailedIndexing(kbId, { syncJobId: effectiveJob.id })}
+              disabled={busy === `retry-indexing:${kbId}`}
+            >
+              {busy === `retry-indexing:${kbId}` ? "…" : "↺ Retry indexing"}
+            </button>
+          ) : null}
+        </div>
       ) : null}
 
       <div className="integrations-table-wrap ops-sync-step-wrap">
@@ -209,14 +221,17 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
             {effectiveJob && steps.length === 0 ? (
               <tr>
                 <td colSpan={5} className="ops-sync-step-empty">
-                  No step entries yet. When n8n reports steps to <code>stepsJson</code>, they appear here.
+                  No step entries yet. Steps will appear here as the sync progresses.
                 </td>
               </tr>
             ) : null}
             {steps.map((step) => {
               const variant = stepBadgeVariant(step.status);
               const isErr = variant === "failed";
-              const canRetryIndexing = isErr && isFailedDifyIndexingStep(step) && effectiveJob?.status === "failed" && Boolean(kbId);
+              const isTimedOutDify = isSyncTimedOut(effectiveJob) &&
+                (step.logStepName === "dify_indexing" || step.logStepName === "retry_failed_indexing");
+              const canRetryIndexing = effectiveJob?.status === "failed" && Boolean(kbId) &&
+                ((isErr && isFailedDifyIndexingStep(step)) || isTimedOutDify);
 
               // Detect smart-sync / cleanup operation type for visual differentiation
               const isCleanupStep = step.logStepName.startsWith("cleanup_") || step.task.startsWith("Cleanup:");
@@ -281,7 +296,6 @@ export function SyncProcessMonitor(props: Props): ReactElement | null {
                             <div key={`${doc.difyDocId ?? doc.batchId ?? doc.filePath ?? "doc"}-${index}`} className="ops-failed-doc">
                               <strong>{doc.filePath ?? doc.difyDocId ?? "Unknown document"}</strong>
                               {doc.error ? <span>AI Agent error: {doc.error}</span> : null}
-                              {doc.difyDocId ? <small>Document ID: {doc.difyDocId}</small> : null}
                               {canRetryIndexing && doc.difyDocId ? (
                                 <button
                                   type="button"

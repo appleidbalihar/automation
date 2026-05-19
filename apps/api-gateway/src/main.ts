@@ -1272,6 +1272,14 @@ app.get("/rag/knowledge-bases/:id/sync-history", { preHandler: requireAnyRole(["
   await proxy(request, reply, "GET", config.workflowServiceUrl, `/rag/knowledge-bases/${id}/sync-history`);
 });
 
+app.get("/rag/sync-analytics", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/sync-analytics");
+});
+
+app.get("/rag/sync-timeout", { preHandler: requireAnyRole(["admin", "useradmin", "operator"]) }, async (request, reply) => {
+  await proxy(request, reply, "GET", config.workflowServiceUrl, "/rag/sync-timeout");
+});
+
 // sync-progress is called by n8n internally. n8n uses a shared callback token
 // because it is not an interactive Keycloak user.
 app.post("/rag/knowledge-bases/:id/sync-progress", async (request, reply) => {

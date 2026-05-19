@@ -3,7 +3,7 @@
 import type { ReactElement } from "react";
 import { useMemo } from "react";
 import type { Integration } from "./types";
-import { formatDate, hasFailedDifyIndexing, syncDisabledReason } from "./types";
+import { canRetryAfterFailure, formatDate, hasFailedDifyIndexing, syncDisabledReason } from "./types";
 
 type Props = {
   integrations: Integration[];
@@ -90,6 +90,7 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                 const syncStatus = latestJob?.status ?? "never_synced";
                 const isActiveSync = syncStatus === "running" || syncStatus === "pending";
                 const failedIndexing = hasFailedDifyIndexing(latestJob);
+                const canRetry = canRetryAfterFailure(latestJob);
 
                 return (
                   <tr key={integration.id} className={integration.isDefault ? "integrations-row-default" : ""}>
@@ -163,7 +164,7 @@ export function KnowledgeSourcesTable(props: Props): ReactElement {
                           </button>
                         ) : (
                           <>
-                            {failedIndexing ? (
+                            {canRetry ? (
                               <button
                                 type="button"
                                 className="ops-action-btn ops-action-retry"
