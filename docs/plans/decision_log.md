@@ -26,3 +26,7 @@
 - Replace Flowise entirely with Dify and n8n orchestration. Dify manages KBs and LLM chats, while n8n manages workflow execution and webhook syncing.
 - Embed Vault Agent sidecars into Dify and n8n stack for secure secrets management instead of environment variables.
 - Update Operations AI Frontend to natively integrate with Dify knowledgebases, displaying sync progression and custom configurations.
+
+## 2026-05-19
+- Skip the OAuth vs PAT choice screen in Create Knowledge Source modal — users go directly to the provider picker. PAT remains accessible as a small link at the bottom of the grid. This reduces unnecessary friction for the common OAuth path.
+- AI Indexing progress bar (`ops-dify-mini-bar`) height increased to 14 px with gradient green fill and border so progress is clearly readable at a glance.

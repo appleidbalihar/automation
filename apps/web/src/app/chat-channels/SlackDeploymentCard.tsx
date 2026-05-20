@@ -5,17 +5,23 @@ import type { SlackDeployment } from "./types";
 
 interface Props {
   deployment: SlackDeployment;
+  isOwner?: boolean;
+  onView: (deployment: SlackDeployment) => void;
   onEdit: (deployment: SlackDeployment) => void;
+  onMembers: (deployment: SlackDeployment) => void;
   onDeactivate: (deployment: SlackDeployment) => void;
   onDelete: (deployment: SlackDeployment) => void;
 }
 
-export function SlackDeploymentCard({ deployment, onEdit, onDeactivate, onDelete }: Props): ReactElement {
+export function SlackDeploymentCard({ deployment, isOwner = true, onView, onEdit, onMembers, onDeactivate, onDelete }: Props): ReactElement {
   const isActive = deployment.status === "active";
   const isPending = deployment.status === "pending";
 
   const statusTone = isActive ? "active" : isPending ? "pending" : deployment.status === "error" ? "error" : "disabled";
   const statusLabel = isActive ? "● Active" : isPending ? "◐ Pending" : deployment.status === "error" ? "✕ Error" : "○ Disabled";
+
+  const accessModeLabel = deployment.requireUserVerification ? "Verified 🔒" : "Open 🌐";
+  const shareLabel = deployment.shareScope === "all" ? "Shared with all" : deployment.shareScope === "specific" ? "Shared" : "Private";
 
   return (
     <tr className="cc-bot-row">
@@ -45,18 +51,24 @@ export function SlackDeploymentCard({ deployment, onEdit, onDeactivate, onDelete
         {deployment.installMode === "oauth" ? "OAuth install" : "Manual app"}
       </td>
 
+      {/* Access Mode */}
+      <td className="cc-td-access">
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          <span className="tpl-badge tpl-badge-category">{accessModeLabel}</span>
+          <span className="tpl-badge tpl-badge-shared" style={{ fontSize: 11 }}>{shareLabel}</span>
+        </div>
+      </td>
+
       {/* Knowledge */}
       <td className="cc-td-knowledge">
         <div className="cc-bot-cell-kb">
-          <span className="cc-bot-access-primary">
-            {deployment.accessMode === "allowlist"
-              ? `Allowlist (${deployment.allowedSlackUserIds?.length ?? 0} users)`
-              : "All users in workspace"}
-          </span>
           {deployment.kbMappings.length > 0 && (
             <span className="cc-bot-kb-names">
               {deployment.kbMappings.map((kb) => kb.knowledgeBaseName).join(", ")}
             </span>
+          )}
+          {deployment.kbMappings.length === 0 && (
+            <span className="cc-bot-cell-muted">No KBs mapped</span>
           )}
         </div>
       </td>
@@ -67,11 +79,29 @@ export function SlackDeploymentCard({ deployment, onEdit, onDeactivate, onDelete
           <button
             type="button"
             className="cc-bot-action cc-bot-action-ghost"
-            onClick={() => onEdit(deployment)}
+            onClick={() => onView(deployment)}
           >
-            Edit
+            View
           </button>
-          {isActive ? (
+          {isOwner && (
+            <button
+              type="button"
+              className="cc-bot-action cc-bot-action-ghost"
+              onClick={() => onEdit(deployment)}
+            >
+              Edit
+            </button>
+          )}
+          {isOwner && deployment.requireUserVerification && isActive && (
+            <button
+              type="button"
+              className="cc-bot-action cc-bot-action-ghost"
+              onClick={() => onMembers(deployment)}
+            >
+              Members
+            </button>
+          )}
+          {isOwner && (isActive ? (
             <button
               type="button"
               className="cc-bot-action cc-bot-action-warn"
@@ -83,18 +113,20 @@ export function SlackDeploymentCard({ deployment, onEdit, onDeactivate, onDelete
             <button
               type="button"
               className="cc-bot-action cc-bot-action-primary"
-              onClick={() => onDeactivate(deployment)}
+              onClick={() => onEdit(deployment)}
             >
               Activate
             </button>
+          ))}
+          {isOwner && (
+            <button
+              type="button"
+              className="cc-bot-action cc-bot-action-delete"
+              onClick={() => onDelete(deployment)}
+            >
+              Delete
+            </button>
           )}
-          <button
-            type="button"
-            className="cc-bot-action cc-bot-action-delete"
-            onClick={() => onDelete(deployment)}
-          >
-            Delete
-          </button>
         </div>
       </td>
     </tr>

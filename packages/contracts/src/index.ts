@@ -91,10 +91,24 @@ export interface ChannelChatMessageRecord {
 export type SlackDeploymentStatus = "pending" | "active" | "error" | "disabled";
 export type SlackAccessMode = "channel" | "allowlist";
 export type SlackInstallMode = "oauth" | "manual";
+export type SlackShareScope = "private" | "all" | "specific";
+export type SlackMemberStatus = "connected" | "pending" | "disconnected";
 
 export interface SlackDeploymentKbSummary {
   knowledgeBaseId: string;
   knowledgeBaseName: string;
+}
+
+export interface SlackUserKbMapping {
+  id: string;
+  deploymentId: string;
+  rapidragUserId?: string;
+  rapidragUsername?: string;
+  slackUserId: string;
+  kbIds: string[];
+  status: SlackMemberStatus;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface SlackDeployment {
@@ -109,6 +123,10 @@ export interface SlackDeployment {
   status: SlackDeploymentStatus;
   accessMode: SlackAccessMode;
   allowedSlackUserIds: string[];
+  shareScope: SlackShareScope;
+  sharedWithUserIds: string[];
+  requireUserVerification: boolean;
+  defaultKbIds: string[];
   kbMappings: SlackDeploymentKbSummary[];
   webhookUrl?: string;
   errorMessage?: string;
@@ -119,11 +137,17 @@ export interface SlackDeployment {
 export interface SlackDeploymentActivateRequest {
   botToken?: string;
   signingSecret?: string;
+  clientId?: string;
+  clientSecret?: string;
   slackChannelId?: string;
   slackChannelName?: string;
   knowledgeBaseIds: string[];
   accessMode: SlackAccessMode;
   allowedSlackUserIds?: string[];
+  shareScope?: SlackShareScope;
+  sharedWithUserIds?: string[];
+  requireUserVerification?: boolean;
+  defaultKbIds?: string[];
 }
 
 export interface SlackOAuthConnectResponse {

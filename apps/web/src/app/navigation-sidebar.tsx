@@ -8,12 +8,6 @@ import { clearStoredToken, fetchIdentity } from "./auth-client";
 
 type NavItem = { href: string; label: string; icon: string; section: "Workspace" | "Account" | "Admin" };
 
-const baseNavItems: NavItem[] = [
-  { href: "/dashboard", label: "Overview", icon: "OV", section: "Workspace" },
-  { href: "/knowledge-connector", label: "Knowledge", icon: "KB", section: "Workspace" },
-  { href: "/rag-assistant", label: "RAG Assistant", icon: "AI", section: "Workspace" }
-];
-
 export function NavigationSidebar(): ReactElement {
   const pathname = usePathname();
   const [roles, setRoles] = useState<string[]>([]);
@@ -36,11 +30,22 @@ export function NavigationSidebar(): ReactElement {
     setNavOpen(false);
   }, [pathname]);
 
-  const navItems: NavItem[] = [...baseNavItems, { href: "/profile", label: "Profile", icon: "ME", section: "Account" }];
+  const workspaceItems: NavItem[] = [
+    { href: "/dashboard", label: "Overview", icon: "OV", section: "Workspace" },
+  ];
   if (roles.includes("admin") || roles.includes("useradmin")) {
-    navItems.push({ href: "/ai-agent-prompt", label: "AI Prompts", icon: "PR", section: "Workspace" });
-    navItems.push({ href: "/chat-channels", label: "Chat Channels", icon: "CH", section: "Workspace" });
+    workspaceItems.push({ href: "/ai-agent-prompt", label: "AI Agent", icon: "AG", section: "Workspace" });
   }
+  workspaceItems.push({ href: "/knowledge-connector", label: "Knowledge", icon: "KB", section: "Workspace" });
+  workspaceItems.push({ href: "/rag-assistant", label: "RAG Assistant", icon: "AI", section: "Workspace" });
+  if (roles.includes("admin") || roles.includes("useradmin")) {
+    workspaceItems.push({ href: "/chat-channels", label: "Chat Channels", icon: "CH", section: "Workspace" });
+  }
+
+  const navItems: NavItem[] = [
+    ...workspaceItems,
+    { href: "/profile", label: "Profile", icon: "ME", section: "Account" },
+  ];
   if (roles.includes("admin")) {
     // Platform admin exclusive items
     navItems.push({ href: "/rag-stats", label: "Analytics", icon: "AN", section: "Admin" });

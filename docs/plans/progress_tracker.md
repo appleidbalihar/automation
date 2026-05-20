@@ -13,8 +13,11 @@
 | 2026-04-18 | Dify & n8n complete migration | Completed | Full Dify stack, n8n orchestration, Vault PKI sidecars, and Frontend Chat interface added. |
 | 2026-05-07 | AI Agent prompt templates | Completed | Prompt template Prisma models, workflow-service CRUD/generate/apply routes, API gateway routes, and `/ai-agent-prompt` UI added. |
 
+| 2026-05-12 | Knowledge source OAuth/sync flow | Completed | n8n source-to-dify sync workflow, GitLab OAuth connector, SyncProcessMonitor with live step tracking and log drill-down, retry-failed-indexing, and sync history selector. |
+| 2026-05-19 | UI polish: progress bar + create-source flow | Completed | AI Indexing progress bar made clearly visible (14 px, gradient fill, green border). Create Knowledge Source modal now opens directly on the provider picker — removed the redundant OAuth/PAT choice step. PAT still accessible via a link from the provider grid. |
+
 ## Active blockers
 - None.
 
 ## Recovery note
-- Resume with: `pnpm build` and `docker compose up -d --build` for the surviving platform services.
+- Resume with: `scripts/build-images.sh dev --only web` then `scripts/platform-containers.sh dev restart web`.

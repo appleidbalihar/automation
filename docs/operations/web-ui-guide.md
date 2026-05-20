@@ -12,20 +12,35 @@ Unauthenticated users see the RapidRAG sign-in/register flow. Authenticated user
 
 ## Navigation Sidebar
 
-The sidebar currently shows:
+The sidebar shows items in this order:
+
+**Workspace section:**
 
 | Link | Route | Visibility |
 |------|-------|------------|
-| Dashboard | `/dashboard` | all authenticated users |
-| Knowledge Connector | `/knowledge-connector` | all authenticated users |
+| Overview | `/dashboard` | all authenticated users |
+| AI Agent | `/ai-agent-prompt` | `admin`, `useradmin` |
+| Knowledge | `/knowledge-connector` | all authenticated users |
 | RAG Assistant | `/rag-assistant` | all authenticated users |
+| Chat Channels | `/chat-channels` | `admin`, `useradmin` |
+
+**Account section:**
+
+| Link | Route | Visibility |
+|------|-------|------------|
 | Profile | `/profile` | all authenticated users |
-| AI Agent Prompt | `/ai-agent-prompt` | `admin`, `useradmin` |
-| RAG Stats | `/rag-stats` | `admin` only |
+
+**Admin section:**
+
+| Link | Route | Visibility |
+|------|-------|------------|
+| Analytics | `/rag-stats` | `admin` only |
+| Sync Analytics | `/sync-analytics` | `admin` only |
 | Logs | `/logs` | `admin` only |
 | Users | `/users` | `admin` only in sidebar; API supports useradmin-specific operations |
 | Secrets | `/secrets` | `admin` only |
-| Security Health | `/security` | `admin` only |
+| Security | `/security` | `admin` only |
+| Dify Config | `/dify-config` | `admin` only |
 
 The sidebar is a mobile-friendly drawer controlled by the menu button. It closes after route changes.
 
@@ -60,10 +75,10 @@ Supported source types:
 
 1. Open Knowledge Connector.
 2. Click the create/connect action.
-3. Choose OAuth or PAT.
-4. Enter name, optional project name/description, source URL, branch, and one or more document paths.
-5. For OAuth, follow the provider app setup instructions and connect.
-6. For PAT, paste the relevant token and create.
+3. The modal opens directly on the **provider picker** — select GitHub, GitLab, Google Drive, or Web URL.
+4. For OAuth providers: follow the provider app setup instructions (Client ID + Secret), fill in the source details, and click **Create & Connect**.
+5. For PAT/token auth: click **Use Personal Access Token (PAT) instead** at the bottom of the picker, select source type, paste the token, and create.
+6. Web URL sources require no authentication — selecting Web URL goes directly to the PAT form with no token field shown.
 
 The UI sends `sourcePaths` as an array. `sourcePath` is sent only for backward compatibility.
 
@@ -230,11 +245,15 @@ It shows:
 - KB selector
 - recent job history
 - trigger type (`manual`, `cleanup`, `retry_failed_indexing`, etc.)
-- file counters
+- file counters with a top-level progress bar (files processed / total)
 - step table
 - error details
 - failed Dify document retry controls
 - step log drawer
+
+### AI Indexing Progress Bar
+
+For the `dify_indexing` and `retry_failed_indexing` steps, an inline progress bar appears inside the step row. It is 14 px tall with a green gradient fill and a light-green background, making it clearly readable at a glance. The bar shows `completed / total` documents as a percentage. When Dify stats have not yet arrived the bar shows an indeterminate pulsing animation.
 
 Common step names include:
 
@@ -264,6 +283,84 @@ Capabilities:
 - link back to Knowledge Connector when no KB is ready
 
 Legacy chat routes redirect here.
+
+## Chat Channels
+
+Route: `/chat-channels`
+
+Visibility: `admin`, `useradmin`.
+
+Purpose: create and manage Slack bots, and link your personal Slack identity to accessible bots.
+
+### Page Layout — Two Sections
+
+**Section 1 — My Bots**
+
+Bots you own. Full management: Create, Edit, Members, Deactivate, Delete.
+
+| Column | Description |
+|--------|-------------|
+| Bot | Deployment name and workspace |
+| Status | Active / Pending / Error / Disabled |
+| Install | Manual app |
+| Access Mode | Verified 🔒 or Open 🌐 |
+| Knowledge | Mapped KB names |
+| Actions | View, Edit, Members (verified + owner only), Deactivate, Delete |
+
+**Section 2 — My Slack Connections**
+
+All bots you can access — owned bots and bots shared with you. Shows your personal Slack identity link status for each.
+
+| Column | Description |
+|--------|-------------|
+| Bot | Name and workspace |
+| Access Mode | Verified 🔒 or Open 🌐 |
+| Your Slack ID | Your linked Slack user ID, or amber "Not linked" |
+| Your KBs | Count of KBs you have linked |
+| Actions | Connect (not yet linked) or Update (already linked) |
+
+### Create Bot Wizard
+
+**Bot Token, Signing Secret, Client ID, Client Secret** — all four are required. Client ID and Client Secret enable the "Add to Slack" install link and Slack identity OAuth for users.
+
+Click **Validate token** to confirm the workspace before activating.
+
+**Verification toggle**:
+- **Verified (default)**: per-user KB isolation. Each user links their Slack ID via OAuth. Unknown Slack users receive a "not connected" message.
+- **Open access**: any Slack user gets answers from the bot's default KBs — no registration.
+
+**Share scope**: Private / All RapidRAG users / Specific users.
+
+After activation, the wizard shows:
+- **Webhook URL** (copy button) — paste into Slack app Event Subscriptions and /kb slash command.
+- **OAuth Redirect URL** (copy button) — paste into Slack app OAuth & Permissions → Redirect URLs.
+
+### Edit Active Bot
+
+When editing an already-active bot, the credentials form is not shown. Only deployment settings (name, share scope, verification mode, KBs) can be updated. To change credentials, deactivate and re-activate.
+
+### Connect Wizard (My Slack Connections)
+
+Clicking **Connect** or **Update** on a bot in Section 2:
+
+1. **Phase 1 — Add to Slack**: click **Add to Slack** to install the bot app to your Slack workspace. Skip if already installed.
+2. **Phase 2 — Link your identity**: choose your KBs (own + shared), click **Connect via Slack** → redirected to Slack OAuth → Slack captures your user ID → RapidRAG registers the mapping → green success banner on return.
+
+After connecting, your Slack ID appears in the table and you can DM the bot immediately.
+
+### Members Panel
+
+Available to the deployment owner on verified-mode bots (Members button in Section 1).
+
+| Column | Notes |
+|--------|-------|
+| RapidRAG User | Username if linked |
+| Slack ID | Real Slack user ID, or amber "Not linked" for unlinked placeholder |
+| KBs | Assigned knowledge bases |
+| Status | Connected / Pending / Not linked |
+| Action | Remove |
+
+The owner's own entry starts as "Not linked" (synthetic placeholder) until they complete the Connect flow in Section 2. Manual add form: Slack user ID + optional RapidRAG username + KB selection.
 
 ## Logs
 

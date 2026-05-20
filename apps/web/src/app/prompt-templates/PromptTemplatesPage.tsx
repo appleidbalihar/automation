@@ -15,6 +15,7 @@ export function PromptTemplatesPage(): ReactElement {
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("all");
   const [editorTarget, setEditorTarget] = useState<PromptTemplate | null | undefined>(undefined);
+  const [viewTarget, setViewTarget] = useState<PromptTemplate | null>(null);
   const [currentUserId, setCurrentUserId] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
 
@@ -120,6 +121,7 @@ export function PromptTemplatesPage(): ReactElement {
               template={t}
               currentUserId={currentUserId}
               isAdmin={isAdmin}
+              onView={(tpl) => setViewTarget(tpl)}
               onEdit={(tpl) => setEditorTarget(tpl)}
               onDuplicate={handleDuplicate}
               onDelete={handleDelete}
@@ -134,6 +136,16 @@ export function PromptTemplatesPage(): ReactElement {
           isAdmin={isAdmin}
           onClose={() => setEditorTarget(undefined)}
           onSaved={handleSaved}
+        />
+      )}
+
+      {viewTarget !== null && (
+        <TemplateEditorModal
+          template={viewTarget}
+          isAdmin={false}
+          readOnly
+          onClose={() => setViewTarget(null)}
+          onSaved={() => setViewTarget(null)}
         />
       )}
     </div>

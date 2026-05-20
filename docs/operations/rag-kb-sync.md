@@ -119,7 +119,7 @@ Symptoms:
 Actions:
 
 1. Open Knowledge Connector.
-2. Reconnect OAuth or save a new PAT.
+2. Open the source edit modal and reconnect OAuth (update Client ID/Secret and re-authorise) or save a new PAT token.
 3. Confirm branch/source URL/path filters.
 4. Trigger sync again.
 

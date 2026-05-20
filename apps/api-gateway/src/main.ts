@@ -1327,9 +1327,31 @@ for (const [method, path] of [
   ["GET", "/channels/history/:deploymentId"],
   ["GET", "/channels/history/:deploymentId/thread/:threadId"],
   ["DELETE", "/channels/history/:deploymentId/thread/:threadId"],
-  ["DELETE", "/channels/history/:deploymentId"]
+  ["DELETE", "/channels/history/:deploymentId"],
+  // Multi-user member management (owner only)
+  ["GET", "/slack/deployments/:id/members"],
+  ["POST", "/slack/deployments/:id/members"],
+  ["DELETE", "/slack/deployments/:id/members/:slackUserId"]
 ] as Array<[HttpMethod, string]>) {
   app[method.toLowerCase()](path, { preHandler: requireAnyRole(["admin", "useradmin"]) }, async (request: any, reply: any) => {
+    let upstreamPath = path;
+    for (const [key, value] of Object.entries(request.params ?? {})) {
+      upstreamPath = upstreamPath.replace(`:${key}`, encodeURIComponent(String(value)));
+    }
+    await proxy(request, reply, method, config.workflowServiceUrl, upstreamPath);
+  });
+}
+
+// Shared deployments list + self-registration + identity/install OAuth — available to all authenticated roles
+for (const [method, path] of [
+  ["GET", "/slack/deployments/shared"],
+  ["GET", "/slack/deployments/member-of"],
+  ["GET", "/slack/deployments/my-connections"],
+  ["POST", "/slack/deployments/:id/members/self"],
+  ["GET", "/slack/deployments/:id/members/self/oauth"],
+  ["GET", "/slack/deployments/:id/install-url"]
+] as Array<[HttpMethod, string]>) {
+  app[method.toLowerCase()](path, { preHandler: requireAnyRole(["admin", "useradmin", "operator", "approver", "viewer"]) }, async (request: any, reply: any) => {
     let upstreamPath = path;
     for (const [key, value] of Object.entries(request.params ?? {})) {
       upstreamPath = upstreamPath.replace(`:${key}`, encodeURIComponent(String(value)));

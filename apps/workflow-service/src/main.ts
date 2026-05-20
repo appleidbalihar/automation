@@ -211,7 +211,7 @@ function slackDeploymentSecretPath(ownerId: string, deploymentId: string): strin
 }
 
 async function readSlackGlobalSecret(key: "client_id" | "client_secret" | "signing_secret"): Promise<string> {
-  const data: Record<string, unknown> = await readVaultKv("platform/global/slack/oauth").catch(() => ({}));
+  const data: Record<string, unknown> = await readVaultKv("platform/global/slack/oauth").catch(() => ({} as Record<string, unknown>));
   const envName = key === "client_id" ? "SLACK_CLIENT_ID" : key === "client_secret" ? "SLACK_CLIENT_SECRET" : "SLACK_SIGNING_SECRET";
   return String(data[key] ?? process.env[envName] ?? "").trim();
 }
@@ -1414,7 +1414,30 @@ async function ensureDifyKnowledgeBaseProvisioned(kbId: string): Promise<void> {
     appId = await createDifyApp(session, buildDifyResourceName(kb.name, kbId), kb.description);
   }
 
-  await configureDifyApp(session, appId, datasetId, kb.config ?? null, reranker);
+  try {
+    await configureDifyApp(session, appId, datasetId, kb.config ?? null, reranker);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes(":404:")) {
+      // Before recreating, confirm the app is genuinely gone — not a transient Dify outage.
+      const appExists = await difyConsoleFetch(session.baseUrl, `/apps/${appId}`, {
+        method: "GET",
+        token: session.token,
+        ok: [200, 404]
+      }).then((r) => r.response.status === 200).catch(() => true); // on network error, assume it exists
+
+      if (!appExists) {
+        logInfo("Dify app confirmed missing (404), recreating", { service: "workflow-service", kbId, staleAppId: appId });
+        appId = await createDifyApp(session, buildDifyResourceName(kb.name, kbId), kb.description);
+        await configureDifyApp(session, appId, datasetId, kb.config ?? null, reranker);
+      } else {
+        // App exists — model-config 404 was transient (Dify temporarily unreachable). Re-throw.
+        throw err;
+      }
+    } else {
+      throw err;
+    }
+  }
 
   const legacyApiKey = nonEmptyString(existingSecrets.api_key);
   const appApiKey =
@@ -2098,7 +2121,7 @@ async function checkHallucinationGuard(
   if (!enabled || retrievedChunks.length === 0) return { grounded: true, score: null }; // pass-through
 
   try {
-    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({} as Record<string, unknown>));
     const apiKey = String((llmSecrets as any).api_key ?? "").trim();
     const model = String((llmSecrets as any).model ?? "").trim();
     const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
@@ -2176,7 +2199,7 @@ async function synthesizeFromChunks(
   _kbId: string
 ): Promise<string | null> {
   try {
-    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({} as Record<string, unknown>));
     const apiKey = String((llmSecrets as any).api_key ?? "").trim();
     const model = String((llmSecrets as any).model ?? "").trim();
     const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
@@ -2216,7 +2239,7 @@ async function fetchKbDocumentNames(
 ): Promise<string[]> {
   if (!kbId) return [];
   try {
-    const secrets = await readVaultKv(`platform/global/dify/${kbId}`).catch(() => ({}));
+    const secrets = await readVaultKv(`platform/global/dify/${kbId}`).catch(() => ({} as Record<string, unknown>));
     const apiKey = String((secrets as any).dataset_api_key ?? (secrets as any).app_api_key ?? (secrets as any).api_key ?? "").trim();
     const datasetId = String((secrets as any).dataset_id ?? "").trim();
     if (!apiKey || !datasetId) return [];
@@ -2243,7 +2266,7 @@ async function generateClarifyingQuestion(
   kbName: string
 ): Promise<string | null> {
   try {
-    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({} as Record<string, unknown>));
     const apiKey = String((llmSecrets as any).api_key ?? "").trim();
     const model = String((llmSecrets as any).model ?? "").trim();
     const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
@@ -2334,7 +2357,7 @@ async function evaluateAnswerQuality(
   if (!QUALITY_EVAL_ENABLED || !question.trim() || !answer.trim()) return;
   try {
     // Read LLM credentials from Vault (same path as the prompt generator uses)
-    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+    const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({} as Record<string, unknown>));
     const apiKey = String((llmSecrets as any).api_key ?? "").trim();
     const model = String((llmSecrets as any).model ?? "").trim();
     const baseUrl = String((llmSecrets as any).base_url ?? "https://api.fuelix.ai").replace(/\/$/, "");
@@ -5331,6 +5354,10 @@ function mapSlackDeployment(row: any, request?: any) {
     status: row.status,
     accessMode: row.accessMode,
     allowedSlackUserIds: row.allowedSlackUserIds ?? [],
+    shareScope: row.shareScope ?? "private",
+    sharedWithUserIds: row.sharedWithUserIds ?? [],
+    requireUserVerification: row.requireUserVerification ?? true,
+    defaultKbIds: row.defaultKbIds ?? [],
     errorMessage: row.errorMessage ?? undefined,
     webhookUrl: request ? buildAbsoluteApiUrl(request, path) : path,
     createdAt: row.createdAt?.toISOString?.() ?? String(row.createdAt),
@@ -5347,8 +5374,23 @@ function slackDeploymentInclude() {
 }
 
 async function getSlackDeploymentToken(deployment: any): Promise<string> {
+  const cacheKey = `slack:bot_token:${deployment.id}`;
+  if (redis) {
+    const cached = await redis.get(cacheKey).catch(() => null);
+    if (cached) return cached;
+  }
   const secrets = await readVaultKv(slackDeploymentSecretPath(deployment.ownerId, deployment.id));
-  return safeString(secrets.bot_token);
+  const token = safeString(secrets.bot_token);
+  if (redis && token) await redis.set(cacheKey, token, "EX", 3600).catch(() => undefined);
+  return token;
+}
+
+async function clearSlackDeploymentCache(deploymentId: string): Promise<void> {
+  if (!redis) return;
+  await Promise.all([
+    redis.del(`slack:signing_secret:${deploymentId}`),
+    redis.del(`slack:bot_token:${deploymentId}`)
+  ]).catch(() => undefined);
 }
 
 async function validateSlackBotToken(botToken: string) {
@@ -5372,11 +5414,12 @@ app.get("/slack/deployments", async (request) => {
 
 app.post("/slack/deployments", async (request, reply) => {
   const ownerId = requesterUserId(request.headers as Record<string, unknown>);
-  const body = (request.body ?? {}) as { deploymentName?: string; installMode?: string };
+  const body = (request.body ?? {}) as { deploymentName?: string; installMode?: string; id?: string };
   const deploymentName = safeString(body.deploymentName) || "Slack KB Bot";
   const installMode = safeString(body.installMode) === "manual" ? "manual" : "oauth";
+  const preGeneratedId = safeString(body.id) || undefined;
   const row = await (prisma as any).slackDeployment.create({
-    data: { ownerId, deploymentName, installMode, status: "pending" },
+    data: { ...(preGeneratedId ? { id: preGeneratedId } : {}), ownerId, deploymentName, installMode, status: "pending" },
     include: slackDeploymentInclude()
   });
   return reply.code(201).send(mapSlackDeployment(row, request));
@@ -5397,7 +5440,7 @@ app.get("/slack/deployments/:id", async (request, reply) => {
 app.put("/slack/deployments/:id", async (request, reply) => {
   const ownerId = requesterUserId(request.headers as Record<string, unknown>);
   const id = (request.params as { id: string }).id;
-  const body = (request.body ?? {}) as { deploymentName?: string; knowledgeBaseIds?: string[]; accessMode?: string; allowedSlackUserIds?: string[] };
+  const body = (request.body ?? {}) as { deploymentName?: string; knowledgeBaseIds?: string[]; accessMode?: string; allowedSlackUserIds?: string[]; shareScope?: string; sharedWithUserIds?: string[]; requireUserVerification?: boolean; defaultKbIds?: string[] };
   const existing = await (prisma as any).slackDeployment.findFirst({ where: { id, ownerId } });
   if (!existing) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
   await (prisma as any).$transaction(async (tx: any) => {
@@ -5415,11 +5458,16 @@ app.put("/slack/deployments/:id", async (request, reply) => {
       data: {
         ...(body.deploymentName !== undefined ? { deploymentName: safeString(body.deploymentName) || existing.deploymentName } : {}),
         ...(body.accessMode !== undefined ? { accessMode: safeString(body.accessMode) === "allowlist" ? "allowlist" : "channel" } : {}),
-        ...(body.allowedSlackUserIds !== undefined ? { allowedSlackUserIds: safeArray(body.allowedSlackUserIds) } : {})
+        ...(body.allowedSlackUserIds !== undefined ? { allowedSlackUserIds: safeArray(body.allowedSlackUserIds) } : {}),
+        ...(body.shareScope !== undefined ? { shareScope: ["all", "specific", "private"].includes(safeString(body.shareScope)) ? safeString(body.shareScope) : "private" } : {}),
+        ...(body.sharedWithUserIds !== undefined ? { sharedWithUserIds: safeArray(body.sharedWithUserIds) } : {}),
+        ...(body.requireUserVerification !== undefined ? { requireUserVerification: body.requireUserVerification !== false } : {}),
+        ...(body.defaultKbIds !== undefined ? { defaultKbIds: safeArray(body.defaultKbIds) } : {})
       }
     });
   });
   const row = await (prisma as any).slackDeployment.findUnique({ where: { id }, include: slackDeploymentInclude() });
+  await clearSlackDeploymentCache(id);
   return mapSlackDeployment(row, request);
 });
 
@@ -5432,6 +5480,7 @@ app.delete("/slack/deployments/:id", async (request, reply) => {
     await tx.channelChatThread.deleteMany({ where: { channelDeploymentId: id } });
     await tx.slackDeployment.delete({ where: { id } });
   });
+  await clearSlackDeploymentCache(id);
   return { deleted: true };
 });
 
@@ -5465,11 +5514,107 @@ app.get("/slack/oauth/callback", async (request, reply) => {
   const query = request.query as any;
   const code = safeString(query.code);
   const state = safeString(query.state);
+  if (!code || !state) return reply.code(400).send({ error: "INVALID_SLACK_OAUTH_CALLBACK" });
+
+  // Peek at purpose without verifying so we know which secrets to load
+  const [encoded] = state.split(".");
+  let peekPurpose = "";
+  let peekOwnerId = "";
+  let peekDeploymentId = "";
+  try {
+    const peeked = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as any;
+    peekPurpose = safeString(peeked.purpose);
+    peekOwnerId = safeString(peeked.ownerId);
+    peekDeploymentId = safeString(peeked.deploymentId);
+  } catch { /* ignore */ }
+
+  // ── Identity OAuth: user links their Slack ID ─────────────────────────────
+  if (peekPurpose === "identity") {
+    if (!peekOwnerId || !peekDeploymentId) return reply.redirect(`/chat-channels?slack_identity=false`);
+    const depSecrets = await readVaultKv(slackDeploymentSecretPath(peekOwnerId, peekDeploymentId)).catch(() => ({} as Record<string, unknown>));
+    const depClientId = safeString(depSecrets.client_id);
+    const depClientSecret = safeString(depSecrets.client_secret);
+    if (!depClientId || !depClientSecret) return reply.redirect(`/chat-channels?slack_identity=false`);
+    const payload = verifySlackState(state, depClientSecret);
+    if (!payload) return reply.redirect(`/chat-channels?slack_identity=false`);
+    const nonce = safeString(payload.nonce);
+    if (redis) {
+      const used = await redis.del(`slack:oauth:identity:${nonce}`);
+      if (!used) return reply.redirect(`/chat-channels?slack_identity=false`);
+    }
+    const rapidragUserId = safeString(payload.rapidragUserId);
+    const rapidragUsername = safeString(payload.rapidragUsername);
+    const deploymentId = safeString(payload.deploymentId);
+    const kbIds = safeArray(payload.kbIds);
+    const redirectUri = safeString(payload.redirectUri) || buildAbsoluteApiUrl(request, "/slack/oauth/callback");
+    const response = await fetch("https://slack.com/api/oauth.v2.access", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ client_id: depClientId, client_secret: depClientSecret, code, redirect_uri: redirectUri })
+    });
+    const oauth = (await response.json()) as any;
+    const slackUserId = safeString(oauth.authed_user?.id);
+    if (!oauth.ok || !slackUserId) return reply.redirect(`/chat-channels?slack_identity=false`);
+    await (prisma as any).slackUserKbMapping.upsert({
+      where: { deploymentId_slackUserId: { deploymentId, slackUserId } },
+      create: { deploymentId, slackUserId, rapidragUserId, rapidragUsername, kbIds, status: "connected" },
+      update: { rapidragUserId, rapidragUsername, kbIds, status: "connected" }
+    });
+    // Clean up synthetic placeholder for this user on this deployment
+    await (prisma as any).slackUserKbMapping.deleteMany({
+      where: { deploymentId, slackUserId: `rapidrag:${rapidragUserId}`, status: "pending" }
+    });
+    return reply.redirect(`/chat-channels?slack_identity=true&deploymentId=${encodeURIComponent(deploymentId)}`);
+  }
+
+  // ── Per-deployment bot install OAuth ──────────────────────────────────────
+  if (peekPurpose === "install") {
+    if (!peekOwnerId || !peekDeploymentId) return reply.redirect(`/chat-channels?slack_connected=false`);
+    const depSecrets = await readVaultKv(slackDeploymentSecretPath(peekOwnerId, peekDeploymentId)).catch(() => ({} as Record<string, unknown>));
+    const depClientId = safeString(depSecrets.client_id);
+    const depClientSecret = safeString(depSecrets.client_secret);
+    if (!depClientId || !depClientSecret) return reply.redirect(`/chat-channels?slack_connected=false&deploymentId=${encodeURIComponent(peekDeploymentId)}`);
+    const payload = verifySlackState(state, depClientSecret);
+    if (!payload) return reply.redirect(`/chat-channels?slack_connected=false`);
+    const nonce = safeString(payload.nonce);
+    if (redis) {
+      const used = await redis.del(`slack:oauth:install:${nonce}`);
+      if (!used) return reply.redirect(`/chat-channels?slack_connected=false`);
+    }
+    const ownerId = peekOwnerId;
+    const deploymentId = peekDeploymentId;
+    const redirectUri = safeString(payload.redirectUri) || buildAbsoluteApiUrl(request, "/slack/oauth/callback");
+    const response = await fetch("https://slack.com/api/oauth.v2.access", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ client_id: depClientId, client_secret: depClientSecret, code, redirect_uri: redirectUri })
+    });
+    const oauth = (await response.json()) as any;
+    if (!oauth.ok) return reply.redirect(`/chat-channels?slack_connected=false&deploymentId=${encodeURIComponent(deploymentId)}`);
+    await writeVaultKv(slackDeploymentSecretPath(ownerId, deploymentId), {
+      ...depSecrets,
+      bot_token: oauth.access_token
+    });
+    await (prisma as any).slackDeployment.updateMany({
+      where: { id: deploymentId, ownerId },
+      data: {
+        installMode: "oauth",
+        slackWorkspaceId: safeString(oauth.team?.id),
+        slackWorkspaceName: safeString(oauth.team?.name),
+        slackBotUserId: safeString(oauth.bot_user_id),
+        status: "pending",
+        errorMessage: null
+      }
+    });
+    return reply.redirect(`/chat-channels?slack_connected=true&deploymentId=${encodeURIComponent(deploymentId)}`);
+  }
+
+  // ── Legacy global-secret bot install OAuth (no purpose in state) ──────────
   const clientId = await readSlackGlobalSecret("client_id");
   const clientSecret = await readSlackGlobalSecret("client_secret");
   const signingSecret = await readSlackGlobalSecret("signing_secret");
   const payload = clientSecret ? verifySlackState(state, clientSecret) : null;
-  if (!code || !payload || !signingSecret) return reply.code(400).send({ error: "INVALID_SLACK_OAUTH_CALLBACK" });
+  if (!payload || !signingSecret) return reply.code(400).send({ error: "INVALID_SLACK_OAUTH_CALLBACK" });
   const nonce = safeString(payload.nonce);
   if (redis) {
     const used = await redis.del(`slack:oauth:state:${nonce}`);
@@ -5518,12 +5663,19 @@ app.post("/slack/validate-token", async (request, reply) => {
 
 app.post("/slack/deployments/:id/activate", async (request, reply) => {
   const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const ownerUsername = safeString((request.headers as any)["x-user-name"]) || ownerId;
   const id = (request.params as { id: string }).id;
   const body = (request.body ?? {}) as any;
   const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id, ownerId } });
   if (!deployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+
+  const requireUserVerification = body.requireUserVerification !== false;
+  const defaultKbIds = safeArray(body.defaultKbIds);
   const knowledgeBaseIds = safeArray(body.knowledgeBaseIds);
-  if (knowledgeBaseIds.length === 0) return reply.code(400).send({ error: "ACTIVATION_FIELDS_REQUIRED" });
+
+  // In open-access mode use defaultKbIds; in verified mode the owner's kbIds are required
+  const activationKbIds = requireUserVerification ? knowledgeBaseIds : defaultKbIds;
+  if (requireUserVerification && knowledgeBaseIds.length === 0) return reply.code(400).send({ error: "ACTIVATION_FIELDS_REQUIRED" });
 
   let tokenInfo = {
     workspaceId: safeString(deployment.slackWorkspaceId),
@@ -5533,10 +5685,17 @@ app.post("/slack/deployments/:id/activate", async (request, reply) => {
   if (deployment.installMode === "manual") {
     const botToken = safeString(body.botToken);
     const signingSecret = safeString(body.signingSecret);
+    const clientId = safeString(body.clientId);
+    const clientSecret = safeString(body.clientSecret);
     if (!botToken || !signingSecret) return reply.code(400).send({ error: "MANUAL_SLACK_SECRETS_REQUIRED" });
     try {
       tokenInfo = await validateSlackBotToken(botToken);
-      await writeVaultKv(slackDeploymentSecretPath(ownerId, id), { bot_token: botToken, signing_secret: signingSecret });
+      await writeVaultKv(slackDeploymentSecretPath(ownerId, id), {
+        bot_token: botToken,
+        signing_secret: signingSecret,
+        ...(clientId ? { client_id: clientId } : {}),
+        ...(clientSecret ? { client_secret: clientSecret } : {})
+      });
     } catch {
       await (prisma as any).slackDeployment.update({ where: { id }, data: { status: "error", errorMessage: "Invalid Slack bot token" } });
       return reply.code(400).send({ error: "INVALID_SLACK_BOT_TOKEN" });
@@ -5546,18 +5705,19 @@ app.post("/slack/deployments/:id/activate", async (request, reply) => {
     if (!safeString(secrets.bot_token) || !safeString(secrets.signing_secret) || !tokenInfo.workspaceId) {
       return reply.code(400).send({ error: "SLACK_OAUTH_INSTALL_REQUIRED" });
     }
-    const duplicate = await (prisma as any).slackDeployment.findFirst({
-      where: { id: { not: id }, installMode: "oauth", status: "active", slackWorkspaceId: tokenInfo.workspaceId }
-    });
-    if (duplicate) return reply.code(409).send({ error: "SLACK_WORKSPACE_ALREADY_ACTIVE" });
   }
+
+  const shareScope = ["all", "specific"].includes(safeString(body.shareScope)) ? safeString(body.shareScope) : "private";
+  const sharedWithUserIds = safeArray(body.sharedWithUserIds);
 
   await (prisma as any).$transaction(async (tx: any) => {
     await tx.slackDeploymentKb.deleteMany({ where: { deploymentId: id } });
-    await tx.slackDeploymentKb.createMany({
-      data: knowledgeBaseIds.map((knowledgeBaseId) => ({ deploymentId: id, knowledgeBaseId })),
-      skipDuplicates: true
-    });
+    if (activationKbIds.length > 0) {
+      await tx.slackDeploymentKb.createMany({
+        data: activationKbIds.map((knowledgeBaseId: string) => ({ deploymentId: id, knowledgeBaseId })),
+        skipDuplicates: true
+      });
+    }
     await tx.slackDeployment.update({
       where: { id },
       data: {
@@ -5566,14 +5726,25 @@ app.post("/slack/deployments/:id/activate", async (request, reply) => {
         slackBotUserId: tokenInfo.botUserId,
         slackChannelId: null,
         slackChannelName: null,
-        accessMode: safeString(body.accessMode) === "allowlist" ? "allowlist" : "channel",
-        allowedSlackUserIds: safeArray(body.allowedSlackUserIds),
+        shareScope,
+        sharedWithUserIds,
+        requireUserVerification,
+        defaultKbIds: requireUserVerification ? [] : defaultKbIds,
         status: "active",
         errorMessage: null
       }
     });
+    // Auto-create owner's user mapping in verified mode
+    if (requireUserVerification && knowledgeBaseIds.length > 0) {
+      await tx.slackUserKbMapping.upsert({
+        where: { deploymentId_slackUserId: { deploymentId: id, slackUserId: `rapidrag:${ownerId}` } },
+        create: { deploymentId: id, rapidragUserId: ownerId, rapidragUsername: ownerUsername, slackUserId: `rapidrag:${ownerId}`, kbIds: knowledgeBaseIds, status: "pending" },
+        update: { kbIds: knowledgeBaseIds, rapidragUsername: ownerUsername }
+      });
+    }
   });
   const row = await (prisma as any).slackDeployment.findUnique({ where: { id }, include: slackDeploymentInclude() });
+  await clearSlackDeploymentCache(id);
   return mapSlackDeployment(row, request);
 });
 
@@ -5582,7 +5753,230 @@ app.post("/slack/deployments/:id/deactivate", async (request, reply) => {
   const id = (request.params as { id: string }).id;
   const updated = await (prisma as any).slackDeployment.updateMany({ where: { id, ownerId }, data: { status: "disabled" } });
   if (updated.count === 0) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+  await clearSlackDeploymentCache(id);
   return { deactivated: true };
+});
+
+// List deployments shared with the requesting user (shareScope="all" or userId in sharedWithUserIds)
+app.get("/slack/deployments/shared", async (request) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const rows = await (prisma as any).slackDeployment.findMany({
+    where: {
+      status: "active",
+      OR: [
+        { shareScope: "all" },
+        { shareScope: "specific", sharedWithUserIds: { has: userId } }
+      ]
+    },
+    include: slackDeploymentInclude(),
+    orderBy: { createdAt: "desc" }
+  });
+  return rows.map((row: any) => mapSlackDeployment(row, request));
+});
+
+// Current user's own Slack mappings across all deployments (excludes synthetic placeholders)
+app.get("/slack/deployments/my-connections", async (request) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const mappings = await (prisma as any).slackUserKbMapping.findMany({
+    where: { rapidragUserId: userId, NOT: { slackUserId: { startsWith: "rapidrag:" } } },
+    orderBy: { createdAt: "asc" }
+  });
+  return mappings.map((m: any) => ({
+    deploymentId: m.deploymentId,
+    slackUserId: m.slackUserId,
+    kbIds: m.kbIds,
+    status: m.status
+  }));
+});
+
+// Deployments where current user is a member (not owner)
+app.get("/slack/deployments/member-of", async (request) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const mappings = await (prisma as any).slackUserKbMapping.findMany({
+    where: { rapidragUserId: userId },
+    select: { deploymentId: true }
+  });
+  const ids = (mappings as any[]).map((m) => m.deploymentId as string);
+  const rows = await (prisma as any).slackDeployment.findMany({
+    where: { id: { in: ids }, ownerId: { not: userId } },
+    include: slackDeploymentInclude(),
+    orderBy: { createdAt: "desc" }
+  });
+  return rows.map((row: any) => mapSlackDeployment(row, request));
+});
+
+// List members of a deployment (owner only)
+app.get("/slack/deployments/:id/members", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id, ownerId }, select: { id: true } });
+  if (!deployment) return reply.code(403).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND_OR_FORBIDDEN" });
+  const members = await (prisma as any).slackUserKbMapping.findMany({
+    where: { deploymentId: id },
+    orderBy: { createdAt: "asc" }
+  });
+  return members.map((m: any) => ({
+    id: m.id,
+    deploymentId: m.deploymentId,
+    rapidragUserId: m.rapidragUserId ?? undefined,
+    rapidragUsername: m.rapidragUsername ?? undefined,
+    slackUserId: m.slackUserId,
+    kbIds: m.kbIds,
+    status: m.status,
+    createdAt: m.createdAt?.toISOString?.() ?? String(m.createdAt),
+    updatedAt: m.updatedAt?.toISOString?.() ?? String(m.updatedAt)
+  }));
+});
+
+// Owner manually adds a member
+app.post("/slack/deployments/:id/members", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id, ownerId }, select: { id: true } });
+  if (!deployment) return reply.code(403).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND_OR_FORBIDDEN" });
+  const body = (request.body ?? {}) as { slackUserId?: string; rapidragUserId?: string; rapidragUsername?: string; kbIds?: string[] };
+  const slackUserId = safeString(body.slackUserId);
+  if (!slackUserId) return reply.code(400).send({ error: "SLACK_USER_ID_REQUIRED" });
+  const member = await (prisma as any).slackUserKbMapping.upsert({
+    where: { deploymentId_slackUserId: { deploymentId: id, slackUserId } },
+    create: {
+      deploymentId: id,
+      slackUserId,
+      rapidragUserId: body.rapidragUserId ? safeString(body.rapidragUserId) : null,
+      rapidragUsername: body.rapidragUsername ? safeString(body.rapidragUsername) : null,
+      kbIds: safeArray(body.kbIds),
+      status: "connected"
+    },
+    update: {
+      rapidragUserId: body.rapidragUserId ? safeString(body.rapidragUserId) : undefined,
+      rapidragUsername: body.rapidragUsername ? safeString(body.rapidragUsername) : undefined,
+      kbIds: safeArray(body.kbIds),
+      status: "connected"
+    }
+  });
+  return reply.code(201).send(member);
+});
+
+// Owner removes a member
+app.delete("/slack/deployments/:id/members/:slackUserId", async (request, reply) => {
+  const ownerId = requesterUserId(request.headers as Record<string, unknown>);
+  const { id, slackUserId } = request.params as { id: string; slackUserId: string };
+  const deployment = await (prisma as any).slackDeployment.findFirst({ where: { id, ownerId }, select: { id: true } });
+  if (!deployment) return reply.code(403).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND_OR_FORBIDDEN" });
+  await (prisma as any).slackUserKbMapping.deleteMany({ where: { deploymentId: id, slackUserId } });
+  return { deleted: true };
+});
+
+// User links their own Slack ID after OAuth (called with their own Slack user ID + chosen KBs)
+app.post("/slack/deployments/:id/members/self", async (request, reply) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const username = safeString((request.headers as any)["x-user-name"]) || userId;
+  const id = (request.params as { id: string }).id;
+  const body = (request.body ?? {}) as { slackUserId?: string; kbIds?: string[] };
+  const slackUserId = safeString(body.slackUserId);
+  if (!slackUserId) return reply.code(400).send({ error: "SLACK_USER_ID_REQUIRED" });
+
+  // Verify deployment is accessible to this user
+  const deployment = await (prisma as any).slackDeployment.findFirst({
+    where: {
+      id,
+      status: "active",
+      OR: [
+        { ownerId: userId },
+        { shareScope: "all" },
+        { shareScope: "specific", sharedWithUserIds: { has: userId } }
+      ]
+    },
+    select: { id: true, requireUserVerification: true }
+  });
+  if (!deployment) return reply.code(403).send({ error: "SLACK_DEPLOYMENT_NOT_ACCESSIBLE" });
+  if (!deployment.requireUserVerification) return reply.code(400).send({ error: "DEPLOYMENT_IS_OPEN_ACCESS" });
+
+  const member = await (prisma as any).slackUserKbMapping.upsert({
+    where: { deploymentId_slackUserId: { deploymentId: id, slackUserId } },
+    create: { deploymentId: id, slackUserId, rapidragUserId: userId, rapidragUsername: username, kbIds: safeArray(body.kbIds), status: "connected" },
+    update: { rapidragUserId: userId, rapidragUsername: username, kbIds: safeArray(body.kbIds), status: "connected" }
+  });
+  return reply.code(201).send(member);
+});
+
+// Generate Slack identity OAuth URL so user can link their Slack ID without manual entry
+app.get("/slack/deployments/:id/members/self/oauth", async (request, reply) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const username = safeString((request.headers as any)["x-user-name"]) || userId;
+  const id = (request.params as { id: string }).id;
+  const kbIds = safeString((request.query as any).kbIds || "").split(",").map((s: string) => s.trim()).filter(Boolean);
+
+  const deployment = await (prisma as any).slackDeployment.findFirst({
+    where: {
+      id, status: "active",
+      OR: [{ ownerId: userId }, { shareScope: "all" }, { shareScope: "specific", sharedWithUserIds: { has: userId } }]
+    },
+    select: { id: true, ownerId: true, requireUserVerification: true }
+  });
+  if (!deployment) return reply.code(403).send({ error: "SLACK_DEPLOYMENT_NOT_ACCESSIBLE" });
+  if (!deployment.requireUserVerification) return reply.code(400).send({ error: "DEPLOYMENT_IS_OPEN_ACCESS" });
+
+  const secrets = await readVaultKv(slackDeploymentSecretPath(deployment.ownerId, id)).catch(() => ({} as Record<string, unknown>));
+  const clientId = safeString(secrets.client_id);
+  const clientSecret = safeString(secrets.client_secret);
+  if (!clientId || !clientSecret) return reply.send({ oauthAvailable: false });
+
+  const nonce = randomUUID();
+  if (redis) await redis.set(`slack:oauth:identity:${nonce}`, "1", "EX", 600);
+
+  const redirectUri = buildAbsoluteApiUrl(request, "/slack/oauth/callback");
+  const state = signSlackState({
+    purpose: "identity",
+    deploymentId: id,
+    ownerId: deployment.ownerId,
+    rapidragUserId: userId,
+    rapidragUsername: username,
+    kbIds,
+    nonce,
+    redirectUri,
+    exp: Math.floor(Date.now() / 1000) + 600
+  }, clientSecret);
+
+  const url = `https://slack.com/oauth/v2/authorize?client_id=${encodeURIComponent(clientId)}&user_scope=openid%2Cprofile&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`;
+  return reply.send({ oauthAvailable: true, url });
+});
+
+// Generate Slack bot install URL so non-owner users can add the bot to their workspace
+app.get("/slack/deployments/:id/install-url", async (request, reply) => {
+  const userId = requesterUserId(request.headers as Record<string, unknown>);
+  const id = (request.params as { id: string }).id;
+
+  const deployment = await (prisma as any).slackDeployment.findFirst({
+    where: {
+      id, status: "active",
+      OR: [{ ownerId: userId }, { shareScope: "all" }, { shareScope: "specific", sharedWithUserIds: { has: userId } }]
+    },
+    select: { id: true, ownerId: true, slackBotUserId: true }
+  });
+  if (!deployment) return reply.code(403).send({ error: "SLACK_DEPLOYMENT_NOT_ACCESSIBLE" });
+
+  const secrets = await readVaultKv(slackDeploymentSecretPath(deployment.ownerId, id)).catch(() => ({} as Record<string, unknown>));
+  const clientId = safeString(secrets.client_id);
+  const clientSecret = safeString(secrets.client_secret);
+  if (!clientId || !clientSecret) return reply.send({ installAvailable: false });
+
+  const nonce = randomUUID();
+  if (redis) await redis.set(`slack:oauth:install:${nonce}`, "1", "EX", 600);
+
+  const redirectUri = buildAbsoluteApiUrl(request, "/slack/oauth/callback");
+  const state = signSlackState({
+    purpose: "install",
+    deploymentId: id,
+    ownerId: deployment.ownerId,
+    nonce,
+    redirectUri,
+    exp: Math.floor(Date.now() / 1000) + 600
+  }, clientSecret);
+
+  const botScopes = "chat%3Awrite%2Cim%3Ahistory%2Cusers%3Aread%2Ccommands";
+  const url = `https://slack.com/oauth/v2/authorize?client_id=${encodeURIComponent(clientId)}&scope=${botScopes}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`;
+  return reply.send({ installAvailable: true, url, botUserId: deployment.slackBotUserId ?? undefined });
 });
 
 app.get("/channels/history/:deploymentId", async (request, reply) => {
@@ -5780,11 +6174,12 @@ async function handleSlackCommand(deployment: any, body: any): Promise<void> {
   await handleSlackMessage(deployment, teamId, userId, channelId, text, responseUrl);
 }
 
-async function handleSlackMessage(deployment: any, slackTeamId: string, slackUserId: string, slackChannelId: string, text: string, responseUrl?: string): Promise<void> {
+async function handleSlackMessage(deployment: any, slackTeamId: string, slackUserId: string, slackChannelId: string, text: string, responseUrl?: string, userKbIds?: string[]): Promise<void> {
   await pruneExpiredChannelChatThreads();
   const externalThreadKey = `${slackTeamId}#${slackUserId}`;
   const now = new Date();
-  const allKbIds = (deployment.kbMappings ?? []).map((mapping: any) => mapping.knowledgeBaseId);
+  // userKbIds overrides deployment-level kbMappings for per-user KB isolation
+  const allKbIds = userKbIds ?? (deployment.kbMappings ?? []).map((mapping: any) => mapping.knowledgeBaseId);
   const thread = await (prisma as any).channelChatThread.upsert({
     where: { origin_channelDeploymentId_externalThreadKey: { origin: "slack", channelDeploymentId: deployment.id, externalThreadKey } },
     create: {
@@ -5803,7 +6198,13 @@ async function handleSlackMessage(deployment: any, slackTeamId: string, slackUse
     }
   });
   const activeKbIds = (thread.activeKbIds?.length ? thread.activeKbIds : allKbIds) as string[];
-  const activeMappings = (deployment.kbMappings ?? []).filter((mapping: any) => activeKbIds.includes(mapping.knowledgeBaseId));
+  const deploymentMappingIds = new Set((deployment.kbMappings ?? []).map((m: any) => m.knowledgeBaseId));
+  // Merge deployment kbMappings with any user-specific KBs not in the deployment-level set
+  const syntheticMappings = activeKbIds
+    .filter((kbId: string) => !deploymentMappingIds.has(kbId))
+    .map((kbId: string) => ({ knowledgeBaseId: kbId, knowledgeBase: null }));
+  const allMappings = [...(deployment.kbMappings ?? []), ...syntheticMappings];
+  const activeMappings = allMappings.filter((mapping: any) => activeKbIds.includes(mapping.knowledgeBaseId));
   if (activeMappings.length === 0) {
     await postSlackReply(deployment, slackChannelId, "No knowledge bases are mapped to this Slack bot yet.", responseUrl);
     return;
@@ -5933,73 +6334,113 @@ async function resolveSlackDeploymentForWebhook(request: any, body: any, deploym
   });
 }
 
+async function getSlackSigningSecret(deploymentId: string, ownerId: string): Promise<string> {
+  // Cache signing secret in Redis for 5 min to avoid Vault on every slash command
+  const cacheKey = `slack:signing_secret:${deploymentId}`;
+  if (redis) {
+    const cached = await redis.get(cacheKey).catch(() => null);
+    if (cached) return cached;
+  }
+  const secrets = await readVaultKv(slackDeploymentSecretPath(ownerId, deploymentId));
+  const secret = safeString(secrets.signing_secret);
+  if (redis && secret) await redis.set(cacheKey, secret, "EX", 7200).catch(() => undefined);
+  return secret;
+}
+
 async function handleSlackWebhook(request: any, reply: any, deploymentId?: string) {
   const rawBody = request.rawBody as Buffer | undefined;
   const signature = safeString(request.headers["x-slack-signature"]);
   const timestamp = safeString(request.headers["x-slack-request-timestamp"]);
-  let manualDeployment: any | null = null;
+  const retryNum = safeString(request.headers["x-slack-retry-num"]);
+
+  // ── Step 1: get signing secret (Redis cache → Vault) + verify signature ──────
+  // This is the ONLY async work before we send 200. Everything else is background.
   let signingSecret = "";
+  let preloadedDeployment: any | null = null;
+
   if (deploymentId) {
-    manualDeployment = await (prisma as any).slackDeployment.findUnique({ where: { id: deploymentId } });
-    if (!manualDeployment) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
-    const secrets = await readVaultKv(slackDeploymentSecretPath(manualDeployment.ownerId, manualDeployment.id));
-    signingSecret = safeString(secrets.signing_secret);
+    // Fetch deployment row + owner ID in parallel to minimise pre-reply latency
+    const [dep, meta] = await Promise.all([
+      (prisma as any).slackDeployment.findUnique({ where: { id: deploymentId }, include: slackDeploymentInclude() }),
+      (prisma as any).slackDeployment.findUnique({ where: { id: deploymentId }, select: { ownerId: true } })
+    ]);
+    if (!dep || !meta) return reply.code(404).send({ error: "SLACK_DEPLOYMENT_NOT_FOUND" });
+    preloadedDeployment = dep;
+    signingSecret = await getSlackSigningSecret(deploymentId, safeString(meta.ownerId));
   } else {
     signingSecret = await readSlackGlobalSecret("signing_secret");
   }
+
   if (!rawBody || !verifySlackSignature(rawBody, signingSecret, signature, timestamp)) {
     return reply.code(403).send({ error: "INVALID_SLACK_SIGNATURE" });
   }
+
   const body = request.body ?? {};
+
+  // url_verification must be answered synchronously
   if (body.type === "url_verification") return reply.type("text/plain").send(safeString(body.challenge));
 
-  const deployment = manualDeployment ? await resolveSlackDeploymentForWebhook(request, body, deploymentId) : await resolveSlackDeploymentForWebhook(request, body);
-  if (!deployment || deployment.status !== "active") return reply.code(200).send({ ignored: true });
-  const teamId = getSlackTeamId(body);
-  const channelId = getSlackChannelId(body);
-  const userId = getSlackUserId(body);
-  if (teamId !== deployment.slackWorkspaceId) return reply.code(200).send({ ignored: true });
-  if (body.event?.bot_id || body.event?.subtype) return reply.code(200).send({ ignored: true });
-
-  const responseUrl = safeString(body.response_url);
-  if (await isSlackRateLimited(deployment.id)) {
-    const text = "I'm receiving too many requests right now. Please try again in a minute.";
-    logInfo("SLACK_RATE_LIMITED", {
-      service: "workflow-service",
-      deploymentId: deployment.id,
-      workspaceId: teamId,
-      channelId
-    });
-    if (body.command) return reply.code(200).send({ response_type: "ephemeral", text });
-    reply.code(200).send({ ok: true, rateLimited: true });
-    setImmediate(() => {
-      postSlackReply(deployment, channelId, text, responseUrl).catch((error) => logInfo("SLACK_RATE_LIMIT_REPLY_FAILED", {
-        service: "workflow-service",
-        deploymentId: deployment.id,
-        error: error instanceof Error ? error.message : String(error)
-      }));
-    });
-    return;
-  }
-
-  const eventId = safeString(body.event_id);
-  const retryNum = safeString(request.headers["x-slack-retry-num"]);
-  let claimed = true;
-  if (eventId) {
-    claimed = await claimRedisKey(`slack:event:${eventId}`, 300);
-  } else if (body.command) {
-    const composite = `${teamId}:${userId}:${body.command}:${body.text}:${timestamp}`;
-    const hash = createHash("sha256").update(composite).digest("hex");
-    claimed = await claimRedisKey(`slack:command:${hash}`, 300);
-  }
-  if (!claimed) return reply.code(200).send({ duplicate: true, retryNum });
-
-  const accessDenied = deployment.accessMode === "allowlist" && !(deployment.allowedSlackUserIds ?? []).includes(userId);
+  // ── Step 2: send 200 immediately — Slack's 3-second clock stops here ─────────
   reply.code(200).send(body.command ? { response_type: "ephemeral", text: "Working on it..." } : { ok: true });
+
+  // ── Step 3: all remaining work runs in background ────────────────────────────
   setImmediate(() => {
     (async () => {
+      // Resolve deployment (already loaded for manual bots; do DB lookup for OAuth-style)
+      const deployment = preloadedDeployment ?? await resolveSlackDeploymentForWebhook(request, body);
+      if (!deployment || deployment.status !== "active") return;
+
+      const teamId = getSlackTeamId(body);
+      const channelId = getSlackChannelId(body);
+      const userId = getSlackUserId(body);
+      const responseUrl = safeString(body.response_url);
+
+      if (teamId !== deployment.slackWorkspaceId) return;
+      if (body.event?.bot_id || body.event?.subtype) return;
+
+      // Rate limit check
+      if (await isSlackRateLimited(deployment.id)) {
+        const text = "I'm receiving too many requests right now. Please try again in a minute.";
+        logInfo("SLACK_RATE_LIMITED", { service: "workflow-service", deploymentId: deployment.id, workspaceId: teamId, channelId });
+        await postSlackReply(deployment, channelId, text, responseUrl);
+        return;
+      }
+
+      // Deduplication
+      const eventId = safeString(body.event_id);
+      let claimed = true;
+      if (eventId) {
+        claimed = await claimRedisKey(`slack:event:${eventId}`, 300);
+      } else if (body.command) {
+        const composite = `${teamId}:${userId}:${body.command}:${safeString(body.text)}:${timestamp}`;
+        const hash = createHash("sha256").update(composite).digest("hex");
+        claimed = await claimRedisKey(`slack:command:${hash}`, 300);
+      }
+      if (!claimed) {
+        logInfo("SLACK_DUPLICATE_IGNORED", { service: "workflow-service", deploymentId: deployment.id, retryNum });
+        return;
+      }
+
+      // KB resolution
+      let resolvedKbIds: string[] | null = null;
+      let accessDenied = false;
+      const accessDeniedMessage = "You are not connected to this knowledge base bot. Contact your administrator to be added.";
+
+      if (!deployment.requireUserVerification) {
+        resolvedKbIds = deployment.defaultKbIds ?? [];
+      } else {
+        const userMapping = await (prisma as any).slackUserKbMapping.findFirst({
+          where: { deploymentId: deployment.id, slackUserId: userId, status: "connected" }
+        });
+        if (!userMapping) {
+          accessDenied = true;
+        } else {
+          resolvedKbIds = userMapping.kbIds ?? [];
+        }
+      }
+
       if (accessDenied) {
-        await postSlackReply(deployment, channelId, "Sorry, you're not authorised to use this knowledge base bot.", responseUrl);
+        await postSlackReply(deployment, channelId, accessDeniedMessage, responseUrl);
         return;
       }
       if (body.command === "/kb") {
@@ -6007,11 +6448,11 @@ async function handleSlackWebhook(request: any, reply: any, deploymentId?: strin
         return;
       }
       if (body.event?.type === "message" && body.event?.channel_type === "im") {
-        await handleSlackMessage(deployment, teamId, userId, channelId, safeString(body.event.text), responseUrl);
+        await handleSlackMessage(deployment, teamId, userId, channelId, safeString(body.event.text), responseUrl, resolvedKbIds ?? undefined);
       }
     })().catch((error) => logInfo("SLACK_ASYNC_HANDLER_FAILED", {
       service: "workflow-service",
-      deploymentId: deployment.id,
+      deploymentId: deploymentId ?? "unknown",
       error: error instanceof Error ? error.message : String(error)
     }));
   });
@@ -7005,7 +7446,7 @@ app.post("/rag/prompt-templates/generate", async (request, reply) => {
   const mode: "recommend" | "improve" = description ? "improve" : "recommend";
 
   // Read LLM credentials from Vault (OpenAI-compatible endpoint)
-  const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({}));
+  const llmSecrets = await readVaultKv("platform/global/llm").catch(() => ({} as Record<string, unknown>));
   const apiKey = String((llmSecrets as any).api_key ?? "").trim();
   if (!apiKey || apiKey === "PLACEHOLDER_UPDATE_ME") return reply.code(503).send({ error: "LLM_NOT_CONFIGURED", details: "Add API credentials at Vault path platform/global/llm (fields: api_key, model, base_url)" });
   const model = String((llmSecrets as any).model ?? "claude-sonnet-4-6").trim();

@@ -1,58 +1,47 @@
 "use client";
 
 import { useEffect, useState, type ReactElement } from "react";
-import { deactivateSlackDeployment, deleteSlackDeployment, fetchSlackDeployments } from "./api";
+import {
+  deactivateSlackDeployment,
+  deleteSlackDeployment,
+  fetchMyConnections,
+  fetchSharedSlackDeployments,
+  fetchSlackDeployments
+} from "./api";
 import { ConnectSlackWizard } from "./ConnectSlackWizard";
 import { SlackDeploymentCard } from "./SlackDeploymentCard";
+import { SlackDeploymentViewModal } from "./SlackDeploymentViewModal";
+import { SlackMembersPanel } from "./SlackMembersPanel";
 import type { SlackDeployment } from "./types";
 
-/** Platform channel cards — shows Slack (live) + coming-soon placeholders */
-const CHANNEL_PLATFORMS = [
-  { key: "slack",   label: "Slack",          desc: "Bot DMs, channel mentions, slash commands",   status: "live"   },
-  { key: "telegram",label: "Telegram",       desc: "Bot API for 1:1 and group chats",             status: "soon"   },
-  { key: "gchat",   label: "Google Chat",    desc: "Workspace bot for spaces and DMs",            status: "soon"   },
-  { key: "teams",   label: "Microsoft Teams",desc: "Channel & personal scope bot",                status: "soon"   },
-] as const;
-
-function PlatformIcon({ platform }: { platform: string }): ReactElement {
-  const gradients: Record<string, [string, string]> = {
-    slack:    ["#0f766e", "#0891b2"],
-    telegram: ["#2b6cb0", "#3182ce"],
-    gchat:    ["#065f46", "#0891b2"],
-    teams:    ["#4f46e5", "#7c3aed"],
-  };
-  const labels: Record<string, string> = { slack: "#", telegram: "✈", gchat: "G", teams: "T" };
-  const [c1, c2] = gradients[platform] ?? ["#64748b", "#94a3b8"];
-  const id = `pg-${platform}`;
-  return (
-    <span className="cc-platform-icon">
-      <svg width="36" height="36" viewBox="0 0 36 36" fill="none" aria-hidden="true">
-        <rect width="36" height="36" rx="10" fill={`url(#${id})`} />
-        <defs>
-          <linearGradient id={id} x1="0" y1="0" x2="36" y2="36" gradientUnits="userSpaceOnUse">
-            <stop stopColor={c1} />
-            <stop offset="1" stopColor={c2} />
-          </linearGradient>
-        </defs>
-        <text x="18" y="23" textAnchor="middle" fill="#fff" fontSize="13" fontWeight="900" fontFamily="sans-serif">
-          {labels[platform] ?? "?"}
-        </text>
-      </svg>
-    </span>
-  );
-}
+type MyConnection = { deploymentId: string; slackUserId: string; kbIds: string[]; status: string };
 
 export function ChatChannelsPage(): ReactElement {
-  const [deployments, setDeployments] = useState<SlackDeployment[]>([]);
+  const [ownedBots, setOwnedBots] = useState<SlackDeployment[]>([]);
+  const [allAccessibleBots, setAllAccessibleBots] = useState<SlackDeployment[]>([]);
+  const [myConnections, setMyConnections] = useState<MyConnection[]>([]);
   const [modalDeployment, setModalDeployment] = useState<SlackDeployment | null | undefined>();
+  const [connectToBot, setConnectToBot] = useState<SlackDeployment | null>(null);
+  const [viewDeployment, setViewDeployment] = useState<SlackDeployment | null>(null);
+  const [membersDeployment, setMembersDeployment] = useState<SlackDeployment | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [successBanner, setSuccessBanner] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   async function load(): Promise<void> {
     setLoading(true);
     setError(null);
     try {
-      setDeployments(await fetchSlackDeployments());
+      const [owned, shared, connections] = await Promise.all([
+        fetchSlackDeployments(),
+        fetchSharedSlackDeployments().catch(() => [] as SlackDeployment[]),
+        fetchMyConnections().catch(() => [] as MyConnection[])
+      ]);
+      setOwnedBots(owned);
+      setMyConnections(connections);
+      const ownedIds = new Set(owned.map((d) => d.id));
+      const uniqueShared = shared.filter((d) => !ownedIds.has(d.id));
+      setAllAccessibleBots([...owned, ...uniqueShared]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -62,17 +51,28 @@ export function ChatChannelsPage(): ReactElement {
 
   useEffect(() => { void load(); }, []);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("slack_identity") === "true") {
+      setSuccessBanner("You are now connected. Message the bot in Slack to get started.");
+      window.history.replaceState({}, "", window.location.pathname);
+      void load();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function removeDeployment(item: SlackDeployment): Promise<void> {
     if (!window.confirm(`Delete "${item.deploymentName}"? This cannot be undone.`)) return;
     try {
       await deleteSlackDeployment(item.id);
-      setDeployments((prev) => prev.filter((d) => d.id !== item.id));
+      setOwnedBots((prev) => prev.filter((d) => d.id !== item.id));
+      setAllAccessibleBots((prev) => prev.filter((d) => d.id !== item.id));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }
 
-  const hasSlack = deployments.length > 0;
+  const connectionMap = new Map(myConnections.map((c) => [c.deploymentId, c]));
 
   return (
     <div className="cc-page">
@@ -82,15 +82,14 @@ export function ChatChannelsPage(): ReactElement {
           <p className="cc-eyebrow">Integrations</p>
           <h1 className="cc-page-title">Chat Channels</h1>
           <p className="cc-page-subtitle">
-            Connect your knowledge bases to Slack and other messaging platforms.
-            Telegram and Google Chat are coming soon.
+            Create and manage Slack bots, then link your Slack identity to start chatting with your knowledge bases.
           </p>
         </div>
         <div className="cc-header-actions">
           <button
             type="button"
             className="cc-btn-secondary"
-            onClick={() => load()}
+            onClick={() => void load()}
             disabled={loading}
           >
             ↻ Refresh
@@ -98,59 +97,33 @@ export function ChatChannelsPage(): ReactElement {
         </div>
       </div>
 
+      {successBanner && (
+        <div style={{ background: "#f0fdf4", border: "1px solid #6ee7b7", borderRadius: 8, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span style={{ color: "#065f46", fontWeight: 600 }}>✓ {successBanner}</span>
+          <button type="button" className="ops-btn ops-btn-sm ops-btn-ghost" onClick={() => setSuccessBanner(null)}>✕</button>
+        </div>
+      )}
       {error ? <p className="cc-error">{error}</p> : null}
 
-      {/* ── Platform cards ───────────────────────────────────────────── */}
-      <div className="cc-platform-grid">
-        {CHANNEL_PLATFORMS.map((platform) => (
-          <div key={platform.key} className="cc-platform-card">
-            <div className="cc-platform-card-top">
-              <PlatformIcon platform={platform.key} />
-              <span className={`cc-status-badge cc-status-${platform.status}`}>
-                {platform.status === "live"
-                  ? (hasSlack ? "Connected" : "Not connected")
-                  : "Coming soon"}
-              </span>
-            </div>
-            <h3 className="cc-platform-name">{platform.label}</h3>
-            <p className="cc-platform-desc">{platform.desc}</p>
-            {platform.status === "live" ? (
-              <button
-                type="button"
-                className="cc-platform-action"
-                onClick={() => setModalDeployment(null)}
-              >
-                {hasSlack ? "Manage" : "Connect"}
-              </button>
-            ) : (
-              <button type="button" className="cc-platform-action cc-platform-action-muted" disabled>
-                Notify me
-              </button>
-            )}
-          </div>
-        ))}
-      </div>
-
-      {/* ── Connected bots table ──────────────────────────────────────── */}
+      {/* ══ SECTION 1 — BOT MANAGEMENT ══════════════════════════════════ */}
       <div className="cc-bots-section">
         <div className="cc-bots-header">
           <div>
-            <h2 className="cc-bots-title">Connected bots</h2>
-            <p className="cc-bots-subtitle">Manage installations, audiences, and KB bindings.</p>
+            <h2 className="cc-bots-title">My Bots</h2>
+            <p className="cc-bots-subtitle">Bots you own — create, configure, share, and manage.</p>
           </div>
+          <button type="button" className="cc-btn-primary" onClick={() => setModalDeployment(null)}>
+            + Create a bot
+          </button>
         </div>
 
         {loading ? (
-          <p className="cc-loading">Loading deployments…</p>
-        ) : deployments.length === 0 ? (
+          <p className="cc-loading">Loading…</p>
+        ) : ownedBots.length === 0 ? (
           <div className="cc-bots-empty">
-            <p>No Slack bots connected yet.</p>
-            <button
-              type="button"
-              className="cc-btn-primary"
-              onClick={() => setModalDeployment(null)}
-            >
-              + Connect Slack
+            <p>No bots created yet.</p>
+            <button type="button" className="cc-btn-primary" onClick={() => setModalDeployment(null)}>
+              + Create a bot
             </button>
           </div>
         ) : (
@@ -161,22 +134,28 @@ export function ChatChannelsPage(): ReactElement {
                   <th className="cc-th-bot">Bot</th>
                   <th className="cc-th-status">Status</th>
                   <th className="cc-th-install">Install</th>
+                  <th className="cc-th-access">Access Mode</th>
                   <th className="cc-th-knowledge">Knowledge</th>
                   <th className="cc-th-actions">Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {deployments.map((deployment) => (
+                {ownedBots.map((deployment) => (
                   <SlackDeploymentCard
                     key={deployment.id}
                     deployment={deployment}
+                    isOwner={true}
+                    onView={(item) => setViewDeployment(item)}
                     onEdit={(item) => setModalDeployment(item)}
+                    onMembers={(item) => setMembersDeployment(item)}
                     onDeactivate={(item) =>
                       deactivateSlackDeployment(item.id)
                         .then(load)
                         .catch((err) => setError(err instanceof Error ? err.message : String(err)))
                     }
-                    onDelete={(item) => removeDeployment(item).catch((err) => setError(err instanceof Error ? err.message : String(err)))}
+                    onDelete={(item) =>
+                      removeDeployment(item).catch((err) => setError(err instanceof Error ? err.message : String(err)))
+                    }
                   />
                 ))}
               </tbody>
@@ -185,44 +164,85 @@ export function ChatChannelsPage(): ReactElement {
         )}
       </div>
 
-      {/* ── CTA banner + Security panel ──────────────────────────────── */}
-      <div className="cc-bottom-grid">
-        <div className="cc-cta-banner">
-          <span className="cc-cta-badge">✦ New</span>
-          <h2 className="cc-cta-title">
-            Bring RapidRAG into <span className="cc-cta-accent">every conversation</span>
-          </h2>
-          <p className="cc-cta-body">
-            Install the Slack app, choose your knowledge bases, and your team can ask
-            questions right where they already work.
-          </p>
-          <div className="cc-cta-actions">
-            <button
-              type="button"
-              className="cc-cta-btn-primary"
-              onClick={() => setModalDeployment(null)}
-            >
-              ⊞ Add to Slack
-            </button>
-            <a href="https://rapidrag.io/docs/slack" target="_blank" rel="noreferrer" className="cc-cta-btn-ghost">
-              Read the guide →
-            </a>
+      {/* ══ SECTION 2 — MY SLACK CONNECTIONS ════════════════════════════ */}
+      <div className="cc-bots-section">
+        <div className="cc-bots-header">
+          <div>
+            <h2 className="cc-bots-title">My Slack Connections</h2>
+            <p className="cc-bots-subtitle">
+              All bots you can access — link your Slack identity to each one and choose which knowledge bases to use.
+            </p>
           </div>
         </div>
 
-        <div className="cc-security-panel">
-          <div className="cc-security-header">
-            <span className="cc-security-icon">◎</span>
-            <h3 className="cc-security-title">Security &amp; scopes</h3>
+        {loading ? (
+          <p className="cc-loading">Loading…</p>
+        ) : allAccessibleBots.length === 0 ? (
+          <div className="cc-bots-empty">
+            <p>No bots available. Create a bot above, or ask your admin to share one with you.</p>
           </div>
-          <p className="cc-security-body">
-            Bots use OAuth with the minimum scopes required:{" "}
-            <code>chat:write</code>, <code>im:history</code>, <code>users:read</code>.
-          </p>
-          <a href="https://rapidrag.io/docs/slack-permissions" target="_blank" rel="noreferrer" className="cc-security-link">
-            Review permissions →
-          </a>
-        </div>
+        ) : (
+          <div className="cc-bots-table-wrap">
+            <table className="cc-bots-table">
+              <thead>
+                <tr>
+                  <th className="cc-th-bot">Bot</th>
+                  <th className="cc-th-access">Access Mode</th>
+                  <th style={{ minWidth: 160 }}>Your Slack ID</th>
+                  <th className="cc-th-knowledge">Your KBs</th>
+                  <th className="cc-th-actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {allAccessibleBots.map((bot) => {
+                  const conn = connectionMap.get(bot.id);
+                  const linked = conn != null && !conn.slackUserId.startsWith("rapidrag:");
+                  return (
+                    <tr key={bot.id} className="cc-bot-row">
+                      <td className="cc-td-bot">
+                        <div className="cc-bot-cell-name">
+                          <span className="cc-bot-avatar">{bot.deploymentName.charAt(0).toUpperCase()}</span>
+                          <div>
+                            <strong className="cc-bot-name">{bot.deploymentName}</strong>
+                            <span className="cc-bot-meta">{bot.slackWorkspaceName ?? "Workspace not linked"}</span>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="cc-td-access">
+                        <span className={`tpl-badge ${bot.requireUserVerification ? "tpl-badge-category" : "tpl-badge-shared"}`}>
+                          {bot.requireUserVerification ? "Verified 🔒" : "Open 🌐"}
+                        </span>
+                      </td>
+                      <td>
+                        {linked ? (
+                          <code style={{ fontSize: 12 }}>{conn!.slackUserId}</code>
+                        ) : (
+                          <span style={{ color: "#d97706", fontWeight: 600, fontSize: 13 }}>Not linked</span>
+                        )}
+                      </td>
+                      <td className="cc-td-knowledge cc-bot-cell-muted">
+                        {linked && conn!.kbIds.length > 0
+                          ? conn!.kbIds.length === 1 ? "1 KB" : `${conn!.kbIds.length} KBs`
+                          : "—"}
+                      </td>
+                      <td className="cc-td-actions">
+                        <div className="cc-bot-cell-actions">
+                          <button
+                            type="button"
+                            className={linked ? "cc-bot-action" : "cc-bot-action cc-bot-action-primary"}
+                            onClick={() => setConnectToBot(bot)}
+                          >
+                            {linked ? "Update" : "Connect"}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* ── Modals / drawers ─────────────────────────────────────────── */}
@@ -230,7 +250,29 @@ export function ChatChannelsPage(): ReactElement {
         <ConnectSlackWizard
           existing={modalDeployment}
           onClose={() => setModalDeployment(undefined)}
-          onSaved={() => load()}
+          onSaved={() => { void load(); setModalDeployment(undefined); }}
+        />
+      ) : null}
+
+      {connectToBot !== null ? (
+        <ConnectSlackWizard
+          connectTo={connectToBot}
+          onClose={() => setConnectToBot(null)}
+          onSaved={() => { void load(); setConnectToBot(null); }}
+        />
+      ) : null}
+
+      {viewDeployment !== null ? (
+        <SlackDeploymentViewModal
+          deployment={viewDeployment}
+          onClose={() => setViewDeployment(null)}
+        />
+      ) : null}
+
+      {membersDeployment !== null ? (
+        <SlackMembersPanel
+          deployment={membersDeployment}
+          onClose={() => setMembersDeployment(null)}
         />
       ) : null}
     </div>

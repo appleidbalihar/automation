@@ -8,7 +8,7 @@ import { CATEGORY_ICONS, CATEGORY_LABELS } from "../prompt-templates/types";
 import type { IntegrationForm } from "./types";
 import { normalizeRepositoryInput } from "./types";
 
-type AuthMode = "choose" | "oauth" | "pat";
+type AuthMode = "oauth" | "pat";
 type OAuthStep = "provider" | "details";
 type Provider = "github" | "gitlab" | "googledrive";
 
@@ -138,7 +138,7 @@ type Props = {
 
 export function CreateSourceModal(props: Props): ReactElement | null {
   const { open, onClose, form, setForm, busy, isAdminOrUserAdmin, onSubmitPat, onSubmitOauth } = props;
-  const [mode, setMode] = useState<AuthMode>("choose");
+  const [mode, setMode] = useState<AuthMode>("oauth");
   const [oauthStep, setOauthStep] = useState<OAuthStep>("provider");
   const [oauthProvider, setOauthProvider] = useState<Provider>("github");
   const [appClientId, setAppClientId] = useState("");
@@ -166,7 +166,7 @@ export function CreateSourceModal(props: Props): ReactElement | null {
   if (!open) return null;
 
   function handleClose(): void {
-    setMode("choose");
+    setMode("oauth");
     setOauthStep("provider");
     setAppClientId("");
     setAppClientSecret("");
@@ -188,8 +188,8 @@ export function CreateSourceModal(props: Props): ReactElement | null {
     />
   ) : null;
 
-  // ── Step 0: choose auth mode ────────────────────────────────────────────────
-  if (mode === "choose") {
+  // ── OAuth Step 1: choose provider ───────────────────────────────────────────
+  if (mode === "oauth" && oauthStep === "provider") {
     return (
       <div className="ops-modal-overlay" role="presentation" onClick={handleClose}>
         <div className="ops-modal-panel ops-modal-narrow" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
@@ -197,37 +197,7 @@ export function CreateSourceModal(props: Props): ReactElement | null {
             <h2>Connect Knowledge Source</h2>
             <button type="button" className="ops-modal-close" onClick={handleClose} aria-label="Close">×</button>
           </div>
-          <p className="ops-modal-lead">How would you like to connect your source?</p>
-
-          <div className="ops-auth-choice-grid">
-            <button type="button" className="ops-auth-choice-card ops-auth-choice-oauth" onClick={() => setMode("oauth")}>
-              <span className="ops-auth-choice-icon">🔗</span>
-              <strong>Connect with OAuth</strong>
-              <span>Recommended — no manual tokens. The platform authorises directly with the provider.</span>
-              <span className="ops-auth-choice-badge">Recommended</span>
-            </button>
-
-            <button type="button" className="ops-auth-choice-card ops-auth-choice-pat" onClick={() => setMode("pat")}>
-              <span className="ops-auth-choice-icon">🔑</span>
-              <strong>Enter Token (PAT)</strong>
-              <span>For self-hosted providers or service accounts. Paste your personal access token.</span>
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ── OAuth Step 1: choose provider ───────────────────────────────────────────
-  if (mode === "oauth" && oauthStep === "provider") {
-    return (
-      <div className="ops-modal-overlay" role="presentation" onClick={handleClose}>
-        <div className="ops-modal-panel ops-modal-narrow" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
-          <div className="ops-modal-panel-header">
-            <h2>Choose Provider</h2>
-            <button type="button" className="ops-modal-close" onClick={handleClose} aria-label="Close">×</button>
-          </div>
-          <p className="ops-modal-lead">Select the source provider you want to connect via OAuth.</p>
+          <p className="ops-modal-lead">Choose your provider to get started.</p>
 
           <div className="ops-provider-grid">
             {(Object.keys(PROVIDER_META) as Provider[]).map((p) => (
@@ -247,8 +217,10 @@ export function CreateSourceModal(props: Props): ReactElement | null {
             </button>
           </div>
 
-          <div className="ops-modal-footer-nav">
-            <button type="button" className="ops-modal-back-btn" onClick={() => setMode("choose")}>← Back</button>
+          <div className="ops-modal-footer-nav" style={{ textAlign: "center", paddingTop: 8 }}>
+            <button type="button" className="ops-modal-back-btn" style={{ fontSize: "0.8rem", color: "#64748b" }} onClick={() => setMode("pat")}>
+              Use Personal Access Token (PAT) instead
+            </button>
           </div>
         </div>
       </div>
@@ -535,7 +507,7 @@ export function CreateSourceModal(props: Props): ReactElement | null {
             </label>
           </div>
           <div className="ops-modal-footer-nav-spread" style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <button type="button" className="ops-modal-back-btn" onClick={() => setMode("choose")}>← Back</button>
+            <button type="button" className="ops-modal-back-btn" onClick={() => { setMode("oauth"); setOauthStep("provider"); }}>← Back</button>
             <button type="button" className="integrations-primary-button sync-btn-ready" onClick={() => void onSubmitPat()} disabled={busy || (isAdminOrUserAdmin && !form.templateId)}>
               {busy ? "Saving…" : "Connect Source"}
             </button>

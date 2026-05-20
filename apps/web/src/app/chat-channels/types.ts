@@ -2,14 +2,16 @@ import type {
   ChannelChatHistoryResponse,
   ChannelChatThreadSummary,
   SlackDeployment,
-  SlackDeploymentActivateRequest
+  SlackDeploymentActivateRequest,
+  SlackUserKbMapping
 } from "@platform/contracts";
 
 export type {
   ChannelChatHistoryResponse,
   ChannelChatThreadSummary,
   SlackDeployment,
-  SlackDeploymentActivateRequest
+  SlackDeploymentActivateRequest,
+  SlackUserKbMapping
 };
 
 export interface RagKnowledgeBaseOption {

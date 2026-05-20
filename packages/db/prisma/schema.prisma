@@ -216,28 +216,51 @@ model RagChannelDeployment {
 }
 
 model SlackDeployment {
-  id                  String   @id @default(cuid())
-  ownerId             String
-  deploymentName      String
-  installMode         String   @default("oauth") // "oauth" | "manual"
-  slackWorkspaceId    String?
-  slackWorkspaceName  String?
-  slackBotUserId      String?
-  slackChannelId      String?
-  slackChannelName    String?
-  status              String   @default("pending") // "pending" | "active" | "error" | "disabled"
-  accessMode          String   @default("channel") // "channel" | "allowlist"
-  allowedSlackUserIds String[] @default([])
-  errorMessage        String?
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  id                      String   @id @default(cuid())
+  ownerId                 String
+  deploymentName          String
+  installMode             String   @default("oauth") // "oauth" | "manual"
+  slackWorkspaceId        String?
+  slackWorkspaceName      String?
+  slackBotUserId          String?
+  slackChannelId          String?
+  slackChannelName        String?
+  status                  String   @default("pending") // "pending" | "active" | "error" | "disabled"
+  accessMode              String   @default("channel") // "channel" | "allowlist" (legacy, kept for migration)
+  allowedSlackUserIds     String[] @default([])
+  shareScope              String   @default("private") // "private" | "all" | "specific"
+  sharedWithUserIds       String[] @default([])        // rapidrag userIds
+  requireUserVerification Boolean  @default(true)      // false = open access; any Slack user gets defaultKbIds
+  defaultKbIds            String[] @default([])        // KBs served in open-access mode
+  errorMessage            String?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 
   kbMappings     SlackDeploymentKb[]
+  userMappings   SlackUserKbMapping[]
   channelThreads ChannelChatThread[]
 
   @@index([ownerId])
   @@index([slackWorkspaceId])
   @@index([status])
+  @@index([shareScope])
+}
+
+model SlackUserKbMapping {
+  id               String          @id @default(cuid())
+  deploymentId     String
+  deployment       SlackDeployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  rapidragUserId   String?
+  rapidragUsername String?
+  slackUserId      String
+  kbIds            String[]        @default([])
+  status           String          @default("connected") // "connected" | "pending" | "disconnected"
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@unique([deploymentId, slackUserId])
+  @@index([deploymentId])
+  @@index([rapidragUserId])
 }
 
 model SlackDeploymentKb {

@@ -62,8 +62,8 @@ The authenticated platform UI lives at `https://<host>:3443` under these routes:
 | `/knowledge-connector` | Source and knowledge base management | admin, useradmin, operator |
 | `/rag-assistant` | Dify-backed RAG chat | All roles |
 | `/profile` | User profile and password change | All roles |
-| `/ai-agent-prompt` | Reusable system prompt templates | admin, useradmin |
-| `/chat-channels` | Slack chat-channel deployments and history | admin, useradmin |
+| `/ai-agent-prompt` | Reusable system prompt templates (shown as "AI Agent" in sidebar) | admin, useradmin |
+| `/chat-channels` | Slack bot deployments — create, share, members, history | admin, useradmin |
 | `/rag-stats` | RAG response timing and usage stats | admin only |
 | `/logs` | Platform log explorer | admin only |
 | `/users` | User management | admin, useradmin |
@@ -108,8 +108,9 @@ The platform database schema (`packages/db/prisma/schema.prisma`) contains these
 | `RagKbFileTracker` | Per-file SHA hash and Dify document ID for incremental sync |
 | `RagKbSyncJob` | Sync job lifecycle, steps, progress, and error state |
 | `RagChannelDeployment` | Channel deployment metadata |
-| `SlackDeployment` | Direct Slack bot deployment metadata |
-| `SlackDeploymentKb` | Slack deployment to knowledge-base mappings |
+| `SlackDeployment` | Slack bot deployment: share scope, access mode (verified/open), default KBs, workspace metadata |
+| `SlackDeploymentKb` | Deployment-level KB mappings (used in open-access mode and `/kb` command routing) |
+| `SlackUserKbMapping` | Per-user: Slack user ID → KB list for verified-mode deployments. Synthetic `rapidrag:{ownerId}` placeholder until owner links real Slack ID via identity OAuth |
 | `ChannelChatThread` | Generic external-channel chat threads |
 | `ChannelChatMessage` | Messages for external-channel chat threads |
 | `ChannelChatKbSession` | Per-KB Dify conversation IDs for external-channel threads |
@@ -161,25 +162,27 @@ Discussion threads are private to the user who created them. Sharing a KB grants
 Slack Chat Channels use a direct real-time path instead of n8n:
 
 ```text
-Slack → /rapidrag/api/slack/events → api-gateway raw proxy → workflow-service
-  ↓
-Slack signature verification + deployment resolution
-  ↓
-Dify chat API
-  ↓
-Slack response_url or chat.postMessage
+Slack DM or /kb slash command
+  → /api/slack/events/<deploymentId>
+  → api-gateway raw proxy
+  → workflow-service: signing secret verified (Redis 2-hour cache)
+  → 200 "Working on it..." sent immediately (slash commands)
+  → RAG query runs async → Dify
+  → reply via response_url (slash) or chat.postMessage (DM)
 ```
 
-OAuth installs use the platform-owned RapidRAG Bot and resolve deployments by Slack workspace. Manual installs use customer-owned Slack apps and deployment-specific webhook URLs. Per-user bot conversation context is stored in the generic `ChannelChatThread` tables so later Telegram and Google Chat integrations can reuse the same history shape. Slack channels are not required in Phase 1.
+All bots use the Advanced (manual) form — no hardcoded platform bot. Admins create bots and share them with `shareScope = "all"`. Each user links their Slack identity via OAuth (`user_scope=openid,profile`) to get their own KB mapping. The Chat Channels page has two sections: **My Bots** (owned, full CRUD) and **My Slack Connections** (all accessible bots with personal Slack ID linkage status).
 
-The OAuth callback also stays under the RapidRAG URL space:
+The OAuth callback handles two purposes via a peek-and-branch pattern:
 
 ```text
-Slack OAuth → /rapidrag/api/slack/oauth/callback → api-gateway → workflow-service
-workflow-service → 302 /rapidrag/chat-channels?... → browser
+purpose = "install"  → bot install, store bot_token in Vault
+purpose = "identity" → user identity, upsert SlackUserKbMapping with real Slack user ID
 ```
 
-api-gateway must preserve that upstream redirect instead of following it server-side.
+Both redirect back to `/chat-channels` with query params for the UI to show appropriate banners.
+
+Redis caches `signing_secret` (2 h) and `bot_token` (1 h) per deployment. Both keys are deleted immediately on any bot update, deactivate, or delete.
 
 Developer details: `docs/developer/slack-chat-channel.md`.
 Operations runbook: `docs/operations/slack-chat-channel.md`.

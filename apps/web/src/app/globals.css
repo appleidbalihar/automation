@@ -2229,17 +2229,18 @@ a {
 
 .ops-dify-mini-bar-wrap {
   position: relative;
-  height: 6px;
-  background: #e5e7eb;
-  border-radius: 4px;
+  height: 14px;
+  background: #d1fae5;
+  border-radius: 8px;
   overflow: hidden;
-  max-width: 320px;
+  max-width: 400px;
+  border: 1px solid #6ee7b7;
 }
 
 .ops-dify-mini-bar-fill {
   height: 100%;
-  background: #10b981;
-  border-radius: 4px;
+  background: linear-gradient(90deg, #10b981, #059669);
+  border-radius: 8px;
   transition: width 1s ease;
 }
 
@@ -2258,14 +2259,13 @@ a {
   inset: 0;
   display: flex;
   align-items: center;
-  padding-left: 6px;
-  font-size: 10px;
-  font-weight: 600;
-  color: #111827;
+  padding-left: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #065f46;
   white-space: nowrap;
   pointer-events: none;
   line-height: 1;
-  top: 8px;
 }
 
 .ops-dify-stats-row {

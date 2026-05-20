@@ -2,135 +2,294 @@
 
 ## Request Flow
 
-Slack Phase 1 is bot-first and direct-to-workflow-service, not n8n:
+Slack is bot-first and direct-to-workflow-service, not n8n:
 
 ```text
-Slack DM or /kb
-  → nginx /rapidrag/api/slack/events or /rapidrag/api/slack/events/<deploymentId>
+Slack DM or /kb slash command
+  → nginx /api/slack/events/<deploymentId>
   → api-gateway raw proxy
-  → workflow-service signature verification
-  → Dify
-  → Slack reply
+  → workflow-service: signing secret verification (Redis-cached)
+  → routing decision (open access vs verified)
+  → Dify chat API (async, after 200 reply)
+  → Slack reply via response_url (slash commands) or chat.postMessage (DMs)
 ```
 
-OAuth installs use the platform-owned RapidRAG Bot and the global `/rapidrag/api/slack/events` URL. The workflow-service resolves the active deployment by Slack `team_id` for the installed workspace.
+All bots use the Advanced (manual) form. There is no hardcoded platform RapidRAG Bot OAuth flow — platform admins create bots via the same wizard as everyone else and share them with all users via `shareScope = "all"`.
 
-Manual installs use a customer-owned Slack app, such as `eclass-bot`, and the deployment-specific `/rapidrag/api/slack/events/<deploymentId>` URL. The Slack branding is the customer's bot, but the backend remains RapidRAG.
+---
 
-Shared-channel support is postponed. Channel IDs may still exist in older rows, but Phase 1 does not require or resolve deployments by channel.
+## Deployment Model
 
-## OAuth Install
+Each `SlackDeployment` row has:
 
-`GET /slack/oauth/connect?deploymentId=...` creates a signed state with deployment ID, owner ID, nonce, and expiry. The nonce is stored in Redis with a 10 minute TTL.
+| Field | Purpose |
+|-------|---------|
+| `shareScope` | `"private"` / `"all"` / `"specific"` — who can see this bot in My Slack Connections |
+| `sharedWithUserIds` | rapidrag userIds when `shareScope = "specific"` |
+| `requireUserVerification` | `true` = per-user KB isolation; `false` = open access |
+| `defaultKbIds` | KBs served to all Slack users in open-access mode |
 
-`GET /slack/oauth/callback` validates the signed state, consumes the Redis nonce once, exchanges the Slack code with `oauth.v2.access`, stores the bot token in Vault, copies the platform signing secret into the deployment Vault path, and updates `SlackDeployment` workspace/bot metadata.
+---
 
-The public callback URL is `/rapidrag/api/slack/oauth/callback`, which nginx rewrites to api-gateway `/slack/oauth/callback`. api-gateway proxies the request to workflow-service with `redirect: "manual"` so workflow-service can return a browser redirect back to `/rapidrag/chat-channels`.
+## Message Routing
 
-Keep this redirect pass-through explicit:
+When a Slack webhook event arrives:
 
-```typescript
-const response = await tlsFetch(tlsRuntime, url, { ...init, redirect: "manual" });
-const location = response.headers.get("location");
-reply.redirect(location, response.status);
+1. Fetch signing secret from Redis (2-hour cache) or Vault on first hit.
+2. Signature verification: `HMAC-SHA256("v0:{timestamp}:{rawBody}", signing_secret)` — requests older than 5 minutes are rejected.
+3. Deduplication via Redis: events by `event_id`, slash commands by `sha256(team+user+command+text+ts)`.
+4. Deployment lookup by `deploymentId` path param (manual) or `team_id` (OAuth-style).
+5. **Slash commands**: send `200 { response_type: "ephemeral", text: "Working on it..." }` immediately, then process asynchronously.
+6. **Open access** (`requireUserVerification = false`): serve `deployment.defaultKbIds` to any Slack user.
+7. **Verified** (`requireUserVerification = true`): look up `SlackUserKbMapping` where `deploymentId = deployment.id AND slackUserId = userId AND status = "connected"`. If not found, reply "not connected". If found, use `userMapping.kbIds`.
+8. Pass resolved KB IDs to `handleSlackMessage()`, which bypasses deployment-level `kbMappings`.
+
+Access control is 100% internal — Slack delivers all messages regardless of user. RapidRAG routes based on the `user_id` in every Slack event.
+
+---
+
+## Data Models
+
+### SlackDeployment
+
+```prisma
+model SlackDeployment {
+  id                      String   @id
+  deploymentName          String
+  installMode             String   // "manual" | "oauth"
+  ownerId                 String
+  status                  String   // "pending" | "active" | "disabled" | "error"
+  shareScope              String   @default("private")   // "private" | "all" | "specific"
+  sharedWithUserIds       String[] @default([])
+  requireUserVerification Boolean  @default(true)
+  defaultKbIds            String[] @default([])          // open-access mode KBs
+  slackWorkspaceId        String?
+  slackWorkspaceName      String?
+  slackBotUserId          String?
+  kbMappings              SlackDeploymentKb[]
+}
 ```
 
-Do not let api-gateway follow the workflow-service redirect internally. If it follows the redirect, the gateway may request a UI route from workflow-service and the browser can see a false 502/404 even though the Slack token was already stored successfully.
+### SlackUserKbMapping
 
-The RapidRAG Bot requires these scopes:
+Per-user Slack ID → KB mapping for verified-mode deployments:
 
-```text
-chat:write
-commands
-im:history
+```prisma
+model SlackUserKbMapping {
+  id               String   @id @default(cuid())
+  deploymentId     String
+  deployment       SlackDeployment @relation(fields: [deploymentId], references: [id])
+  rapidragUserId   String?
+  rapidragUsername String?
+  slackUserId      String          // real Slack U_XXXXXXX — or "rapidrag:{ownerId}" placeholder
+  kbIds            String[]
+  status           String   @default("connected")  // "connected" | "pending"
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([deploymentId, slackUserId])
+}
 ```
 
-These are `OAuth & Permissions` -> `Scopes` -> `Bot Token Scopes`. Do not use Slack `App-Level Tokens` for this flow.
+**Synthetic placeholder**: on activation in verified mode, the activate endpoint creates a `SlackUserKbMapping` with `slackUserId = "rapidrag:{ownerId}"` and `status = "pending"`. This marks the owner as needing to link their real Slack ID. The Members panel detects entries where `slackUserId.startsWith("rapidrag:")` and shows "Not linked" (amber badge) instead of displaying the synthetic ID. When the owner completes Slack identity OAuth, the callback upserts their real Slack user ID and deletes the synthetic placeholder.
 
-## Own Company Bot Manual Setup
+---
 
-For a customer-owned bot:
+## API Endpoints (workflow-service)
 
-1. The user creates a Slack app from `api.slack.com/apps`.
-2. The user adds the required bot scopes under `OAuth & Permissions` -> `Bot Token Scopes`.
-3. The user enables `App Home` -> `Messages Tab` and checks `Allow users to send Slash commands and messages from the messages tab`.
-4. The user configures Event Subscriptions with the deployment webhook URL.
-5. After Slack shows `Verified`, the user clicks `Add Bot User Event`, adds `message.im`, and clicks `Save Changes`.
-6. The user creates the `/kb` slash command with the same URL, short description `Query RapidRAG knowledge bases`, and usage hint `[list | use <name> | all | status | help]`.
-7. The user installs the Slack app.
-8. The user copies the Bot User OAuth Token from `OAuth & Permissions`.
-9. The user copies the Signing Secret from `Basic Information`.
-10. RapidRAG validates the token with Slack `auth.test` and stores both secrets in Vault.
+### Deployment management
 
-`/kb` is a RapidRAG platform command, not a per-bot custom command. Every bot should use the same command name and subcommands. If the command contract changes, update `handleSlackCommand()`, the shared usage hint, the Chat Channels wizard, and the Slack app setup docs together.
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/slack/deployments` | any role | List owned deployments |
+| `POST` | `/slack/deployments` | any role | Create deployment |
+| `PUT` | `/slack/deployments/:id` | owner | Update settings; clears Redis token cache |
+| `DELETE` | `/slack/deployments/:id` | owner | Delete deployment; clears Redis token cache |
+| `POST` | `/slack/deployments/:id/activate` | owner | Activate with credentials; clears Redis token cache |
+| `POST` | `/slack/deployments/:id/deactivate` | owner | Deactivate; clears Redis token cache |
 
-## Allowlist Onboarding
+### Member management
 
-Allowlist access is enforced only by RapidRAG when Slack sends a DM or slash-command event. Adding a Slack user ID to `allowedSlackUserIds` does not notify Slack and does not invite the user to anything.
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/slack/deployments/shared` | any role | List deployments shared with user |
+| `GET` | `/slack/deployments/member-of` | any role | List deployments where user has a real (non-synthetic) SlackUserKbMapping |
+| `GET` | `/slack/deployments/my-connections` | any role | List user's own SlackUserKbMapping entries (excludes synthetic `rapidrag:` entries) |
+| `GET` | `/slack/deployments/:id/members` | owner | List all SlackUserKbMapping rows for a deployment |
+| `POST` | `/slack/deployments/:id/members` | owner | Manually add a member |
+| `DELETE` | `/slack/deployments/:id/members/:slackUserId` | owner | Remove a member |
+| `POST` | `/slack/deployments/:id/members/self` | any role | Self-register Slack ID + KBs |
 
-The Chat Channels UI therefore provides copyable user instructions for admins. The copied message tells the Slack user to find the bot, open a DM, run `/kb list`, optionally run `/kb use <name>`, and reply with their Slack member ID if authorization fails. For platform OAuth installs the bot name is `RapidRAG Bot`; for customer-owned manual installs the message uses the deployment name.
+### OAuth helpers
 
-Future enhancements may add Slack user lookup or automated notification, but that would require additional Slack scopes and product approval.
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/slack/deployments/:id/members/self/oauth` | any role | Get Slack identity OAuth URL (`user_scope=openid,profile`) for linking Slack ID |
+| `GET` | `/slack/deployments/:id/install-url` | any role | Get Slack bot install OAuth URL for adding the app to a workspace |
+| `GET` | `/slack/oauth/connect` | owner | Start bot install OAuth (deprecated in favour of install-url) |
+| `GET` | `/slack/oauth/callback` | public | OAuth callback — handles both `purpose: "install"` and `purpose: "identity"` |
+| `POST` | `/slack/validate-token` | any role | Validate a bot token against Slack auth.test |
 
-## Secrets
+All endpoints above are proxied through api-gateway.
 
-Per-deployment secrets:
+---
+
+## Activate Endpoint
+
+`POST /slack/deployments/:id/activate` accepts:
+
+```ts
+{
+  botToken: string;         // required
+  signingSecret: string;    // required
+  clientId: string;         // required — enables install-url and identity OAuth
+  clientSecret: string;     // required — enables install-url and identity OAuth
+  knowledgeBaseIds: string[];        // owner's KBs (verified mode)
+  defaultKbIds?: string[];           // KBs for open-access mode
+  requireUserVerification?: boolean; // default: true
+  shareScope?: "private" | "all" | "specific";
+  sharedWithUserIds?: string[];
+}
+```
+
+`clientId` and `clientSecret` are required in the activation form. Without them, users cannot install the bot to their Slack workspace and the identity OAuth flow is unavailable.
+
+In verified mode, activate auto-creates a `SlackUserKbMapping` entry for the owner with `slackUserId = "rapidrag:{ownerId}"` (synthetic placeholder, status `"pending"`). This disappears from the Members panel "Not linked" state once the owner completes Slack identity OAuth.
+
+---
+
+## Slack Identity OAuth Flow
+
+When a user wants to link their Slack identity to a bot:
+
+1. Frontend calls `GET /slack/deployments/:id/members/self/oauth?kbIds=id1,id2`.
+2. Workflow-service reads `client_id` + `client_secret` from Vault.
+3. Builds Slack OAuth URL with `user_scope=openid,profile` (no bot `scope`).
+4. Signs state: `{ purpose: "identity", deploymentId, rapidragUserId, kbIds, nonce, redirectUri, exp }`.
+5. Stores nonce in Redis (`slack:oauth:identity:{nonce}` EX 600).
+6. Returns `{ oauthAvailable: true, url }`.
+7. Frontend redirects: `window.location.href = url`.
+8. Slack identity OAuth completes → callback at `/slack/oauth/callback`.
+9. Callback peeks state `purpose`, loads per-deployment secrets, verifies signature.
+10. Extracts `authed_user.id` from Slack response.
+11. Upserts `SlackUserKbMapping` with real Slack user ID + status `"connected"`.
+12. Deletes synthetic `rapidrag:{ownerId}` placeholder if present.
+13. Redirects to `/chat-channels?slack_identity=true`.
+14. Frontend shows green success banner, reloads data.
+
+---
+
+## Bot Install OAuth Flow
+
+When a user needs to install the bot app to their Slack workspace:
+
+1. Frontend calls `GET /slack/deployments/:id/install-url`.
+2. Workflow-service reads `client_id` from Vault.
+3. Builds Slack OAuth URL with `scope=chat:write,im:history,users:read,commands`.
+4. Returns `{ installAvailable: true, url, botUserId }`.
+5. Frontend opens URL in new tab or redirects.
+
+---
+
+## OAuth Callback — Peek-and-Branch Pattern
+
+The single `/slack/oauth/callback` handler supports multiple purposes. It decodes the state JWT **without verifying** first to read `purpose`, then loads the correct secrets and verifies:
+
+```ts
+// Peek without verifying
+const [encoded] = state.split(".");
+const peeked = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+const purpose = peeked.purpose; // "identity" | "install" | undefined
+
+if (purpose === "identity") {
+  // Load per-deployment secrets, verify state, upsert SlackUserKbMapping
+} else if (purpose === "install") {
+  // Load per-deployment secrets, verify state, store bot_token in Vault
+} else {
+  // Legacy global-secret flow
+}
+```
+
+---
+
+## Secrets and Caching
+
+### Vault paths (per-deployment)
 
 ```text
 platform/users/{ownerId}/slack/{deploymentId}/bot_token
 platform/users/{ownerId}/slack/{deploymentId}/signing_secret
+platform/users/{ownerId}/slack/{deploymentId}/client_id
+platform/users/{ownerId}/slack/{deploymentId}/client_secret
 ```
 
-Platform OAuth app secrets:
+### Redis cache
 
-```text
-platform/global/slack/oauth/client_id
-platform/global/slack/oauth/client_secret
-platform/global/slack/oauth/signing_secret
-```
+| Key | TTL | Purpose |
+|-----|-----|---------|
+| `slack:signing_secret:{deploymentId}` | 2 hours | Avoids Vault hit on every inbound message |
+| `slack:bot_token:{deploymentId}` | 1 hour | Avoids Vault hit on every DM reply |
 
-## Signature Verification
+**Cache invalidation**: `clearSlackDeploymentCache(deploymentId)` deletes both keys and is called on every `activate`, `PUT`, `deactivate`, and `DELETE` operation. Secrets in Vault are always the source of truth; Redis is a performance layer only.
 
-The api-gateway captures and forwards the exact raw request body bytes. The workflow-service verifies Slack signatures with:
+### When each secret is used
 
-```text
-v0:{X-Slack-Request-Timestamp}:{rawBody}
-```
+| Secret | Used for | Frequency |
+|--------|----------|-----------|
+| `signing_secret` | Verify HMAC-SHA256 signature of every inbound Slack request | Every message |
+| `bot_token` | `chat.postMessage` API calls for DM replies | Only for DMs (slash commands use `response_url`) |
+| `client_id` / `client_secret` | Build Slack OAuth URLs for bot install and identity linking | On demand |
 
-Requests older than 5 minutes or with invalid signatures are rejected before Dify work.
+---
+
+## Slash Command Timeout Fix
+
+Slack requires a response within 3 seconds for slash commands. The handler:
+
+1. Fetches deployment + signing secret **in parallel** (parallel Promise.all).
+2. Signing secret is read from Redis cache (2-hour TTL) — Vault only on cache miss.
+3. Sends `200 { response_type: "ephemeral", text: "Working on it..." }` immediately after signature verification.
+4. Runs RAG query + posts answer asynchronously via `response_url`.
+
+---
+
+## Dify App 404 Auto-Recovery
+
+If a Dify app is deleted (stale `app_id` in Vault), the sync `configureDifyApp` call returns 404. The recovery logic:
+
+1. Catches the `:404:` error from `configureDifyApp`.
+2. Makes a GET request to `/apps/{appId}` to confirm the app is truly gone.
+3. If confirmed missing → creates a new Dify app, retries `configureDifyApp`, continues sync.
+4. If app exists (transient Dify outage) → re-throws the error; does **not** recreate.
+5. On network error during the confirmation check → assumes app exists (fail-safe), re-throws.
+
+---
 
 ## Deduplication
 
-Events API deliveries are deduped by Slack `event_id`:
+- Events: `SET slack:event:{event_id} "1" NX EX 300`
+- Slash commands: `SET slack:command:{sha256(team+user+command+text+ts)} "1" NX EX 300`
 
-```text
-SET slack:event:{event_id} "1" NX EX 300
-```
+If Redis is unavailable, the service processes the request without dedup so users still get a reply.
 
-Slash commands are deduped by a SHA-256 hash of team, user, command, text, and Slack request timestamp. User text is not stored in Redis keys.
+---
 
-If Redis is unavailable, the service logs a warning and processes the request so Slack users still get a reply.
+## Dify Thread Continuity
 
-## Dify Flow
+`ChannelChatThread` uses external key `{teamId}#{userId}` for per-user conversation continuity. Each active KB has a `ChannelChatKbSession` with a Dify `conversation_id`. The message handler passes `userKbIds` to scope which KBs are queried. After repeated Dify failures the deployment is marked `error` for admin visibility.
 
-Slack user context is stored in `ChannelChatThread` using an external key of:
+---
 
-```text
-{teamId}#{userId}
-```
+## Bot Setup Checklist (Developer Summary)
 
-Each active KB has a `ChannelChatKbSession` carrying the Dify `conversation_id`.
-
-The Slack message handler reuses:
-
-- `sendToDify()`
-- `formatMultiKnowledgeBaseAnswer()`
-- `readVaultKv()` / `writeVaultKv()`
-
-If all KB calls fail, Slack receives:
-
-```text
-Sorry, I couldn't reach the knowledge base right now. Please try again in a moment.
-```
-
-After repeated failures, the deployment is marked `error` for admin visibility.
+1. Create Slack app at `api.slack.com/apps`.
+2. Add **Bot Token Scopes**: `chat:write`, `commands`, `im:history`.
+3. Add **User Token Scopes**: `openid`, `profile` (enables Slack identity OAuth for users).
+4. Enable **App Home → Messages Tab** + allow slash commands from messages tab.
+5. Add **Redirect URL**: `https://<domain>/api/slack/oauth/callback`.
+6. Enable **Event Subscriptions** → set Request URL to `https://<domain>/api/slack/events/<deploymentId>`.
+7. Subscribe to bot event: `message.im`.
+8. Configure slash command `/kb` with the same Request URL.
+9. Install app to workspace.
+10. Copy Bot User OAuth Token, Signing Secret, Client ID, Client Secret.
+11. Activate via RapidRAG Chat Channels UI.

@@ -6,6 +6,7 @@ import type {
   SlackDeployment,
   SlackDeploymentActivateRequest
 } from "./types";
+import type { SlackUserKbMapping } from "@platform/contracts";
 
 type Method = "GET" | "POST" | "PUT" | "DELETE";
 
@@ -28,8 +29,8 @@ export function fetchSlackDeployments(): Promise<SlackDeployment[]> {
   return requestJson<SlackDeployment[]>("/slack/deployments");
 }
 
-export function createSlackDeployment(deploymentName: string, installMode: "oauth" | "manual" = "oauth"): Promise<SlackDeployment> {
-  return requestJson<SlackDeployment>("/slack/deployments", "POST", { deploymentName, installMode });
+export function createSlackDeployment(deploymentName: string, installMode: "oauth" | "manual" = "oauth", id?: string): Promise<SlackDeployment> {
+  return requestJson<SlackDeployment>("/slack/deployments", "POST", { deploymentName, installMode, ...(id ? { id } : {}) });
 }
 
 export function startSlackOAuthConnect(deploymentId: string): Promise<{ url: string }> {
@@ -72,4 +73,47 @@ export function clearAllChannelHistory(deploymentId: string): Promise<{ deleted:
 
 export function fetchKnowledgeBases(): Promise<RagKnowledgeBaseOption[]> {
   return requestJson<RagKnowledgeBaseOption[]>("/rag/knowledge-bases");
+}
+
+export function fetchSharedSlackDeployments(): Promise<SlackDeployment[]> {
+  return requestJson<SlackDeployment[]>("/slack/deployments/shared");
+}
+
+export function fetchMemberOfDeployments(): Promise<SlackDeployment[]> {
+  return requestJson<SlackDeployment[]>("/slack/deployments/member-of");
+}
+
+export function fetchMyConnections(): Promise<Array<{ deploymentId: string; slackUserId: string; kbIds: string[]; status: string }>> {
+  return requestJson("/slack/deployments/my-connections");
+}
+
+export function getSlackIdentityOAuthUrl(deploymentId: string, kbIds: string[]): Promise<{ oauthAvailable: boolean; url?: string }> {
+  const params = new URLSearchParams({ kbIds: kbIds.join(",") });
+  return requestJson(`/slack/deployments/${deploymentId}/members/self/oauth?${params}`);
+}
+
+export function getSlackInstallUrl(deploymentId: string): Promise<{ installAvailable: boolean; url?: string; botUserId?: string }> {
+  return requestJson(`/slack/deployments/${deploymentId}/install-url`);
+}
+
+export function fetchDeploymentMembers(deploymentId: string): Promise<SlackUserKbMapping[]> {
+  return requestJson<SlackUserKbMapping[]>(`/slack/deployments/${deploymentId}/members`);
+}
+
+export function addDeploymentMember(
+  deploymentId: string,
+  member: { slackUserId: string; rapidragUserId?: string; rapidragUsername?: string; kbIds?: string[] }
+): Promise<SlackUserKbMapping> {
+  return requestJson<SlackUserKbMapping>(`/slack/deployments/${deploymentId}/members`, "POST", member);
+}
+
+export function removeDeploymentMember(deploymentId: string, slackUserId: string): Promise<{ deleted: boolean }> {
+  return requestJson(`/slack/deployments/${deploymentId}/members/${encodeURIComponent(slackUserId)}`, "DELETE");
+}
+
+export function selfRegisterSlackMember(
+  deploymentId: string,
+  body: { slackUserId: string; kbIds?: string[] }
+): Promise<SlackUserKbMapping> {
+  return requestJson<SlackUserKbMapping>(`/slack/deployments/${deploymentId}/members/self`, "POST", body);
 }

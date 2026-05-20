@@ -8,11 +8,12 @@ import { createTemplate, generateTemplatePrompt, updateTemplate } from "./api";
 type Props = {
   template: PromptTemplate | null;
   isAdmin: boolean;
+  readOnly?: boolean;
   onClose: () => void;
   onSaved: (t: PromptTemplate) => void;
 };
 
-export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Props): ReactElement {
+export function TemplateEditorModal({ template, isAdmin, readOnly, onClose, onSaved }: Props): ReactElement {
   const isEdit = template !== null;
   const [form, setForm] = useState<TemplateFormState>(() =>
     isEdit
@@ -75,19 +76,20 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
     <div className="ops-modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="ops-modal-panel" style={{ maxWidth: 700 }}>
         <div className="ops-modal-panel-header">
-          <h2>{isEdit ? "Edit Template" : "New Prompt Template"}</h2>
+          <h2>{readOnly ? "View Template" : isEdit ? "Edit Template" : "New Prompt Template"}</h2>
           <button type="button" className="ops-modal-close" onClick={onClose}>✕</button>
         </div>
 
         <div className="ops-modal-form" style={{ gap: 14 }}>
           <div className="tpl-form-row">
             <div className="tpl-form-field tpl-form-field-grow">
-              <label>Name *</label>
+              <label>Name</label>
               <input
                 className="tpl-input"
                 value={form.name}
                 onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
                 placeholder="e.g. DevOps Engineer"
+                readOnly={readOnly}
               />
             </div>
             <div className="tpl-form-field">
@@ -96,6 +98,7 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
                 className="tpl-select"
                 value={form.category}
                 onChange={(e) => setForm((f) => ({ ...f, category: e.target.value as TemplateCategory }))}
+                disabled={readOnly}
               >
                 {Object.entries(CATEGORY_LABELS).map(([k, v]) => (
                   <option key={k} value={k}>{v}</option>
@@ -111,20 +114,23 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
               value={form.description}
               onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
               placeholder="Short description shown on the card"
+              readOnly={readOnly}
             />
           </div>
 
           <div className="tpl-form-field">
             <div className="tpl-form-label-row">
-              <label>System Prompt Content *</label>
-              <button
-                type="button"
-                className="ops-btn ops-btn-sm ops-btn-ghost"
-                onClick={handleGenerate}
-                disabled={generating}
-              >
-                {generating ? "Generating…" : generateLabel}
-              </button>
+              <label>System Prompt Content</label>
+              {!readOnly && (
+                <button
+                  type="button"
+                  className="ops-btn ops-btn-sm ops-btn-ghost"
+                  onClick={handleGenerate}
+                  disabled={generating}
+                >
+                  {generating ? "Generating…" : generateLabel}
+                </button>
+              )}
             </div>
             <textarea
               className="tpl-textarea"
@@ -132,8 +138,12 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
               value={form.systemPromptBase}
               onChange={(e) => setForm((f) => ({ ...f, systemPromptBase: e.target.value }))}
               placeholder="Describe this knowledge base and how the assistant should answer…"
+              readOnly={readOnly}
+              style={readOnly ? { background: "#f8fafc", cursor: "default" } : undefined}
             />
-            <p className="tpl-hint">Platform grounding rules (faithfulness, credential security, confidence) are appended automatically.</p>
+            {!readOnly && (
+              <p className="tpl-hint">Platform grounding rules (faithfulness, credential security, confidence) are appended automatically.</p>
+            )}
           </div>
 
           <button
@@ -141,7 +151,7 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
             className="tpl-finetune-toggle"
             onClick={() => setShowFineTune((v) => !v)}
           >
-            {showFineTune ? "▾" : "▸"} Fine-tune options (optional)
+            {showFineTune ? "▾" : "▸"} {readOnly ? "Fine-tune settings" : "Fine-tune options (optional)"}
           </button>
 
           {showFineTune && (
@@ -152,6 +162,7 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
                   className="tpl-select"
                   value={form.responseStyle}
                   onChange={(e) => setForm((f) => ({ ...f, responseStyle: e.target.value }))}
+                  disabled={readOnly}
                 >
                   <option value="">Default</option>
                   <option value="formal">Formal</option>
@@ -167,6 +178,7 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
                   value={form.toneInstructions}
                   onChange={(e) => setForm((f) => ({ ...f, toneInstructions: e.target.value }))}
                   placeholder="e.g. Use numbered steps. Include exact commands in code blocks."
+                  readOnly={readOnly}
                 />
               </div>
               <div className="tpl-form-field">
@@ -176,9 +188,10 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
                   value={form.restrictionRules}
                   onChange={(e) => setForm((f) => ({ ...f, restrictionRules: e.target.value }))}
                   placeholder="e.g. Answer only DevOps and infrastructure questions."
+                  readOnly={readOnly}
                 />
               </div>
-              {isAdmin && (
+              {isAdmin && !readOnly && (
                 <div className="tpl-form-row tpl-form-row-gap">
                   <div className="tpl-form-field">
                     <label>Visibility</label>
@@ -209,12 +222,20 @@ export function TemplateEditorModal({ template, isAdmin, onClose, onSaved }: Pro
         </div>
 
         <div className="ops-modal-footer">
-          <button type="button" className="ops-btn ops-btn-secondary" onClick={onClose} disabled={saving}>
-            Cancel
-          </button>
-          <button type="button" className="ops-btn ops-btn-primary" onClick={handleSave} disabled={saving}>
-            {saving ? "Saving…" : isEdit ? "Save Changes" : "Create Template"}
-          </button>
+          {readOnly ? (
+            <button type="button" className="ops-btn ops-btn-secondary" onClick={onClose}>
+              Close
+            </button>
+          ) : (
+            <>
+              <button type="button" className="ops-btn ops-btn-secondary" onClick={onClose} disabled={saving}>
+                Cancel
+              </button>
+              <button type="button" className="ops-btn ops-btn-primary" onClick={handleSave} disabled={saving}>
+                {saving ? "Saving…" : isEdit ? "Save Changes" : "Create Template"}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
